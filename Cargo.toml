@@ -1,0 +1,57 @@
+[package]
+name = "deescreen"
+version = "0.1.0"
+edition = "2024"
+authors = ["spoonhasi <spoonhasi@gmail.com>"]
+description = "Drive a Windows GUI application over HTTP — named click targets, cropped screen captures, key input. Built for AI agents operating a remote simulator."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/spoonhasi/deescreen"
+# Not published to crates.io. This is a Windows-only exe with nothing to use as a library,
+# and having people read the source and build it themselves suits this tool (see the
+# distribution section of the README).
+publish = false
+
+[dependencies]
+# Hot-reloading the definitions: reads dominate and the only writes come from
+# /admin/reload, which is where ArcSwap beats an RwLock.
+arc-swap = "1.9"
+axum = "0.8"
+# Only PNG encoding and resizing are used. The default features pull in a pile of codecs,
+# so png alone.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# std — needed by the custom Log implementation (set_boxed_logger) that writes to the file
+# and the console at once.
+log = { version = "0.4", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# local-offset — so log and capture file names carry that machine's local time.
+time = { version = "0.3", features = ["local-offset", "formatting"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "sync"] }
+
+[target."cfg(windows)".dependencies]
+# The tray icon (from the Tauri team, MIT). The icon image is drawn in code, so nothing
+# ships alongside.
+tray-icon = "0.24"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    # DIB/BitBlt for capturing, plus ClientToScreen
+    "Win32_Graphics_Gdi",
+    # PrintWindow lives here — in the Xps module, despite the name
+    "Win32_Storage_Xps",
+    "Win32_UI_WindowsAndMessaging",
+    # SetProcessDpiAwarenessContext — the heart of avoiding the coordinate-system trap
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    # opening a browser from the tray menu
+    "Win32_UI_Shell",
+    # OpenProcess / OpenProcessToken / AttachThreadInput / CreateMutexW
+    "Win32_System_Threading",
+    # querying token elevation (the UIPI judgement)
+    "Win32_Security",
+    # deciding whether this is an interactive session (a visible desktop)
+    "Win32_System_StationsAndDesktops",
+] }
+
+[profile.release]
+strip = "symbols"

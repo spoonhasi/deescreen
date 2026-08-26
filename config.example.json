@@ -1,0 +1,23 @@
+{
+  "host": "0.0.0.0",
+  "port": 8090,
+  "allowed_ips_read": [
+    "127.0.0.1",
+    "192.0.2.20"
+  ],
+  "allowed_ips_write": [
+    "192.0.2.20"
+  ],
+  "admin_code": "",
+  "default_profile": "",
+  "captures": {
+    "dir": "captures",
+    "keep": 200,
+    "max_age_minutes": 1440
+  },
+  "allow_raw_clicks": false,
+  "allow_raw_keys": false,
+  "allow_profile_editing": false,
+  "default_settle_ms": 300,
+  "max_settle_ms": 10000
+}

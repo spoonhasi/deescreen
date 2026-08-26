@@ -1,0 +1,81 @@
+{
+  "description": "the Mitsubishi CNC simulator that mirrors the real machine's screen",
+  "window": {
+    "title": "NC Trainer",
+    "title_exact": false,
+    "class": ""
+  },
+  "reference_client": [
+    1280,
+    1000
+  ],
+  "on_size_mismatch": "reject",
+  "regions": {
+    "status_bar": [
+      0,
+      940,
+      1280,
+      60
+    ],
+    "position": [
+      640,
+      120,
+      640,
+      300
+    ]
+  },
+  "buttons": {
+    "cycle_start": {
+      "rect": [
+        820,
+        640,
+        60,
+        40
+      ],
+      "note": "cycle start"
+    },
+    "feed_hold": {
+      "rect": [
+        890,
+        640,
+        60,
+        40
+      ],
+      "note": "feed hold"
+    },
+    "reset": {
+      "rect": [
+        960,
+        640,
+        60,
+        40
+      ],
+      "settle_ms": 800,
+      "note": "reset"
+    },
+    "single_block": {
+      "rect": [
+        700,
+        700,
+        50,
+        30
+      ],
+      "note": "single block toggle — you have to see both off and on to tell which state it is in"
+    },
+    "emergency_stop": {
+      "rect": [
+        100,
+        700,
+        80,
+        80
+      ],
+      "confirm": true,
+      "settle_ms": 1000,
+      "note": "emergency stop. confirm required. Releasing it may need a person at the machine"
+    }
+  },
+  "keys": {
+    "cycle_start_key": "f5",
+    "reset_key": "f1"
+  }
+}

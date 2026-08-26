@@ -1,0 +1,1077 @@
+# deescreen
+
+Capture and click **one Windows GUI window** on a remote PC, over HTTP. One exe, no installer.
+
+Built so an AI agent could work the operator panel of a CNC simulator — Mitsubishi NC Trainer2
+plus, FANUC NCGuide, and the like — but nothing about any of those applications lives in the
+code. It all lives in a **profile file**: write down a window title and some rectangles, and
+the same exe attaches to any Win32/WinUI application. Two vendors, one exe, no code change —
+a CNC panel is just what it was proved against.
+
+**It is meant for remote control of simulators and test machines.** That premise is what the
+design is built on, and the warning below is that premise written down, not decoration.
+
+---
+
+## ⚠️ Do not put this on a real equipment HMI
+
+**Driving a simulator and driving a machine are not the same activity.**
+This tool can press cycle start and emergency stop. Install it on simulators and test
+machines only.
+
+This is not a boundary code can enforce — the simulator's [CYCLE START] and the machine's
+[CYCLE START] are the same pixels as far as this tool is concerned. Where you install it
+*is* the decision.
+
+The ceiling on what it can do is set by the **profile file**
+(`profiles/deescreen.<name>.json`). Which means: **whoever can edit that file holds the
+control authority.** Manage file permissions and the IP whitelist on that basis.
+
+---
+
+## Vocabulary
+
+**The thing you press is a "button"** — on screen, in the file, and in the API.
+
+A profile holds three collections. A request names **one** thing out of one of them, so the
+plural is the file and the singular is the request — and next to each singular sits the
+unnamed way of saying the same thing, which is the one a policy flag governs:
+
+| the profile holds | a request names one | or says it unnamed (gated) |
+|---|---|---|
+| `buttons` | `button` | `rect` / `point` — `allow_raw_clicks` |
+| `keys` | `key` | `chord` — `allow_raw_keys` |
+| `regions` | `capture=NAME` | `rect` |
+
+The unnamed column is deliberately a **different word** every time, never a variant spelling of
+the named one — the gated thing must not be reachable by mistyping the safe thing. `key` looks
+up a definition; `chord` bypasses the definitions entirely. Those are opposite acts and they do
+not get near-identical names.
+
+`click_button` is the one name in the API that is in no column, because it answers a different
+question — not *what* to press but *which mouse button presses it* (`left`, `right` or
+`middle`, one per click). It is not called `button` because then one word would mean two things
+inside a single object: an entry in `buttons` that itself carries a `button` field makes the
+reader stop every time.
+
+## The spine of the design
+
+### 1. The request does not choose coordinates
+
+A request sends a **name**.
+
+```
+POST /click  {"button": "cycle_start"}
+```
+
+Coordinates live only in the profile file. Let the caller compute raw pixels and it will
+**quietly press the wrong thing** — no error, so it takes a long time to notice. A coordinate
+that is not on the list cannot be pressed (until you explicitly open that with
+`allow_raw_clicks: true`). Key input is treated at the same level.
+
+### 2. Coordinates are physical pixels in the window's client area
+
+Moving the window does not break them. Changing the window **size** shifts every coordinate
+at once, so `reference_client` records "these were measured at this size" and a mismatch is
+**refused**. One `POST /window/fit` puts it back.
+
+Refusing is the default because it is the only answer that is right for every application. A
+profile can choose otherwise with `on_size_mismatch`: `"scale"` where the panel really does
+stretch with its window, `"ignore"` where the window grows but the panel stays pinned to the
+top-left. Both are claims about that specific UI, which is why neither is the default —
+guessing wrong presses the wrong pixel and says nothing.
+
+Captures use the same coordinate system — **a pixel measured in a PNG can be written straight
+into the profile file.**
+
+### 3. The screen is a last resort
+
+Read from an API whatever an API can tell you. In this project deemesh-hub serves machine
+state over HTTP, so the screen is used only to *act* and to see *what exists only on screen*.
+That removes any need for OCR and makes the verification loop **"act on the screen, confirm
+through the API"**, which is far more robust.
+
+```
+1. POST /click {"button":"emergency_stop","confirm":true}   ← deescreen
+2. GET  /machine/channel/executionStatus?machine=3          ← deemesh-hub
+3. GET  /machine/channel/emergencyStatus?machine=3          ← deemesh-hub
+4. POST /click {"button":"emergency_stop","confirm":true}   ← release
+5. read again to confirm it went back
+```
+
+---
+
+## Quick start
+
+```bash
+cargo build --release
+```
+
+Copy the single `target/release/deescreen.exe` into any folder on the target PC and run it.
+The first run creates `config.json`, `profiles/`, `captures/` and `logs/` next to the exe —
+unless the exe sits in a shared bin directory, which is the one case below.
+
+Or, if you have a Rust toolchain on the target PC, one line:
+
+```bash
+cargo install --git https://github.com/spoonhasi/deescreen
+```
+
+### Where the runtime files go
+
+The exe needs a home for `config.json`, `profiles/`, `captures/` and `logs/`. It picks one at
+startup, in this order, and **says which it picked** — in the startup log, in `GET /health`
+under `home`, and by opening it from the tray's **Open settings folder**:
+
+| | home | |
+|---|---|---|
+| 1 | `DEESCREEN_HOME` | set the variable and everything lives there. An explicit answer beats the rest |
+| 2 | beside the exe | a `config.json` is already there, so this install is portable and stays portable |
+| 3 | `%LOCALAPPDATA%\deescreen` | the exe is in a shared bin directory — what `cargo install` does |
+| 4 | beside the exe | the ordinary case: the exe was dropped in a folder, and that folder is the install |
+
+Rules 2 and 4 are the behaviour this has always had, so an existing install does not move. Rule
+3 exists only because `cargo install` puts the exe in `~/.cargo/bin`, where creating four
+runtime entries would scatter them among every other tool installed the same way.
+
+The check for rule 3 is deliberately narrow — `CARGO_HOME/bin`, or a path ending in
+`.cargo/bin`. A folder of your own that merely ends in `bin` is not one, because a wrong guess
+here moves somebody's config file.
+
+> **The two `*.example.json` files are documentation, not templates — do not copy them over
+> what the first run generated.** They exist so you can read the full shape of a config and of
+> a profile without starting the program, and the test suite parses both, so neither can drift
+> from what this build actually accepts. But `config.example.json` shows the *LAN* case:
+> `0.0.0.0` plus a second machine on the whitelist. Copy it onto a generated `config.json` and
+> you have replaced the localhost-only default with an open port and a whitelist entry pointing
+> at a machine that is not yours. The addresses in it are `192.0.2.x` — reserved for
+> documentation, so they match no real host — which is exactly why they must be replaced rather
+> than kept. Edit the generated file; read the example.
+
+`profiles/` starts **empty** — profiles are made in the editor, and until one exists there is
+no window to capture and no button to press. `/health` reports that as a problem, and the
+editor's first screen spells out the steps.
+
+**The default allows `127.0.0.1` only.** That is deliberate: copy the exe onto someone else's
+PC and no controllable port opens on the LAN without a decision. To use it from a development
+PC, put that IP in `allowed_ips_read` / `allowed_ips_write` in `config.json`, set `host` to
+`0.0.0.0`, and restart. (`config.json` is read at startup only. The profile files — the part
+you actually edit often — reload with `POST /admin/reload`.)
+
+### What it looks like when running
+
+A release build runs **in the tray with no console window.** Double-clicking the icon opens
+the **button editor** in a browser. Right-click menu:
+
+| item | |
+|---|---|
+| `deescreen v0.1.0` / `http://127.0.0.1:8090` | display only |
+| **Open button editor** | same as double-click |
+| **Status (/health)** | is it in a state where it can act |
+| **Open settings folder** | the home directory — where `config.json`, `profiles/` and `logs/` actually are |
+| **Quit** | clean shutdown |
+
+If startup fails (a typo in the config, a port collision), there is no console to print to,
+so it **puts the reason in a message box.** The details go into today's file under `logs/`.
+A debug build (`cargo build`) keeps the console — during development it is better to see the
+log immediately.
+
+> The tray menu opens `127.0.0.1` on that PC. Drop localhost from the whitelist and those
+> links return 403, so the startup log warns when the config is set that way. From a remote
+> machine, open `http://192.0.2.73:8090/editor` in your own browser instead (that IP has
+> to be in `allowed_ips_read`).
+
+### Reading small text — `scale` goes both ways
+
+`scale<1` shrinks (any capture). **`scale>1` magnifies**, and magnifying is allowed **only on
+a crop**:
+
+```bash
+curl -s -o keys.png "http://192.0.2.73:8090/capture.png?rect=820,600,300,80&scale=4"
+```
+
+The reason for refusing to magnify the whole screen is plain arithmetic — 1920×1080 at 4× is
+33 megapixels, which is no use to the reader either. A crop is what bounds the output size,
+and that condition is exactly the rule. The caps are **8×** and **4 megapixels**, and
+`max_width` bounds the output width in **both** directions, so `&scale=8&max_width=1200`
+means "as large as fits inside 1200px".
+
+Magnification uses **nearest-neighbour, no interpolation**. The point is to see the glyphs
+larger, not to invent detail, so hard edges beat a smeared resample.
+
+> `mark=x,y&inset=4` also magnifies, but that enlarges the area **around one point**.
+> Enlarging "this row of six keys" is `rect=` plus `scale>1`.
+
+### Driving more than one application — profiles
+
+One profile = **one window plus its entire coordinate universe** (buttons, regions, keys,
+reference size). A different application puts the same-named button somewhere completely
+different, so swapping only the window is not a coherent operation.
+
+**Drop in a file and you have a profile.** The first run creates a `profiles/` folder next to
+the exe; each `deescreen.<name>.json` inside it is the profile of that name. No `config.json`
+edit needed:
+
+```
+C:\Portable\DeeScreen\
+  deescreen.exe
+  config.json
+  logs/
+    deescreen-2026-08-26.log   → one per day, last 30 kept
+  captures/
+  profiles/
+    deescreen.ncguide.json     → profile "ncguide"
+    deescreen.nctrainer.json   → profile "nctrainer"
+```
+
+**[＋ Profile]** in the editor header creates the file and registers it in one step. If you
+placed a file by hand, `POST /admin/reload` (with no profile named) rescans the folder and
+picks it up **without a restart**.
+
+Put a plain-language line at the top of every profile file saying **what it is**:
+
+```json
+"description": "the FANUC simulator that mirrors the real machine's screen",
+"window": { "title": "NCGuide" }
+```
+
+That line is carried into `/health`. The profile name is a slug (`ncguide`) and the window
+title is technical, so when a person says "use the FANUC simulator" this sentence is the only
+thing an agent can connect that to. `/help` says explicitly: **match what the person said
+against the descriptions and window titles — do not guess.**
+
+Requests select by name:
+
+```bash
+curl -s "http://192.0.2.73:8090/help?profile=nctrainer"
+curl -s -X POST -o shot.png ".../click.png?profile=nctrainer&button=cycle_start"
+```
+
+There is one rule for omitting it: **when it is ambiguous, do not choose.**
+
+| situation | omitting `profile` gives you |
+|---|---|
+| `default_profile` is set in `config.json` | that one |
+| not set, and there is exactly **one** profile | that one |
+| not set, and there are **two or more** | 404, with the known names listed |
+
+It never quietly takes the first in the list. If it did, adding one profile could re-aim every
+call that left the name out, just by changing alphabetical order — a structure where name
+ordering decides what gets pressed is precisely what this design is built to avoid. If you run
+several and do not want to name one every time, write one line in `default_profile`; that line
+*is* the declaration.
+
+An unknown name is refused the same way — **nothing is picked on your behalf** — with the
+known list attached.
+
+The `profiles` map in `config.json` layers on top of discovery — you only need it for files
+that break the naming rule or live in another folder.
+
+> **One broken file does not stop the rest.** A profile that fails to parse is skipped loudly
+> and the others come up — if one bad file out of three took the other two down, you could not
+> even get into the editor to fix it.
+>
+> **Input is serialised across all profiles.** There is one mouse and one foreground on a PC,
+> so driving two windows at once would have them stealing focus from each other.
+
+### Every setting in `config.json`
+
+These files are **strict JSON — no comments.** What each setting means lives here and in
+`/help`, not beside the value, so a saved file never disagrees with its own documentation.
+
+| setting | |
+|---|---|
+| `host` | bind address. `127.0.0.1` = this PC only, `0.0.0.0` = every NIC |
+| `port` | default 8090. Two instances on one PC need different ports — and therefore different homes, since a home holds one `config.json` |
+| `allowed_ips_read` | IPs allowed on the read endpoints |
+| `allowed_ips_write` | IPs allowed on the control endpoints. `[]` = observation-only |
+| `admin_code` | required on `/admin/*` in the `X-Admin-Code` header. Empty disables it |
+| `profiles` | an **extra** name → file map, layered on what was found in `profiles/`. Only for files that break the naming rule or live elsewhere. Relative paths resolve inside the home directory |
+| `default_profile` | which profile a request gets when it omits `profile`. Empty = only works while exactly one exists |
+| `captures.dir` | where capture PNGs accumulate. Relative resolves inside the home directory; absolute is taken as written |
+| `captures.keep` | how many recent captures to keep; the oldest beyond this are deleted |
+| `captures.max_age_minutes` | delete captures older than this regardless of count. `0` = no age limit |
+| `allow_raw_clicks` | whether unnamed coordinates may be clicked. **This is the boundary in §1 of the design** — default `false` |
+| `allow_raw_keys` | whether unnamed key input (`chord`/`text`) is allowed. Default `false`; a key is as powerful as a click on a panel that maps them |
+| `allow_profile_editing` | whether `/editor` may write profile files. Default `false`; on, the boundary moves from file permissions to HTTP reachability |
+| `default_settle_ms` | default wait between an input and the re-capture. Default 300 |
+| `max_settle_ms` | ceiling on the wait a request may ask for, so a connection is not held open. Default 10000 |
+
+`config.json` is read **at startup only** — restart after changing it. The profile files are the
+part that hot-reloads.
+
+### Opening the port on the target PC
+
+```powershell
+New-NetFirewallRule -DisplayName "deescreen" -Direction Inbound -Protocol TCP `
+  -LocalPort 8090 -RemoteAddress 192.0.2.20 -Action Allow
+```
+
+Narrowing to just the development PC with `-RemoteAddress` is worth doing at the firewall as
+well as in the whitelist.
+
+---
+
+## How to measure coordinates
+
+**Find the window first.** You almost never know the title, so ask:
+
+```bash
+curl -s http://192.0.2.73:8090/windows
+```
+
+Pick a `title` and `class` and write them into the profile's `window`. If several windows
+match, clicking is **refused**, so narrow it with `class` or `title_exact`.
+
+From there, three routes. **With a person present, the browser is much faster.**
+
+### Route A — draw it in the browser (recommended)
+
+```
+http://192.0.2.73:8090/editor
+```
+
+> **The editor speaks Korean or English.** The switch is at the right of the header; the choice
+> is remembered in that browser, and a first visit follows the browser's own language. Only this
+> page is translated — `/help`, `/health` and every API error stay English, because those have to
+> line up with the words in the source and in this document.
+
+Work down the sidebar in order:
+
+1. **Target window** — pick from the list and the title and class fill in, and the picture
+   switches to that program **before you save** (`POST /preview.png` renders the candidate
+   document). It also counts how many windows match right there (several means the server will
+   refuse to act, so narrow with class or exact match).
+
+   > A freshly created profile stays **black until you pick.** Showing some arbitrary window
+   > would have you drawing rectangles on the wrong program's screen, and that means
+   > coordinates belonging to an entirely different window. Better to show nothing.
+
+2. **Reference size** — `[Fit to current window]` records the current client size. Skip it and
+   the rectangles you draw are saved against a stale reference, so every one of them is
+   refused from the moment you save.
+3. Drag rectangles on the live capture. Fill in name, note and `confirm` beside it, and nudge
+   with `←↑→↓` (1px, Shift for 10px). `Delete` removes the selected one and **selects the
+   next**, so you can work through a list without re-picking each time (it does nothing while
+   the cursor is in a text field). **Detect controls** finds child controls and draws the
+   rectangles for you, where the application supports it (see `/controls` below). Expect far
+   more to throw away than to keep.
+
+When you are done, one of two things:
+
+- **Export** — download the finished JSON, a person puts it in `profiles/` and calls
+  `/admin/reload`. The permission boundary stays on the file. **This is the default path.**
+- **Save** — requires `allow_profile_editing: true`. That moves the boundary to HTTP
+  reachability, so turn it on knowingly. `admin_code` can add one more layer (optional).
+
+### Route B — the agent measures, a person checks
+
+For when nobody is present, or the agent has to produce a proposal itself.
+
+1. **Capture with the grid on.** The labels are source coordinates, so they stay readable even
+   in a shrunken image.
+
+   ```bash
+   curl -s -o shot.png "http://192.0.2.73:8090/capture.png?grid=50"
+   ```
+
+2. **Check the guess before pressing.** This adds a crosshair and a magnified inset. No input,
+   so zero risk.
+
+   ```bash
+   curl -s -o check.png "http://192.0.2.73:8090/capture.png?mark=420,310&inset=4"
+   ```
+
+3. **Check the whole proposal in one picture.** Send the candidate definition in the body and
+   it is drawn over the current screen and returned — **nothing is saved.** Render-after-save
+   would mean it went live before anyone checked it, so the order matters.
+
+   ```bash
+   curl -s -X POST --data-binary @proposed.json -o proof.png http://192.0.2.73:8090/preview.png
+   ```
+
+   Buttons that fell outside the client area are drawn in magenta and reported as
+   `outside_client`. A document that fails validation comes back as 422 with the reason —
+   filtered out before a person is involved.
+
+4. The agent hands the person the **proposed JSON plus `proof.png`**. They look at one picture
+   and commit the file. Writing that file is the approval.
+
+5. **Apply it**
+
+   ```bash
+   curl -s -X POST http://192.0.2.73:8090/admin/reload
+   ```
+
+   A bad file is not applied — if parsing or validation fails, the old definition stays live.
+
+### Route C — edit it from a program
+
+`GET /admin/profile` returns **exactly the document `POST` accepts.** Read it, change it, send
+it back:
+
+```bash
+curl -s "http://192.0.2.73:8090/admin/profile?profile=fanuc" > p.json
+# edit p.json
+curl -s -X POST -H "Content-Type: application/json" \
+  --data-binary @p.json "http://192.0.2.73:8090/admin/profile?profile=fanuc"
+```
+
+Do not use `GET /profiles` for this — that one is **for reading**, so it flattens the document
+into arrays (`buttons: [{name, rect, …}]`). The saved shape is a map keyed by name
+(`buttons: {name: {rect, …}}`). Hand-writing a converter works today, but **the day the server
+gains a field, that converter drops it silently.** It disappears on the next save and nothing
+errors. Send back what you received and there is no converter, and therefore nothing to lose.
+
+> `POST` **replaces the whole document.** Anything you leave out is gone. Send back what you
+> read with your edits applied — never a fragment.
+
+#### Changing one thing — `PATCH`
+
+Read-modify-write is the wrong shape for a small edit. The 140-button FANUC profile above is
+37 KB, roughly **6,000 tokens** — so adding one button costs that twice, and the writing half
+means an agent re-typing 140 rectangles. Move one digit in one of them and it validates, saves,
+and answers success. That is the failure this whole tool is built to avoid, produced by the
+edit protocol itself.
+
+`PATCH` sends only the difference:
+
+```bash
+curl -s -X PATCH -H "Content-Type: application/json"   -d '{"buttons": {"NEW_KEY": {"rect": [820,640,60,40]}, "OLD_KEY": null}}'   ".../admin/profile?profile=fanuc"
+```
+
+It is a **JSON merge patch** ([RFC 7386](https://www.rfc-editor.org/rfc/rfc7386)) and has three
+rules:
+
+| in the patch | effect |
+|---|---|
+| a value | replaces what is at that key |
+| an object | **merges** into what is at that key — patching a button's `rect` keeps its `confirm` and `note` |
+| `null` | puts the key back the way it was before anyone set it |
+
+Everything not named is untouched. Which makes the two most common edits one line each:
+
+```bash
+-d '{"reference_client": [1280,1000]}'
+-d '{"regions": {"alarm_bar": [0,940,1280,60]}}'
+```
+
+`null` covers unsetting too, which is not obvious about merge patch and is worth stating: the
+usual complaint is that it cannot *store* a null. Nothing in a profile is ever stored as a
+literal null — an option that is not set is written by leaving the key out — so **removing the
+key and clearing the value are the same act**, and one syntax does both:
+
+```bash
+-d '{"reference_client": null}'                       # size check goes back to unpinned
+-d '{"buttons": {"E_STOP": {"settle_ms": null}}}'     # back to the server default
+-d '{"buttons": {"E_STOP": {"point": null}}}'         # back to pressing the rect's centre
+-d '{"on_size_mismatch": null}'                       # back to "reject"
+```
+
+The one thing to know: **to empty a whole collection send `null`, not `{}`.** An empty object
+merges nothing, so `{"buttons": {}}` asks for no change — and the reply says `"changed": false`
+rather than pretending it emptied anything.
+
+The reply reports what actually changed, per collection, by name — `added`, `removed`,
+`modified`. **A patch that matches what the profile already said writes nothing** and answers
+`"changed": false`, so "it worked" and "it was already like that" are never the same answer,
+and a good `.bak` is not rotated away for a no-op. A typo inside a patch is refused like any
+other unknown field, and nothing is written.
+
+`PATCH` does **not** create profiles — an unknown name is a 404. `POST` is where creating
+happens, so a mistyped name cannot quietly become a new empty profile.
+
+**Deleting one button** is just leaving it out of the document you send back — or `null` in a
+patch, which is cheaper. Deleting the **profile itself** is a separate path:
+
+```bash
+curl -s -X DELETE ".../admin/profile?profile=fanuc&confirm=true"
+curl -s -X POST   ".../admin/profile/rename?profile=fanuc&to=nctrainer"
+```
+
+- **Delete requires `confirm=true`** — for the same reason a button does. The file is not
+  erased; it is moved aside as `deescreen.fanuc.json.deleted-2026-08-26_162651`.
+- **Rename is not "save under a new name".** That **copies**: the old one stays, two profiles
+  point at one window, and omitting `profile` breaks the moment there are two of them.
+  `rename` moves it in place, so neither happens. The old name then 404s with the known list —
+  **it is never silently redirected.**
+- Neither touches the profile named by `default_profile` in `config.json`. Losing that kills
+  every request that omits `profile`, and undoing it takes a config edit plus a restart — a
+  person, physically at that PC. One HTTP call should not be able to create a state that
+  requires that.
+
+#### What happens to the archive if the same name is deleted twice
+
+**They do not overwrite each other.** The `.bak` a save leaves is one generation deep and the
+next save overwrites it, but a delete archive carries **the time in its name**, so every one
+is a new file (`_2`, `_3` are appended within the same second). Delete → recreate under the
+same name → delete again leaves:
+
+```
+deescreen.fanuc.json.deleted-2026-08-26_162651        ← the first one
+deescreen.fanuc.json.deleted-2026-08-26_162720        ← the second one
+deescreen.fanuc.json.bak.deleted-2026-08-26_162720    ← the second one, one edit earlier
+```
+
+The save backup (`.bak`) is moved aside with it. Left in place, it would be overwritten by the
+next save of a new profile with that name — **a file that looks like a backup and is not.**
+
+**Nothing ever cleans archives up automatically.** Logs and captures are pruned by count and
+age, but this is the last copy of something, so it does not get the same treatment. When they
+pile up, a person deletes them.
+
+Two things are blocked at save time:
+
+- **A field name this build does not know stops the whole document.** Both the profile files
+  and `config.json` are strict about this. `POST` replaces the entire profile, so a field
+  quietly dropped on the way in is a field *saved* as missing — and the one most worth
+  mistyping is `confirm`: `confrim` on an emergency stop would store it with no confirmation
+  required and answer "saved". Instead the reply names the field and lists what was expected,
+  and no file is written. A typo in `config.json` stops startup the same way, with the reason
+  in the message box.
+- **Two identical names are refused at parse time.** JSON does not forbid duplicate keys and
+  the default parser lets the later one win, so without this you send 128 buttons, 127 are
+  saved, and **the response says success**. This collision really happens — the MDI letter keys
+  `X`/`Y`/`Z` and the operator panel's axis-select `X`/`Y`/`Z`. Making clients send a count to
+  cross-check (`expect_buttons=128`) would work too, but that is a discipline every client has
+  to remember, and some client will always forget. Blocking it in the parser makes every path
+  safe at once — file or HTTP.
+- **Names containing characters that get cut in a query string** (`& = # ? % + / \` and
+  whitespace) are refused. A name travels as `?button=NAME`, so in a client that forgot to
+  encode, such a name is not an error — it is a **different name**. Non-ASCII letters are not
+  blocked: forget to encode those and the URL itself breaks loudly, rather than quietly
+  becoming something else.
+
+### Three capture region names behave like reserved words
+
+| value | meaning |
+|---|---|
+| `"client"` | the whole client area |
+| `"button:NAME"` | that saved button's own rectangle |
+| any other name | that rectangle from `regions` |
+
+Using `client` **as a region name** is refused (it would become a ghost that can never be
+selected).
+
+**The request decides what to look at.** Buttons do not carry a default capture region — most
+clicks need no confirmation, and a default would capture on every one of them, twice (before
+and after, for change detection). Buttons have coordinates, so whoever needs to look can
+choose then.
+
+To see whether the saved buttons are still in the right place, add `?buttons=`. Three modes:
+
+| | draws | use when |
+|---|---|---|
+| `buttons=1` | outline + name + **crosshair** | checking the click point. For a button with an explicit `point`, the click point differs from the rectangle's centre and this mark is the only thing that shows it |
+| `buttons=box` | outline + name | **reading the key legends.** The crosshair sits exactly on the click point = the middle of the key = on top of the lettering |
+| `buttons=num` | outline + **a number** | buttons packed too tightly for names. The number is the 1-based position in `GET /buttons` (sorted by name), so no legend table is needed |
+
+Labels are placed so they **do not overlap**: four candidate spots are tried — above, below,
+inside-top, inside-bottom. If none is free, that one label falls back to its number, and the
+metadata's `labels_crowded` says how many did. An overlapping label is not merely ugly, it is
+**wrong information** — `MDI_CASE_TOGGLE` and `MDI_Z` running together as `MDI_CASE_TMDI_Z`
+gives you no way to tell from the picture whether that is two names or one.
+
+```bash
+curl -s -o now.png "http://192.0.2.73:8090/capture.png?buttons=1"
+```
+
+`confirm` buttons are drawn red, regions yellow, anything outside the client area magenta.
+
+---
+
+## Using it from an AI — the PNG in one round trip
+
+The tool runs on the simulator PC and the AI is on a development PC, so a server-side disk
+path is not something this end can open. Hence the **`.png` variants that hand back the
+bytes**.
+
+```bash
+curl -s -X POST -o shot.png "http://192.0.2.73:8090/click.png?button=cycle_start&capture=status_bar&settle_ms=500"
+```
+
+One line does **click → wait to settle → re-capture**, and `shot.png` lands on the development
+PC. Read that file and you have seen it. The metadata (how it was captured, whether it was
+black, whether the screen actually changed) rides back in the `X-Deescreen-Meta` response
+header.
+
+If you want JSON, `POST /click` does the same thing and gives you the server-side file path
+and a `/captures/<name>` URL instead.
+
+---
+
+## API
+
+| method | path | class | |
+|---|---|---|---|
+| GET | `/` · `/help` | read | **the manual for agents**, one page (see below) |
+| GET | `/ping` | exempt | alive or not. Carries no information, hence whitelist-exempt |
+| GET | `/health` | read | is it operable right now — checks every trap in **Known traps** below. `status` is `ok` or `degraded`, `problems` lists what is wrong in plain language, `policy` says which gated things are allowed |
+| GET | `/windows` | read | visible top-level windows — for finding a title |
+| GET | `/window` | read | the configured window's current state (client size, DPI, foreground) |
+| GET | `/profiles` | read | **every profile's full definition** — buttons, regions, keys, window. `?profile=` for one |
+| GET | `/buttons` | read | one profile's button list (a subset of `/profiles`) |
+| GET | `/regions` | read | one profile's region list (coordinates absolute to the window) |
+| GET | `/controls` | read | enumerate child controls. **An empty list is an answer** (see below) |
+| GET | `/editor` | read | the button editor (HTML) |
+| GET | `/capture.png` | read | capture as PNG bytes. `?region= &rect=x,y,w,h &pad= &scale= &max_width= &save=`; `region=button:NAME` is that button's own rect <br>overlays: `&grid=50 &mark=x,y &inset=4 &inset_radius=40 &buttons=1\|box\|num` |
+| POST | `/capture` | read | same, JSON response (includes the server-side path) |
+| POST | `/preview.png` | read | draw a **candidate** definition from the body over the live screen. Saves nothing |
+| GET | `/captures/{name}` | read | fetch a stored capture |
+| POST | `/click` | **control** | `{button\|buttons[]\|rect\|point, confirm, click_button, double, settle_ms, gap_ms, capture, pad, ignore, scale, max_width}`. No `capture` means **no picture is taken**. `buttons` presses in order and stops at the first failure |
+| POST | `/click.png` | **control** | same, PNG bytes back. Parameters go in the query. No `capture` captures the whole client area (an image has to come back) |
+| POST | `/key` | **control** | `{key\|chord\|text, settle_ms, capture, pad, ignore, …}` |
+| POST | `/window/focus` | **control** | bring the window forward (restore if minimised) |
+| POST | `/window/fit` | **control** | restore the client area to `reference_client` |
+| POST | `/admin/reload` | read+code | with `?profile=` re-reads that one; without, **rescans the disk** and picks up new files |
+| GET | `/admin/profile` | **control** | the profile document, **exactly as POST takes it**. For round-trip editing |
+| POST | `/admin/profile` | **control**+flag | replace that document. An unknown `?profile=` name **creates** it. Needs `allow_profile_editing` |
+| PATCH | `/admin/profile` | **control**+flag | change part of it — a JSON merge patch (RFC 7386). Only what you name is touched; `null` removes a key. Does **not** create |
+| DELETE | `/admin/profile` | **control**+flag | delete the profile. `&confirm=true` required. The file is **moved aside** under a timestamped name |
+| POST | `/admin/profile/rename` | **control**+flag | `?profile=OLD&to=NEW`. Moves it in place (not a copy) |
+
+Every window-facing endpoint takes **`?profile=NAME`** (or `"profile"` in the body). Omitting
+it uses the default profile. An unknown name is refused with 404 and the known list — nothing
+gets pressed while it is unclear which window is being driven.
+
+**Classification is by path, not by method** — `/capture` is a POST only because it takes a
+body, and splitting by method would file that under control.
+
+Note that `/admin/profile` is **control** class. It is not pressing something now; it is
+rewriting *what can be pressed from now on*, which is a stronger authority than a click.
+
+### Pointing another agent at it — `/help`
+
+Give it one address.
+
+```bash
+curl -s http://192.0.2.73:8090/help
+```
+
+**`/help` is pure manual — it carries no server state.** What the coordinate system is, how to
+press things, which traps fail silently; none of that changes. The split of duties:
+
+| | |
+|---|---|
+| `GET /help` | **how** to use it (fixed) |
+| `GET /health` | **what exists right now and whether it works** — profiles, window state, policy |
+| `GET /profiles` | **every definition** — all profiles' buttons, regions, keys, window spec |
+| `GET /buttons` · `/regions` | when only one of those is needed (smaller response) |
+
+`/profiles` alone makes the other two optional — `?profile=NAME` returns just one.
+
+So `/help` ends by saying plainly what to call next. Without that, readers start inventing
+endpoint names.
+
+### Coordinates in a cropped picture are relative to the crop
+
+**A region capture's (0,0) is not the window's (0,0).** Read a pixel off a cropped image and
+send it straight back as a click and it is off by the crop offset — silently. Two ways to be
+right:
+
+**① Turn on the grid (recommended).** The tick labels are **window coordinates** even on a
+crop, so the number you read is the number you send:
+
+```bash
+curl -s -o shot.png ".../capture.png?region=status_bar&grid=20"
+```
+
+**② Convert.** The `X-Deescreen-Meta` header of that same response carries the crop rectangle
+and the scale:
+
+```
+window_x = rect[0] + png_x / scale
+window_y = rect[1] + png_y / scale
+```
+
+Capturing `client` needs no conversion at all — that image *is* the window's coordinate
+system.
+
+### Capturing a button, with a margin — `region=button:NAME` and `pad`
+
+**A toggle's state is usually not inside its button.** On this kind of operator panel the
+lamp sits just above the key, so checking "did that switch come on" means capturing a
+rectangle wider than the button.
+
+Do not read the rect out of `GET /buttons` and add the margin yourself. Name the button:
+
+```bash
+curl -s -o shot.png ".../capture.png?region=button:OPT_STOP&pad=25"
+curl -s -X POST -o shot.png ".../click.png?button=OPT_STOP&capture=button&pad=25"
+```
+
+- `region=button:NAME` is that button's own rectangle, straight from the profile.
+- `pad` grows it on every side, in the same client pixels as the numbers in the file.
+  Anything past the window edge is clamped when the crop happens, not refused.
+- On a click, **`capture=button` with no name means the button you just pressed** (the last
+  one, for a sequence), so the name is not written twice.
+
+The point is not keystrokes saved. The rect is a number the server already holds, and
+re-deriving it in the caller is arithmetic done in a second place — which is where things go
+quietly wrong.
+
+### Pressing several buttons in order — `buttons`
+
+Entering data on an MDI keypad is one press per character; `G91 G28 X0;` is ten of them.
+Send the sequence instead:
+
+```bash
+curl -s -X POST -H "Content-Type: application/json" -d '{
+  "buttons": ["MDI_G","MDI_9","MDI_1","MDI_G","MDI_2","MDI_8","MDI_X","MDI_0",
+              "MDI_EOB","MDI_INSERT"],
+  "gap_ms": 150, "capture": "hmi_display" }' .../click
+```
+
+**This is not mainly about round trips.** A partial string left in the machine is worse than
+no string at all — press CYCLE START after it and an unintended block runs. That is what
+shapes the design:
+
+- **Every name is resolved and checked before anything is pressed.** A typo in element eight
+  costs nothing instead of leaving seven characters in the machine. The 404 says which index.
+- **A failed press stops the sequence.** `sequence.failed` carries the index and the button;
+  `pressed` lists what did go in, each with its own `hit`. A partial sequence should be read
+  as an unfinished entry — look at the screen before doing anything else.
+- **A `confirm` button inside the array follows the same rule as a single press** — refused
+  unless the request carries `"confirm": true`. An array is not a way around it.
+- **`capture`, `ignore` and `settle_ms` apply once, after the last press.** `gap_ms` is the
+  spacing between presses.
+
+`gap_ms` defaults to **500**. A panel that drops input when pressed too fast fails silently —
+you get a half-typed block and no error — and that is the exact failure this endpoint exists
+to prevent, so the default is deliberately unhurried. Lower it once you have measured yours.
+
+`buttons` cannot be combined with `button`, `rect` or `point`, and at most 200 fit in one
+request. In the query form (`/click.png`) it is a comma-separated list:
+`buttons=MDI_G,MDI_9`.
+
+> `POST /key` with `{"text": "..."}` is the same idea for real keyboard input. Panel keys are
+> painted buttons rather than keys, so they cannot go through that path — hence the same
+> facility on the click side.
+
+### Pressing something that was never saved — `rect` / `point`
+
+Controls that appear only on certain screens cannot be on the named list. For those, read the
+capture and **send the rectangle itself**; the centre gets pressed. Nothing is stored.
+
+```bash
+curl -s -X POST -H "Content-Type: application/json" \
+  -d '{"rect":[820,640,60,40]}' http://192.0.2.73:8090/click
+
+curl -s -X POST -o shot.png ".../click.png?rect=820,640,60,40&capture=client"
+```
+
+`{"point":[850,660]}` works when you do not know the size. It follows the **same rule** as a
+named button (centre of the rectangle), so it also previews how it would behave once saved.
+
+`allow_raw_clicks` has to be on, and the log records `CLICK ... target=(rect 820,640,60,40)`
+at **WARN** — the fact that an unverified coordinate was pressed should stand out when
+skimming.
+
+**Check what you read before pressing.** This touches nothing:
+
+```bash
+curl -s -o check.png ".../capture.png?mark=850,660&inset=4"
+```
+
+A misread rectangle presses whatever happens to be there, and that is silent.
+
+### `/controls` only works on certain applications
+
+Standard Win32, MFC and WinForms give each button its own window, so they all show up. **WPF
+and WinUI have a single window and return nothing**, as do industrial HMI mock-ups that paint
+the panel as one bitmap and hit-test it in code. An empty list is not a failure; it is the
+answer "this application has to be measured by hand".
+
+Do not trust a non-empty list either — a measurement on Windows 11 Notepad returned 13
+entries, every one of them a WinUI layout container or input sink, and not one a button. Draw
+it with `/preview.png` and keep only what sits on a real control.
+
+Key names: `a`–`z`, `0`–`9`, `f1`–`f24`, `numpad0`–`numpad9`, `enter` `esc` `space` `tab`
+`backspace` `delete` `insert` `home` `end` `pageup` `pagedown` `up` `down` `left` `right`
+`add` `subtract` `multiply` `divide` `decimal` `comma` `period` `slash` … modifiers are joined
+with `+` (`"ctrl+shift+f5"`).
+
+---
+
+## Known traps — every one of them fails silently, without an error
+
+`GET /health` checks all of these at once. **When input does not work, start here.**
+
+### DPI scaling
+
+If the display scale is not 100% and the process is not per-monitor DPI aware, the OS quietly
+converts coordinates and **the capture's pixels and the click's coordinates end up in
+different systems**. deescreen calls
+`SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` on the first line of `main()` and
+reports whether it worked as `dpi_aware` in `/health`.
+
+### UIPI — input is discarded across privilege levels
+
+If the target application runs as administrator and deescreen does not, **`SendInput` returns
+success and does nothing.** MSDN states outright that neither the return value nor
+`GetLastError` reports UIPI blocking, so detecting it after the fact is impossible. Two things
+stand in for that:
+
+- `input.uipi_risk` in `/health` compares both elevation states up front and warns.
+- `hit` in the click response tells you **what was under the point you pressed**, independent
+  of pixels.
+
+There is one fix — **run deescreen at the same privilege level as the target application.**
+
+### `changed` cannot tell you whether a click worked
+
+`changed` only answers whether pixels moved. But that is **two independent questions**, and
+all four combinations really occur:
+
+| | screen changed | screen identical |
+|---|---|---|
+| **hit a control** | it worked | blank key · toggle already in that state · ignored in this mode — **all normal** |
+| **hit nothing** | a clock or animation moved on its own | the coordinate landed on panel background |
+
+Measured on a FANUC NCGuide operator panel (2026-08-26): **21 of 128 keys are blank keys** with
+no legend. Nothing happening when you press them is correct, so pixels cannot tell you whether
+the press arrived. In the other direction, `MDI_PAGE_DOWN` reported `changed: true` when the
+only thing that had moved was **one digit of the on-screen clock**.
+
+So the two questions are answered separately:
+
+**(a) Did it land — `hit`.** Immediately **before** pressing, the control under that coordinate
+is looked up through the window API and returned in the response. No pixels involved.
+
+```json
+"hit": { "hwnd": 856538, "class": "WindowsForms10...", "text": "", "id": 0,
+         "rect": [820, 640, 60, 40], "visible": true, "enabled": true,
+         "depth": 3, "is_window_itself": false }
+```
+
+- `is_window_itself: true` — no child control sits there. You pressed background.
+- `enabled: false` — it arrived and the control ignored it. **A correct no-change.**
+- `rect` — the control's real rectangle. When your coordinate is off, the fix is right here.
+
+A capture with `?mark=x,y` carries the same `hit` — you can verify a coordinate **without
+pressing anything.**
+
+> This works only where controls are separate windows (Win32, MFC, WinForms). On WPF or a
+> single-bitmap HMI, every point reports `is_window_itself: true`. An empty `GET /controls`
+> means you are in the latter case.
+
+**(b) How much changed — `change`.** Instead of a boolean, the pixel count and where.
+
+```json
+"changed": true,
+"change": { "pixels": 214, "fraction": 0.0001, "bbox": [1180, 12, 60, 16] }
+```
+
+`bbox` is in **window client coordinates** and is **one rectangle** around every changed
+pixel — two changes far apart enclose everything between them. Even so, "one clock digit" and
+"half the screen" are distinguishable.
+
+If a clock keeps forcing `changed` true, exclude that spot from the comparison:
+
+```bash
+curl -s -X POST -H "Content-Type: application/json" \
+  -d '{"button":"cycle_start","capture":"client","ignore":[1180,8,90,20]}' .../click
+```
+
+`ignore` is accepted by `/click`, `/click.png` and `/key` (as `ignore=x,y,w,h` in a query).
+
+With a `hit` present and `input.uipi_risk` false in `/health`, `changed: false` simply means
+**a control that does not repaint**, and nothing is wrong.
+
+### The target PC should be unattended while this runs
+
+Input is injected as **real mouse and keyboard events**, into the one input stream that PC has.
+There is no separate, invisible cursor: the pointer physically moves to the button and clicks
+it, and `POST /window/focus` really does bring the target window to the front. So while
+deescreen is driving something, a person using that PC is sharing an input device with it.
+
+What is guarded and what is not:
+
+- **The press itself is pinned to its coordinate.** The button-down carries the coordinate and
+  a move flag in the same `SendInput` batch, and Windows never interleaves a batch with the
+  user's own input. Nudging the mouse mid-click cannot move where the click lands.
+- **The window is brought to the front before every click**, so a click cannot fall through to
+  whatever was covering it.
+- **Two requests never overlap** — input is serialised across every profile.
+- **A person's own clicking is not guarded at all.** Nothing stops someone clicking in the
+  target application between two of our presses, and in the middle of a `buttons` sequence that
+  means a keypad entry with something else spliced into it.
+- **Focus is taken.** If someone is typing in another window when a click arrives, the
+  foreground moves out from under them.
+
+None of this is a fault to fix — it is what driving a real GUI means. Treat the simulator PC as
+a machine that is being operated, not one someone is also working at. If a person does have to
+step in, stop sending requests first; `/health` and `/capture.png` are read-only and stay safe
+at any time.
+
+### Locked screen, disconnected RDP session
+
+If the console session is locked or RDP is disconnected, captures come back black and input
+does nothing. deescreen detects this and returns `black: true` with the reason. The target PC
+needs a **logged-in, unlocked, active console session**. Running it as a service (Session 0)
+produces a warning at startup.
+
+### Pop-up menus do not appear in captures
+
+The default capture is `PrintWindow` — it works even when the window is covered, but
+**anything drawn in a separate window, like a drop-down menu, is not in it.** To see one,
+bring the window forward (`POST /window/focus`) and capture again. If `PrintWindow` comes back
+entirely black, deescreen retries with a screen `BitBlt` on its own and reports which one it
+used in `method`.
+
+### Typing a string is slow (on purpose)
+
+`{"text": "..."}` makes one `SendInput` call per character with 4ms between them. Batched into
+one array, **characters go missing silently** — measured 2026-08-12 on Windows 11 Notepad, 60
+characters sent at once arrived as 17. At the 512-character limit the worst case is about two
+seconds.
+
+---
+
+## Security boundary
+
+- **The IP whitelist is split into read and control.** Observation clients go on the read list
+  only; keep the control list minimal. `allowed_ips_write: []` is observation-only mode.
+- **Localhost is not automatically allowed.** If `127.0.0.1` is not on the list, it is blocked
+  on the very PC it is installed on (`/ping` is the only exemption). Assume "it is my own PC,
+  it will be fine" and the tray's editor link returns 403 — the startup log warns when that is
+  the case. The list is compared literally against the caller's **numeric address**, so writing
+  `localhost` never matches; that is rejected at startup.
+- **Opening the editor and saving from it are different lists.** Opening is read; saving
+  (`/admin/profile`) is control. Put localhost on read only and the editor comes up fine and
+  [Save] alone returns 403.
+- **`/health` is not whitelist-exempt** — it carries window titles and privilege state.
+  `/ping` covers the "is it alive" case.
+- `POST /admin/reload` can require one more layer via `admin_code` (`X-Admin-Code` header).
+- **`confirm` is a deliberation gate, not a permission gate.** Nothing in this server contacts
+  a person or waits for one, and an agent is expected to run unattended — resending with
+  `"confirm": true` is the whole mechanism and the caller sends it. What the flag buys is that
+  the press cannot happen **by accident**: not from a computed rectangle, not swept up in a
+  sequence, not as a reflex after a refusal. Only as a second request that names the button on
+  purpose. The question it asks the caller is *is this press part of the work I was given*, not
+  *is somebody watching*.
+- **`confirm` cannot be bypassed by editing it away either.** A save or patch that leaves a
+  button without a `confirm` it used to have — the flag cleared, or the button deleted — is
+  refused unless the request carries `&confirm=true`, and nothing is written. Otherwise the
+  flag would be advisory: refused at `/click`, patch it off, press — and the button stays
+  unprotected for everyone afterwards. This also catches the likelier case, which is not
+  cunning but transcription — a round-trip `POST` that re-types 140 buttons and drops one
+  `true` would otherwise save and answer success. When it is deliberate the reply lists what
+  was removed and the server logs it at WARN, so the record survives the session.
+- **`confirm` cannot be bypassed with coordinates.** A button marked `confirm: true` needs
+  `"confirm": true` in the request — and so does a **raw coordinate that falls inside one**.
+  A rectangle computed from a capture can happen to land on the emergency stop, so the flag
+  cannot be allowed to stop meaning anything the moment a caller computes coordinates instead
+  of using a name. Deliberate presses are unaffected; accidental ones are caught.
+- **Saving profile files over HTTP is off by default.** While it is off, the permission boundary
+  is "whoever can write the files on that PC". Turning on `allow_profile_editing` moves it to
+  "whoever can reach this port". A save keeps the previous file as `.bak`. `admin_code` can add
+  one more layer (optional). The editor still works with the flag off — it downloads the JSON
+  for a person to place.
+- `/captures/{name}` validates the filename format. This server is not a general file server.
+- **There is no HTTPS.** This tool assumes an IP-narrowed private network, and under that
+  assumption TLS mostly buys self-signed-certificate friction (`curl --insecure`). If the
+  boundary ever has to widen, the first question is not TLS but **whether this belongs there at
+  all.**
+
+### Versioning
+
+**`0.x` — anything may change.** That is what major version zero means in semver, and it is
+the accurate description: this has run on one LAN, against one application, and the request
+shape has already moved several times in response to what an agent using it actually needed.
+Pinning the API now would be a claim with nothing behind it.
+
+Within `0.x` the **minor** is the breaking position, so a rename or a removed field goes
+`0.1 → 0.2` and a fix goes `0.1.0 → 0.1.1`. Breakage is still announced; it just does not need
+a `1.0` to be announced. Whether this ever reaches `1.0` depends on the API sitting still
+because nobody needs it to change — not on the tool feeling finished.
+
+---
+
+## How this was built
+
+Written with Claude (Claude Code), over a long conversation. The decisions — what it may do,
+what it refuses by default, what things are named — were made by a person and argued through;
+the code and most of this prose were written by the model.
+
+That history is why the source reads the way it does. Comments here tend to explain *why*
+rather than *what*, and a test tends to pin a decision rather than a line, because the
+reasoning existed while the thing was being built and belonged in the file rather than in a
+chat log nobody will ever open.
+
+None of which substitutes for reading it. This tool presses buttons on a machine you care
+about. Read the source before you point it at one, the same as you would for anything else
+that can press a button.
+
+---
+
+## Development
+
+```bash
+cargo test          # 81 — coordinate math, crop/scale, overlays, key parsing, ACL classification, example schemas
+cargo build --release
+```
+
+| file | holds |
+|---|---|
+| `src/win/window.rs` | finding windows, client coordinates, focus, fitting, control enumeration |
+| `src/win/capture.rs` | `PrintWindow` → DIB → RGBA, black-frame detection, `BitBlt` fallback |
+| `src/win/input.rs` | `SendInput` mouse/keyboard, key name parsing |
+| `src/targets.rs` | the profile document (buttons, regions, keys) — **the ceiling on capability** |
+| `src/captures.rs` | crop, scale, PNG, retention, before/after diffing |
+| `src/draw.rs` | grid, crosshair, button rectangles, magnified inset + a built-in 5x7 font |
+| `src/editor.html` | the button editor (embedded in the binary, makes no external requests) |
+| `src/acl.rs` | read/control whitelist split, admin code |
+| `src/api.rs` | handlers (the JSON surface and the `.png` surface), and the `/help` manual |
+| `src/main.rs` | startup order, the single-instance lock, startup diagnostics |
+| `src/config.rs` | `config.json`, profile discovery, the JSON-with-comments parser |
+| `src/state.rs` | shared state, profile lookup, which profile an omitted name gets |
+| `src/router.rs` | routes and middleware order |
+| `src/web.rs` | the response and error shape |
+| `src/logging.rs` | one log file per day, 30 days kept |
+| `src/tray.rs` | the tray icon and menu (drawn in code, no asset files) |
+| `src/win/mod.rs` | the Win32 boundary — DPI awareness, elevation, session checks |
+
+### What got pressed is in the log
+
+Clicks and key input are written to that day's log file **immediately after the press** — so
+even if settling or re-capturing then fails, the fact that it was pressed is already recorded.
+
+```
+CLICK profile=fanuc target=cycle_start button=left double=false client=(850,660) screen=(882,686) settle=500 window="FANUC NCGuide" pid=1234 hit="WindowsForms10..."/"CYCLE START"
+KEY profile=fanuc sent=reset (f1) window="FANUC NCGuide" pid=1234
+```
+
+`confirm` buttons and unnamed coordinate clicks (`target=(rect …)`) are logged at **WARN** so
+they stand out when skimming. If a capture was requested and **the screen did not change**,
+that is a WARN too — it may be a toggle already in that state, but UIPI blocking looks
+identical, so this line is the clue when tracing it later.
+
+Logs accumulate in `logs/deescreen-YYYY-MM-DD.log` inside the home directory (the tray's
+**Open settings folder** goes there) — **one file per day**,
+named by **local time** (both the report and the log are spoken about in terms of the clock on
+the wall at that PC). When a new file is created, the oldest are removed past 30 so only the
+**last 30 days** are kept. The level is set with `RUST_LOG` (`error|warn|info|debug|trace`,
+default `info`). Started from the tray, stderr goes nowhere, so this file is the only trace.
+
+---
+
+## License · distribution
+
+**MIT.** Use it, change it, sell it. There is **no obligation to publish source** — you do not
+have to open what you build with this, and you do not have to say you used it.
+
+There is exactly one condition: **when you redistribute it**, include the `LICENSE` file (the
+copyright notice and the permission notice). Simply *using* it in-house carries no obligation
+at all.
+
+### No binaries are distributed
+
+Screen capture plus synthetic input plus an HTTP listener is **functionally the same shape as
+remote-access malware**. An unsigned exe in circulation attracts antivirus false positives
+easily, and once one sticks it starts getting blocked on the very machines that actually use
+this. So the source is published and everyone builds their own:
+
+```bash
+cargo build --release
+```

@@ -1,0 +1,1537 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>deescreen · button editor</title>
+<style>
+  :root {
+    --bg: #14171c; --panel: #1c2027; --line: #2c323c; --fg: #e6e9ef; --dim: #98a1b0;
+    --target: #00c8ff; --danger: #ff3c3c; --region: #ffd200; --warn: #ff00dc; --ok: #38d39f;
+    --header-h: 49px; --footer-h: 128px;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); overflow: hidden;
+         font: 13px/1.5 "Segoe UI", system-ui, sans-serif; }
+
+  /* The height is fixed, so wrapping must not be allowed — anything that overflows is
+     clipped away. The window title shrinks to make room instead. */
+  header { display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; height: var(--header-h);
+           padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 14px; margin: 0 12px 0 0; font-weight: 600; white-space: nowrap; }
+  header > button, header > input { flex: none; }
+  #winmeta { color: var(--dim); font-size: 12px; margin-right: auto;
+             min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  button, input, select, textarea {
+    background: #262c35; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 4px; padding: 5px 9px; font: inherit; }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: #48505d; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: #14506b; border-color: #1d6f92; }
+  button.danger { background: #6b1a1a; border-color: #922323; }
+  button.on { background: #14506b; border-color: var(--target); }
+
+  main { display: flex; height: calc(100vh - var(--header-h)); }
+
+  /* Left: the capture (flexible) plus the edit footer (fixed). Putting the footer here
+     lets it use the full width, so the fields do not have to stack, and the sidebar does
+     not jump around as the selection changes. */
+  #left { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  #stagewrap { flex: 1; min-height: 0; overflow: auto; padding: 12px; }
+  #stage { position: relative; display: inline-block; line-height: 0; }
+  #shot { display: block; image-rendering: pixelated; }
+  /* With no capture, leaving the <img> in place makes the browser draw a broken-image
+     icon. Clearing src is not enough, so the element is hidden and guidance shown. */
+  #stage.empty #shot, #stage.empty #ov { display: none; }
+  #nocap { display: none; max-width: 560px; padding: 20px 22px; border-radius: 8px;
+           border: 1px dashed var(--line); background: #1a1e25; line-height: 1.7; }
+  #stage.empty #nocap { display: block; }
+  #nocap h3 { margin: 0 0 8px; font-size: 14px; }
+  #nocap ol { margin: 8px 0 0; padding-left: 20px; color: var(--dim); }
+  #nocap b { color: var(--fg); }
+  /* Pin left/top only. With inset:0 the right/bottom values fight the width JS sets, and
+     the canvas display size can drift out of step with its backing store. */
+  #ov { position: absolute; left: 0; top: 0; cursor: crosshair; }
+
+  /* The edit footer — always the same height. A button and a region need different
+     numbers of fields, so hiding uses visibility, not display, to keep the layout still. */
+  #footer { flex: none; height: var(--footer-h); border-top: 1px solid var(--line);
+            background: var(--panel); padding: 8px 12px; overflow-x: auto; }
+  #footer .title { font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+                   color: var(--dim); margin-bottom: 6px; }
+  #selhint { text-transform: none; letter-spacing: 0; }
+  /* Two rows — cramming the note onto one row produces a horizontal scrollbar. Short
+     fields on the first row, the note taking the full width on the second. */
+  .frow { display: flex; gap: 14px; align-items: center; flex-wrap: nowrap; }
+  .frow + .frow { margin-top: 6px; }
+  .frow .f { display: flex; gap: 5px; align-items: center; flex: none; }
+  .frow .f > span { color: var(--dim); font-size: 12px; white-space: nowrap; }
+  .frow input[type=number] { width: 68px; }
+  #f_name { width: 150px; }
+  #noteRow .f { flex: 1; }
+  #f_note { flex: 1; min-width: 0; }
+  #noteRow.off { visibility: hidden; }
+  #form.empty { opacity: .3; pointer-events: none; }
+  #targetOnly { display: flex; gap: 14px; align-items: center; }
+  #targetOnly.off { visibility: hidden; }
+
+  /* Right: the top is fixed; only the list scrolls on its own */
+  aside { width: 340px; flex: none; border-left: 1px solid var(--line);
+          background: var(--panel); display: flex; flex-direction: column; }
+  #panels { flex: none; padding: 10px 10px 0; }
+  #listwrap { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 0 10px 10px; }
+  aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+             color: var(--dim); margin: 14px 0 6px; }
+  #panels h2:first-child { margin-top: 0; }
+  .row { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+  .row label { width: 78px; flex: none; color: var(--dim); font-size: 12px; }
+  .row input[type=text], .row input[type=number], .row select, .row textarea { flex: 1; min-width: 0; }
+
+  ul#list { list-style: none; margin: 0; padding: 0; flex: 1; min-height: 0; overflow-y: auto;
+            border: 1px solid var(--line); border-radius: 4px; }
+  ul#list li { display: flex; gap: 6px; align-items: center; padding: 5px 6px;
+               border: 1px solid transparent; border-radius: 4px; cursor: pointer; }
+  ul#list li:hover { background: #232833; }
+  /* The selection has to stand out in the list too — whichever of the picture and the
+     list you are looking at, it must be obvious the same item is selected. A thick left
+     bar reads far more strongly than a background colour. */
+  ul#list li.sel { background: #14435c; border-color: var(--target);
+                   border-left: 4px solid var(--target); padding-left: 3px;
+                   box-shadow: 0 0 0 1px var(--target) inset; }
+  ul#list li.sel .nm { font-weight: 700; color: #fff; }
+  ul#list li.sel .xy { color: #cfe8f5; }
+  .swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+  .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .xy { color: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .hint { color: var(--dim); font-size: 11.5px; margin: 6px 0 0; }
+  kbd { background: #2b323d; border: 1px solid var(--line); border-radius: 3px;
+        padding: 0 4px; font-size: 11px; }
+
+  /* Message modal — inside the sidebar it would push everything below it down each
+     time it appeared. Float it above instead. */
+  #modal { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none;
+           align-items: center; justify-content: center; z-index: 100; }
+  #modal.on { display: flex; }
+  #modalbox { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+              max-width: min(680px, 90vw); max-height: 80vh; overflow: auto;
+              padding: 16px 18px; box-shadow: 0 12px 40px rgba(0,0,0,.5); }
+  #msg { white-space: pre-wrap; word-break: break-word; font-size: 13px; margin: 0 0 12px; }
+  #msg.err { color: #ff9a9a; }
+  #msg.ok { color: var(--ok); }
+  #modalbox .foot { display: flex; justify-content: flex-end; }
+
+  /* With no profiles at all, the only thing that can be done is [＋ Profile]. Leaving the
+     rest clickable produces "I pressed save and nothing happened". Greyed out, where to
+     click is the one thing left visible. */
+  body.noprof #panels, body.noprof #listwrap, body.noprof #footer,
+  body.noprof header button:not(#newprof), body.noprof #profpick, body.noprof #code {
+    opacity: .35; pointer-events: none;
+  }
+  /* Language switch — a segmented pill. The active side is filled so which one is on is
+     readable at a glance, without a second colour to learn. */
+  #lang { display: flex; flex: none; border: 1px solid var(--line); border-radius: 6px;
+          overflow: hidden; background: #262c35; }
+  #lang button { border: 0; border-radius: 0; padding: 4px 10px; background: transparent;
+                 color: var(--dim); font-size: 12px; line-height: 1.4; }
+  #lang button:hover:not(.on) { color: var(--fg); background: #2e3540; }
+  #lang button.on { background: #0f1216; color: #fff; font-weight: 600; }
+</style>
+
+<header>
+  <h1 data-i18n="app">deescreen button editor</h1>
+  <button id="newprof" data-i18n="newprof" data-i18n-title="newprof.t">＋ Profile</button>
+  <select id="profpick" data-i18n-title="profpick.t"></select>
+  <span id="winmeta" data-i18n="loading">loading…</span>
+  <button id="restore" data-i18n="restore">Restore window</button>
+  <button id="refresh" data-i18n="refresh">Refresh capture</button>
+  <button id="detect" data-i18n="detect">Detect controls</button>
+  <button id="export" data-i18n="export">Export</button>
+  <input id="code" type="password" size="12" autocomplete="off"
+         data-i18n-ph="code.ph" data-i18n-title="code.t">
+  <button id="save" class="primary" data-i18n="save">Save</button>
+  <div id="lang">
+    <button data-lang="ko">한국어</button><button data-lang="en">English</button>
+  </div>
+</header>
+
+<main>
+  <div id="left">
+    <div id="stagewrap">
+      <div id="stage" class="empty">
+        <img id="shot" alt=""><canvas id="ov"></canvas>
+        <div id="nocap"></div>
+      </div>
+    </div>
+
+    <div id="footer">
+      <div class="title" data-i18n="selected">Selected <span id="selhint"></span></div>
+      <div id="form" class="empty">
+        <div class="frow">
+          <div class="f"><span data-i18n="f.name">Name</span><input id="f_name" type="text"></div>
+          <div class="f"><span data-i18n="f.kind">Kind</span>
+            <select id="f_kind">
+              <option value="target" data-i18n="kind.button">Button (pressed)</option>
+              <option value="region" data-i18n="kind.region">Region (captured)</option>
+            </select>
+          </div>
+          <div class="f"><span>x, y</span>
+            <input id="f_x" type="number"><input id="f_y" type="number"></div>
+          <div class="f"><span>w, h</span>
+            <input id="f_w" type="number"><input id="f_h" type="number"></div>
+          <div id="targetOnly" class="off">
+            <div class="f"><span data-i18n="f.mouse">Mouse</span>
+              <select id="f_button"><option>left</option><option>right</option><option>middle</option></select>
+              <label style="display:flex;gap:4px;align-items:center;color:var(--dim)">
+                <input id="f_double" type="checkbox"><span data-i18n="f.double">double</span></label>
+            </div>
+            <div class="f">
+              <label style="display:flex;gap:4px;align-items:center;color:var(--dim)"
+                     data-i18n-title="f.confirm.t">
+                <input id="f_confirm" type="checkbox"><span data-i18n="f.confirm">confirm</span></label>
+            </div>
+            <div class="f"><span data-i18n="f.settle">Settle ms</span>
+              <input id="f_settle" type="number" data-i18n-ph="f.settle.ph"></div>
+            <div class="f"><button id="testClick" data-i18n="tryit">Try it</button></div>
+          </div>
+        </div>
+        <div class="frow off" id="noteRow">
+          <div class="f"><span data-i18n="f.note">Note</span>
+            <input id="f_note" type="text" data-i18n-ph="f.note.ph"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <aside>
+    <div id="panels">
+      <h2 data-i18n="h.window">Target window</h2>
+      <div class="row"><label data-i18n="l.desc">Description</label>
+        <input id="p_desc" type="text" data-i18n-title="l.desc.t" data-i18n-ph="l.desc.ph"></div>
+      <div class="row"><label data-i18n="l.programs">Programs</label>
+        <select id="winpick" data-i18n-title="l.programs.t"></select></div>
+      <div class="row"><label data-i18n="l.title">Title</label>
+        <input id="w_title" type="text" data-i18n-ph="l.title.ph" data-i18n-title="l.title.t"></div>
+      <div class="row"><label data-i18n="l.class">Class</label>
+        <input id="w_class" type="text" data-i18n-ph="l.class.ph" data-i18n-title="l.class.t"></div>
+      <div class="row">
+        <label data-i18n="l.exact">Exact</label><input id="w_exact" type="checkbox" style="flex:none">
+        <span class="hint" style="margin:0" data-i18n="l.exact.hint">the whole title must match</span>
+      </div>
+      <p id="winmatch" class="hint"></p>
+      <p class="hint" data-i18n-html="hint.match"></p>
+
+      <h2 data-i18n="h.ref">Reference size</h2>
+      <div class="row">
+        <span id="refmeta" class="xy">—</span>
+        <button id="setref" style="margin-left:auto" data-i18n="fitref">Fit to current window</button>
+      </div>
+
+      <h2 data-i18n="h.tools">Tools</h2>
+      <div class="row">
+        <button id="addTarget" data-i18n="addbtn">＋ Button</button>
+        <button id="addRegion" data-i18n="addregion">＋ Region</button>
+        <button id="del" class="danger" disabled data-i18n="del">Delete</button>
+        <button id="delall" class="danger" data-i18n="delall">Delete all</button>
+      </div>
+      <p class="hint" data-i18n-html="hint.draw"></p>
+      <p class="hint" data-i18n-html="hint.kinds"></p>
+    </div>
+
+    <div id="listwrap">
+      <h2><span data-i18n="h.list">List</span> <span id="listcount" class="xy"></span></h2>
+      <ul id="list"></ul>
+    </div>
+  </aside>
+</main>
+
+<div id="modal">
+  <div id="modalbox">
+    <p id="msg"></p>
+    <div class="foot"><button id="modalclose" class="primary" data-i18n="close">Close</button></div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+
+// ── language ─────────────────────────────────────────────────────────
+//
+// The editor is the one surface a person reads, so it speaks the reader's language. Everything
+// an agent reads — /help, /health, every API error — stays English, because those have to line
+// up with the words in the source and the manual.
+//
+// Strings live in one table rather than being fetched, so the editor keeps its promise of
+// making no external request. `{0}` placeholders are filled positionally by `t()`.
+const STRINGS = {
+  en: {
+    'app': 'deescreen button editor',
+    'newprof': '＋ Profile',
+    'newprof.t': 'Create a profile. A file profiles/deescreen.<name>.json appears and is picked up immediately.',
+    'profpick.t': "Which window's coordinate universe. Every profile has its own window, buttons, regions and reference size.",
+    'loading': 'loading…',
+    'restore': 'Restore window',
+    'refresh': 'Refresh capture',
+    'detect': 'Detect controls',
+    'export': 'Export',
+    'save': 'Save',
+    'close': 'Close',
+    'code.ph': 'admin code',
+    'code.t': 'On a successful save this is remembered only while this tab is open (closing the tab clears it; it never touches disk)',
+    'code.ph.no': 'admin code (not needed)',
+    'code.ph.yes': 'admin code (required)',
+    'code.t.no': 'This server has an empty admin_code, so no code is required.',
+    'code.t.yes': 'Must match admin_code in config.json. That is read at startup only, so restart after changing it.',
+
+    'selected': 'Selected',
+    'selhint.none': '— pick one from the list or the picture',
+    'selhint.button': '— button',
+    'selhint.region': '— region',
+    'f.name': 'Name', 'f.kind': 'Kind', 'f.mouse': 'Mouse', 'f.double': 'double',
+    'f.confirm': 'confirm', 'f.settle': 'Settle ms', 'f.settle.ph': 'default',
+    'confirm.unprotect': 'This save takes the confirm flag off: $1
+
+Those buttons will stop asking before they are pressed - by you, and by any agent using this server. Save anyway?',
+    'ok.unprotect.no': 'Not saved. The confirm flags are as they were.',
+    'f.note': 'Note', 'tryit': 'Try it',
+    'f.confirm.t': 'Tick this for anything a person would have to undo by hand. Then the request must carry confirm as well.',
+    'f.note.ph': 'what this is — passed to the caller verbatim when a press is refused',
+    'kind.button': 'Button (pressed)', 'kind.region': 'Region (captured)',
+
+    'h.window': 'Target window', 'h.ref': 'Reference size', 'h.tools': 'Tools', 'h.list': 'List',
+    'l.desc': 'Description',
+    'l.desc.t': 'What this profile is, in plain language. It goes into /health and /profiles for agents to read.',
+    'l.desc.ph': 'e.g. the FANUC simulator that mirrors the real machine',
+    'l.programs': 'Programs',
+    'l.programs.t': 'Windows open right now. Picking one fills in the two fields below.',
+    'l.title': 'Title',
+    'l.title.ph': 'substring match — a short fragment is fine',
+    'l.title.t': 'This is a matching rule, not a fixed value. Many applications append the open file name, so keep only the part that never changes.',
+    'l.class': 'Class',
+    'l.class.ph': '(optional) when several share a title',
+    'l.class.t': 'The window class name. Use it to narrow down when the title alone matches several.',
+    'l.exact': 'Exact', 'l.exact.hint': 'the whole title must match',
+    'hint.match': 'Title and class are a <b>matching rule</b>, not fixed values. If the application appends the open file name, keep only the part that never changes (e.g. <code>NCGuide</code>).',
+    'fitref': 'Fit to current window',
+    'addbtn': '＋ Button', 'addregion': '＋ Region', 'del': 'Delete', 'delall': 'Delete all',
+    'hint.draw': 'Press <b>[＋ Button]</b> or <b>[＋ Region]</b> above, then drag on the picture to create a rectangle. Drag to move, use the bottom-right corner to resize, <kbd>←↑→↓</kbd> nudges 1px (<kbd>Shift</kbd> 10px), <kbd>Delete</kbd> removes.',
+    'hint.kinds': 'A <b>button</b> is somewhere you press; a <b>region</b> is somewhere you capture.',
+
+    'opt.none': '(none)',
+    'winpick.ph': '— pick one to fill in the fields below —',
+    'winmeta.notfound': 'window not found',
+    'winmeta.noprof': 'no profiles',
+    'winmeta.loadfail': 'could not load',
+    'winmeta.unsaved': '{0} · client {1}×{2} (unsaved)',
+    'winmeta.ok': '{0} · client {1}×{2} · dpi {3}',
+    'winmeta.mismatch': '  (differs from the reference size)',
+    'count.buttons': '{0} buttons', 'count.buttons.one': '{0} button',
+    'count.regions': '{0} regions', 'count.regions.one': '{0} region',
+    'listcount.deleted': "  ·  deleted '{0}'",
+    'refmeta.none': 'none (window is {0})',
+    'refmeta.same': ' (matches the window)',
+    'refmeta.diff': ' · window is {0}',
+    'profpick.default': ' (default)',
+
+    'match.need': 'A title or a class is required.',
+    'match.none': 'Nothing open right now matches.',
+    'match.one': '1 match: {0}',
+    'match.many': '{0} windows match — narrow it with a class or an exact title. With several, the server refuses to act.',
+    'match.unsaved': '  (not saved yet — save to keep it)',
+
+    'stage.loadfail': '<h3>Could not read the profile list</h3>{0}<ol><li>Is the server alive — <code>/ping</code> is exempt from the whitelist.</li><li>Is this PC in <code>allowed_ips_read</code>? <b>Localhost is not allowed automatically</b> — <code>127.0.0.1</code> has to be on the list.</li><li>Restart after fixing it — <code>config.json</code> is read at startup only.</li></ol>',
+    'stage.minimised': '<h3>The window is minimised</h3>Press <b>[Restore window]</b> above.',
+    'stage.pick': '<h3>Pick the program to drive</h3>Choose from <b>Programs</b> under <b>Target window</b> on the right and that program’s screen appears here <b>before you save</b>.<ol><li>Pick from <b>Programs</b>.</li><li>When the picture appears, <b>Reference size → [Fit to current window]</b>.</li><li>Draw rectangles with <b>[＋ Button]</b>.</li><li><b>Save</b>.</li></ol>',
+    'stage.notfound': '<h3>Could not find the target window</h3>{0}<ol><li>Check that the program is running.</li><li>Fix the title or class under <b>[Target window]</b> on the right — it counts the matches live as you type.</li></ol>The list and the coordinates stay editable without a window.',
+    'stage.noprofiles': '<h3>There are no profiles yet</h3>One profile = <b>one window</b> plus all of that window’s buttons and regions. Make one per program you want to drive.<ol><li>Press <b>[＋ Profile]</b> above and give it a name (e.g. <code>ncguide</code>).</li><li><b>Target window</b> — pick the program from [Programs].</li><li><b>Reference size</b> — press [Fit to current window].</li><li>When the picture appears, draw rectangles on it with <b>[＋ Button]</b>.</li><li><b>Save</b>.</li></ol>',
+    'stage.capfail': '<h3>Could not capture</h3>{0}',
+    'stage.capwinfail': '<h3>Could not capture that window</h3>{0}',
+
+    'err.restore': 'Could not restore the window: {0}',
+    'err.sizemismatch': '{0}\n\nPress [Fit to current window] under Reference size and save to resolve it.',
+    'err.winchanged': 'The window changed from {1}×{2} to {3}×{4}.\nThe {0} rectangles already drawn are relative to the old one — check them again.',
+    'err.winchanged.one': 'The window changed from {1}×{2} to {3}×{4}.\nThe one rectangle already drawn is relative to the old one — check it again.',
+    'ok.switched': 'Switched the picture to "{0}". Save to keep it.',
+    'prompt.newname': 'New profile name (letters, digits, - and _)\ne.g. nctrainer, edm, line2',
+    'err.badname': 'Only letters, digits, hyphen and underscore. The name travels in URLs and capture file names.',
+    'err.nameexists': "'{0}' already exists.",
+    'err.needcode.new': 'Saving needs an admin code. Fill in the box in the header and try again.',
+    'err.createfail': 'Could not create the profile ({0})\n{1}',
+    'err.createfail2': 'Could not create the profile: {0}',
+    'ok.created': "Created '{0}'. Pick the program to drive from [Programs] — its screen appears the moment you do.",
+    'ok.toregion': 'Changed to a region. A region is only a rectangle, so {0} was dropped.',
+    'drop.confirm': 'confirm', 'drop.settle': 'settle ms', 'drop.note': 'note',
+    'confirm.delall': 'This deletes all {0} entries. Nothing reaches the file until you save.',
+    'confirm.delall.one': 'This deletes the one entry in the list. Nothing reaches the file until you save.',
+    'ok.cleared': 'List cleared. Save to write it to the file.',
+    'err.nosize': 'The window size has not been read yet.',
+    'ok.refset': 'Reference size set to {0}×{1}. Save to apply it.',
+    'ok.detected': 'Added {0} (skipped {1} containers and tiny ones). Most of them are for discarding — keep only the ones sitting on a real button, and [Delete all] then drawing by hand may well be faster.',
+    'err.detect': 'Control detection failed: {0}',
+    'note.detected': 'auto-detected: {0}{1} — needs checking',
+    'note.nocaption': ' (no caption)',
+    'ok.exported': 'Put the downloaded file in profiles/ on the target PC and call POST /admin/reload.',
+    'err.needcode.save': 'This server requires an admin code. Put the admin_code value from config.json into the [admin code] box in the header and save again. To do without a code entirely, set admin_code to an empty string in config.json and restart.',
+    'confirm.save': 'Saving {0} and {1}.',
+    'confirm.save.risky': '\nMarked confirm: {0}',
+    'confirm.save.none': '\nNothing is marked confirm. Is there really nothing here that is hard to undo?',
+    'err.badcode': 'The admin code does not match. The [admin code] box in the header has to equal admin_code in config.json. That file is read at startup only, so a restart is needed if you changed it.',
+    'err.savefail': 'Save failed ({0})\n{1}',
+    'err.savefail2': 'Save failed: {0}',
+    'ok.saved': 'Saved (live immediately). Backup: {0}',
+    'err.clickfail': 'Click failed ({0})\n{1}\nNote: the server does not know about buttons you have not saved.',
+    'err.clickfail2': 'Click failed: {0}',
+    'ok.clicked': 'Clicked. Refresh the capture to see the result.',
+    'ok.deleted': "  ·  deleted '{0}'",
+  },
+  ko: {
+    'app': 'deescreen 버튼 편집기',
+    'newprof': '＋ 프로파일',
+    'newprof.t': '새 프로파일을 만듭니다. profiles/deescreen.<이름>.json 파일이 생기고 즉시 잡힙니다.',
+    'profpick.t': '어느 창의 좌표 우주인지. 프로파일마다 창·버튼·영역·기준 크기가 따로입니다.',
+    'loading': '불러오는 중…',
+    'restore': '창 복원',
+    'refresh': '캡처 새로고침',
+    'detect': '컨트롤 감지',
+    'export': '내보내기',
+    'save': '저장',
+    'close': '닫기',
+    'code.ph': 'admin code',
+    'code.t': '저장에 성공하면 이 탭이 열려 있는 동안만 기억합니다 (탭을 닫으면 지워지고, 디스크에는 남지 않습니다)',
+    'code.ph.no': 'admin code (불필요)',
+    'code.ph.yes': 'admin code (필수)',
+    'code.t.no': '이 서버는 admin_code 가 비어 있어 코드를 요구하지 않습니다.',
+    'code.t.yes': 'config.json 의 admin_code 값과 같아야 합니다. 시작할 때만 읽으므로 바꿨다면 재시작하세요.',
+
+    'selected': '선택한 항목',
+    'selhint.none': '— 목록이나 그림에서 고르세요',
+    'selhint.button': '— 버튼',
+    'selhint.region': '— 영역',
+    'f.name': '이름', 'f.kind': '종류', 'f.mouse': '마우스', 'f.double': '더블',
+    'f.confirm': '확인 필요', 'f.settle': '정착 ms', 'f.settle.ph': '기본값',
+    'confirm.unprotect': '이 저장은 다음 버튼에서 확인 요구를 없앱니다: $1
+
+앞으로 그 버튼들은 눌리기 전에 묻지 않습니다 — 당신이 누를 때도, 이 서버를 쓰는 에이전트가 누를 때도. 그래도 저장할까요?',
+    'ok.unprotect.no': '저장하지 않았습니다. 확인 요구는 그대로입니다.',
+    'f.note': '메모', 'tryit': '눌러보기',
+    'f.confirm.t': '되돌리는 데 사람 손이 필요한 것에 체크. 체크하면 요청에도 confirm 이 있어야 눌립니다.',
+    'f.note.ph': '이게 무엇인지 — 거부될 때 호출자에게 그대로 전달됩니다',
+    'kind.button': '버튼 (누름)', 'kind.region': '영역 (찍음)',
+
+    'h.window': '대상 창', 'h.ref': '기준 크기', 'h.tools': '도구', 'h.list': '목록',
+    'l.desc': '설명',
+    'l.desc.t': '이 프로파일이 무엇인지 사람 말로. /health 와 /profiles 에 그대로 실려 에이전트가 읽습니다.',
+    'l.desc.ph': '예: 실장비와 같은 화면의 FANUC 시뮬레이터',
+    'l.programs': '프로그램 목록',
+    'l.programs.t': '지금 열려 있는 창들. 고르면 아래 두 칸이 채워집니다.',
+    'l.title': '제목',
+    'l.title.ph': '부분 일치 — 짧게 줄여도 됩니다',
+    'l.title.t': '고정값이 아니라 찾는 규칙입니다. 제목에 파일명이 붙는 앱이 많으니 변하지 않는 부분만 남기세요.',
+    'l.class': '클래스',
+    'l.class.ph': '(선택) 같은 제목이 여럿일 때',
+    'l.class.t': '창 클래스명. 제목만으로 여러 개가 걸릴 때 좁히는 용도입니다.',
+    'l.exact': '완전 일치', 'l.exact.hint': '제목이 통째로 같아야 함',
+    'hint.match': '제목·클래스는 <b>찾는 규칙</b>이지 고정값이 아닙니다. 제목에 열린 파일명이 붙는 앱이라면 변하지 않는 부분만 남기세요 (예: <code>NCGuide</code>).',
+    'fitref': '현재 창에 맞춤',
+    'addbtn': '＋ 버튼', 'addregion': '＋ 영역', 'del': '삭제', 'delall': '모두 삭제',
+    'hint.draw': '위 <b>[＋ 버튼]</b> 이나 <b>[＋ 영역]</b> 을 누른 뒤 그림에서 드래그하면 사각형이 생깁니다. 끌면 이동, 오른쪽 아래 모서리로 크기 조절, <kbd>←↑→↓</kbd> 로 1px 씩(<kbd>Shift</kbd> 10px), <kbd>Delete</kbd> 로 삭제.',
+    'hint.kinds': '<b>버튼</b>은 누르는 곳, <b>영역</b>은 찍는 곳입니다.',
+
+    'opt.none': '(없음)',
+    'winpick.ph': '— 고르면 아래가 채워집니다 —',
+    'winmeta.notfound': '창을 찾지 못함',
+    'winmeta.noprof': '프로파일 없음',
+    'winmeta.loadfail': '불러오지 못함',
+    'winmeta.unsaved': '{0} · client {1}×{2} (저장 전)',
+    'winmeta.ok': '{0} · client {1}×{2} · dpi {3}',
+    'winmeta.mismatch': '  (기준 크기와 다름)',
+    'count.buttons': '버튼 {0}', 'count.regions': '영역 {0}',
+    'listcount.deleted': "  ·  '{0}' 지움",
+    'refmeta.none': '없음 (현재 창 {0})',
+    'refmeta.same': ' (현재 창과 일치)',
+    'refmeta.diff': ' · 현재 창은 {0}',
+    'profpick.default': ' (기본)',
+
+    'match.need': '제목이나 클래스 중 하나는 있어야 합니다.',
+    'match.none': '지금 열린 창 중 일치하는 것이 없습니다.',
+    'match.one': '1개 일치: {0}',
+    'match.many': '{0}개가 걸립니다 — 클래스를 넣거나 완전 일치로 좁히세요. 여럿이면 서버가 조작을 거부합니다.',
+    'match.unsaved': '  (아직 저장 전 — 저장해야 남습니다)',
+
+    'stage.loadfail': '<h3>프로파일 목록을 읽지 못했습니다</h3>{0}<ol><li>서버가 살아 있는지 — <code>/ping</code> 은 화이트리스트 면제입니다.</li><li>이 PC 가 <code>allowed_ips_read</code> 에 있는지. <b>로컬호스트도 자동 통과가 아닙니다</b> — <code>127.0.0.1</code> 이 명단에 적혀 있어야 합니다.</li><li>고친 뒤에는 재시작 — <code>config.json</code> 은 시작할 때만 읽습니다.</li></ol>',
+    'stage.minimised': '<h3>창이 최소화되어 있습니다</h3>위의 <b>[창 복원]</b> 을 누르면 됩니다.',
+    'stage.pick': '<h3>조작할 프로그램을 고르세요</h3>오른쪽 <b>[대상 창]</b> 의 <b>프로그램 목록</b> 에서 고르면 <b>저장 전에도</b> 그 프로그램의 화면이 여기 바로 뜹니다.<ol><li><b>프로그램 목록</b> 에서 고릅니다.</li><li>화면이 뜨면 <b>기준 크기 → [현재 창에 맞춤]</b>.</li><li><b>[＋ 버튼]</b> 으로 사각형을 그립니다.</li><li><b>저장</b>.</li></ol>',
+    'stage.notfound': '<h3>대상 창을 찾지 못했습니다</h3>{0}<ol><li>그 프로그램이 실행 중인지 확인합니다.</li><li>오른쪽 <b>[대상 창]</b> 의 제목·클래스를 고칩니다 — 아래에 몇 개가 걸리는지 실시간으로 보여줍니다.</li></ol>목록과 좌표는 창이 없어도 그대로 편집할 수 있습니다.',
+    'stage.noprofiles': '<h3>아직 프로파일이 없습니다</h3>프로파일 하나 = <b>창 하나</b> 와 그 창의 버튼·영역 전부입니다. 조작할 프로그램마다 하나씩 만듭니다.<ol><li>위의 <b>[＋ 프로파일]</b> 을 눌러 이름을 정합니다 (예: <code>ncguide</code>).</li><li><b>대상 창</b> — [프로그램 목록] 에서 조작할 프로그램을 고릅니다.</li><li><b>기준 크기</b> — [현재 창에 맞춤] 을 누릅니다.</li><li>화면이 뜨면 그 위에 <b>[＋ 버튼]</b> 으로 사각형을 그립니다.</li><li><b>저장</b>.</li></ol>',
+    'stage.capfail': '<h3>캡처하지 못했습니다</h3>{0}',
+    'stage.capwinfail': '<h3>그 창을 찍지 못했습니다</h3>{0}',
+
+    'err.restore': '창 복원 실패: {0}',
+    'err.sizemismatch': '{0}\n\n기준 크기의 [현재 창에 맞춤] 을 누르고 저장하면 해결됩니다.',
+    'err.winchanged': '창이 {1}×{2} → {3}×{4} 로 바뀌었습니다.\n이미 그려둔 {0}개의 좌표는 옛 창 기준이니 다시 확인하세요.',
+    'ok.switched': '화면을 "{0}" 로 바꿨습니다. 저장해야 그대로 남습니다.',
+    'prompt.newname': '새 프로파일 이름 (영문/숫자/-/_)\n예: nctrainer, edm, line2',
+    'err.badname': '이름은 영문·숫자·하이픈·밑줄만 됩니다. URL 과 캡처 파일명에 그대로 실리기 때문입니다.',
+    'err.nameexists': "'{0}' 은 이미 있습니다.",
+    'err.needcode.new': '저장에 admin code 가 필요합니다. 헤더의 칸을 채우고 다시 시도하세요.',
+    'err.createfail': '프로파일 생성 실패 ({0})\n{1}',
+    'err.createfail2': '프로파일 생성 실패: {0}',
+    'ok.created': "'{0}' 을 만들었습니다. [프로그램 목록] 에서 조작할 프로그램을 고르세요 — 고르는 순간 그 화면이 뜹니다.",
+    'ok.toregion': '영역으로 바꿨습니다. 영역은 사각형만 가지므로 {0} 은(는) 버렸습니다.',
+    'drop.confirm': '확인 필요', 'drop.settle': '정착 ms', 'drop.note': '메모',
+    'confirm.delall': '목록의 {0}개를 모두 지웁니다. 저장하기 전까지는 파일에 반영되지 않습니다.',
+    'ok.cleared': '목록을 비웠습니다. 저장해야 파일에 반영됩니다.',
+    'err.nosize': '창 크기를 아직 못 읽었습니다.',
+    'ok.refset': '기준 크기를 {0}×{1} 로 맞췄습니다. 저장해야 반영됩니다.',
+    'ok.detected': '{0}개 추가 (컨테이너·초소형 {1}개 제외). 대부분은 버릴 것입니다 — 그림에서 실제 버튼 위에 앉은 것만 남기고 [모두 삭제] 후 손으로 그리는 편이 빠를 수도 있습니다.',
+    'err.detect': '컨트롤 감지 실패: {0}',
+    'note.detected': '자동 감지: {0}{1} — 확인 필요',
+    'note.nocaption': ' (캡션 없음)',
+    'ok.exported': '내려받은 파일을 대상 PC 의 profiles/ 폴더에 넣고 POST /admin/reload 하세요.',
+    'err.needcode.save': '이 서버는 admin code 를 요구합니다. 헤더의 [admin code] 칸에 config.json 의 admin_code 값을 넣고 다시 저장하세요. 코드를 아예 안 쓰려면 config.json 의 admin_code 를 빈 문자열로 두고 재시작하면 됩니다.',
+    'confirm.save': '{0} · {1} 을 저장합니다.',
+    'confirm.save.risky': '\n확인 필요 버튼: {0}',
+    'confirm.save.none': '\n확인 필요로 표시된 버튼이 없습니다. 되돌리기 어려운 것이 정말 없나요?',
+    'err.badcode': 'admin code 가 맞지 않습니다. 헤더의 [admin code] 칸 값이 config.json 의 admin_code 와 같아야 합니다. config.json 은 시작할 때만 읽으므로 값을 바꿨다면 재시작이 필요합니다.',
+    'err.savefail': '저장 실패 ({0})\n{1}',
+    'err.savefail2': '저장 실패: {0}',
+    'ok.saved': '저장했습니다 (즉시 반영됨). 백업: {0}',
+    'err.clickfail': '클릭 실패 ({0})\n{1}\n※ 저장하지 않은 버튼은 서버가 모릅니다.',
+    'err.clickfail2': '클릭 실패: {0}',
+    'ok.clicked': '클릭했습니다. 캡처를 새로고침해 결과를 보세요.',
+    'ok.deleted': "  ·  '{0}' 지움",
+  },
+};
+
+const LANG_KEY = 'deescreen.lang';
+// First visit follows the browser; after that the choice is remembered per browser. Wrapped
+// because storage throws outright in some privacy modes, and a dead editor over a language
+// preference would be absurd.
+let lang = (() => {
+  try {
+    const saved = localStorage.getItem(LANG_KEY);
+    if (saved && STRINGS[saved]) return saved;
+  } catch (_) {}
+  return (navigator.language || 'en').toLowerCase().startsWith('ko') ? 'ko' : 'en';
+})();
+
+/// Look up a string and fill its `{0}`-style placeholders. An unknown key returns the key
+/// itself rather than blank — a missing translation should be visible, not invisible.
+function t(key, ...args) {
+  const table = STRINGS[lang] || STRINGS.en;
+  let out = table[key] ?? STRINGS.en[key] ?? key;
+  args.forEach((v, i) => { out = out.split('{' + i + '}').join(String(v)); });
+  return out;
+}
+
+/// `t()` for a count. `{0}` is the count; a `key.one` variant is preferred when it is exactly 1.
+///
+/// English needs "1 region" and "2 regions"; Korean does not inflect for number at all. So the
+/// singular is an optional extra key rather than a rule baked into the lookup — a language that
+/// does not need one simply does not define it, and nothing here has to know which is which.
+function tn(key, n, ...rest) {
+  const table = STRINGS[lang] || STRINGS.en;
+  const one = key + '.one';
+  return t(n === 1 && (one in table) ? one : key, n, ...rest);
+}
+
+// The stage panel is rebuilt rather than translated in place, so switching language while one
+// is showing does not leave half a sentence behind.
+let lastStage = null;
+function stagePanel(key, ...args) {
+  lastStage = [key, args];
+  showStage(false, t(key, ...args));
+}
+
+function applyLang() {
+  document.documentElement.lang = lang;
+  for (const el of document.querySelectorAll('[data-i18n]')) {
+    // Only the element's own text — a child <span> carrying its own key must survive.
+    const own = [...el.childNodes].find(n => n.nodeType === 3 && n.textContent.trim());
+    if (own) own.textContent = t(el.dataset.i18n);
+    else if (!el.children.length) el.textContent = t(el.dataset.i18n);
+  }
+  for (const el of document.querySelectorAll('[data-i18n-html]')) el.innerHTML = t(el.dataset.i18nHtml);
+  for (const el of document.querySelectorAll('[data-i18n-title]')) el.title = t(el.dataset.i18nTitle);
+  for (const el of document.querySelectorAll('[data-i18n-ph]')) el.placeholder = t(el.dataset.i18nPh);
+  for (const b of document.querySelectorAll('#lang button')) b.classList.toggle('on', b.dataset.lang === lang);
+
+  // Anything rendered from data has to be redrawn — translating the DOM in place would leave
+  // the parts JS wrote untouched.
+  if (typeof renderAdminHint === 'function') {
+    renderAdminHint();
+    renderWindowPicker();
+    renderWindowMatch();
+    renderRef();
+    renderList();
+    select(sel);
+    if (lastStage) showStage(false, t(lastStage[0], ...lastStage[1]));
+  }
+}
+
+function setLang(next) {
+  if (!STRINGS[next] || next === lang) return;
+  lang = next;
+  try { localStorage.setItem(LANG_KEY, next); } catch (_) {}
+  say('', '');   // a message already on screen would be left in the old language
+  applyLang();
+}
+const shot = $('#shot'), ov = $('#ov'), ctx = ov.getContext('2d');
+
+let doc = null;          // the whole profile document
+let items = [];          // {kind:'target'|'region', name, rect, ...}
+let sel = -1;
+let client = [0, 0];     // the target window's client size
+// The profile being edited. ?profile= in the URL is honoured, so a link can open a
+// particular window directly.
+let profile = new URLSearchParams(location.search).get('profile') || '';
+let profiles = [];
+const pq = () => (profile ? '&profile=' + encodeURIComponent(profile) : '');
+let adminRequired = false; // whether the server demands an admin code (never its value)
+let windowList = [];      // GET /windows (the picker list, and counting matches)
+let windowChanged = false; // whether a save has to reload against a new window
+let lastDeleted = '';      // the name just deleted — shown once in the list header
+let view = 1;            // display scale (image pixels → screen pixels)
+let mode = null;         // 'target' | 'region' | null (waiting to draw a new one)
+let drag = null;
+
+const COLOR = { target: '#00c8ff', danger: '#ff3c3c', region: '#ffd200', warn: '#ff00dc' };
+
+// With no capture, show what to do about it in that spot. A lone broken-image icon gives
+// a first-time visitor no way to tell "broken" from "not set up yet".
+function showStage(ok, html) {
+  const stage = $('#stage');
+  stage.classList.toggle('empty', !ok);
+  if (ok) lastStage = null;
+  else $('#nocap').innerHTML = html || '';
+}
+
+let msgTimer = null;
+
+// Messages go in a modal. While they lived in the sidebar, every message pushed the rest
+// down and the scroll jumped. Making people dismiss success notices too would be a
+// nuisance, so only those fade by themselves — errors stay until read and closed.
+function say(text, kind) {
+  const overlay = $('#modal');
+  clearTimeout(msgTimer);
+  if (!text) { overlay.classList.remove('on'); return; }
+  const body = $('#msg');
+  body.textContent = text;
+  body.className = kind || '';
+  overlay.classList.add('on');
+  if (kind === 'ok') msgTimer = setTimeout(() => overlay.classList.remove('on'), 2500);
+}
+
+function closeMsg() { clearTimeout(msgTimer); $('#modal').classList.remove('on'); }
+
+// ── loading ──────────────────────────────────────────────────────────
+// On a failed response, take **the reason the server wrote**. This used to ignore res.ok,
+// so instead of "the target window is minimized" you got some unrelated TypeError — the
+// sentence explaining the cause was already in the response and was being thrown away.
+async function getJson(url) {
+  const res = await fetch(url);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(body.error || `HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return body;
+}
+
+async function loadAll() {
+  // Two stages. The button definitions load **independently of the window**, so the list
+  // and the window fields must be drawn even when no window is found — a missing window is
+  // exactly when someone comes in to fix those fields. This used to let the window lookup
+  // throw first, leaving the editor blank, which left no way to fix anything.
+  try {
+    // The whole definition comes from one endpoint — window spec, reference size,
+    // buttons, regions and keys are a single document.
+    let all;
+    try {
+      all = await getJson('/profiles' + (profile ? '?profile=' + encodeURIComponent(profile) : ''));
+    } catch (e) {
+      // ?profile= in the address bar is **the profile you were last looking at**
+      // (switchProfile writes it there). If it was deleted or renamed this 404s, and
+      // showing that raw would wall off the whole editor — you could not even get in to
+      // create a new one. Drop the filter and ask again.
+      if (!profile) throw e;
+      profile = '';
+      const u = new URL(location.href);
+      u.searchParams.delete('profile');
+      history.replaceState(null, '', u);
+      all = await getJson('/profiles');
+    }
+    profiles = Object.keys(all.profiles);
+    adminRequired = !!(all.policy && all.policy.admin_code_required);
+    renderAdminHint();
+    document.body.classList.toggle('noprof', profiles.length === 0);
+
+    // No profiles at all = a fresh install. That is not a fault, so do not greet it with a
+    // red error; just say in the middle of the screen that this is where you make one.
+    // Everything below assumes one profile exists, so stop here.
+    if (profiles.length === 0) { noProfiles(); return; }
+
+    // There may be no default (two or more profiles and config picked none). Opening any
+    // of them is harmless in the editor, so open the first — unlike the control API,
+    // opening one does not touch the window.
+    profile = all.profile || all.default_profile || profiles[0];
+    if (!all.profiles[profile]) profile = profiles[0];
+    // With ?profile= only that one comes back, so fetch the list once more to fill the picker.
+    if (profiles.length === 1 && profiles[0] === profile) {
+      try { profiles = Object.keys((await getJson('/profiles')).profiles); } catch (_) {}
+    }
+    renderProfiles(all.default_profile);
+    doc = toDoc(all.profiles[profile]);
+    $('#p_desc').value = doc.description || '';
+    windowChanged = false;
+    rebuildItems();
+  } catch (e) {
+    // Getting here means the server cannot even hand over the list. Leaving the header on
+    // "loading…" makes it look like it is **still waiting**, and you stare at a stopped
+    // screen forever. Say that it finished, and why.
+    $('#winmeta').textContent = t('winmeta.loadfail');
+    $('#profpick').innerHTML = `<option>${escapeHtml(t('opt.none'))}</option>`;
+    document.body.classList.add('noprof');
+    shot.removeAttribute('src');
+    stagePanel('stage.loadfail', escapeHtml(e.message));
+    say('', '');
+    return;
+  }
+
+  try {
+    windowList = (await getJson('/windows')).windows;
+  } catch (_) {
+    windowList = [];
+  }
+  renderWindowPicker();
+  renderWindowMatch();
+
+  try {
+    const w = await getJson('/window?x=1' + pq());
+    client = w.window.client;
+    $('#winmeta').textContent =
+      t('winmeta.ok', w.window.title, client[0], client[1], w.window.dpi) +
+      (w.size_mismatch ? t('winmeta.mismatch') : '');
+    renderRef();
+    await refreshShot();
+    showStage(true);
+    if (w.size_mismatch) {
+      say(t('err.sizemismatch', w.size_mismatch), 'err');
+    } else {
+      say('', '');
+    }
+  } catch (e) {
+    // Editing continues without a window — the list, the window fields and the coordinate
+    // boxes are all already live.
+    client = [0, 0];
+    shot.removeAttribute('src');
+    $('#winmeta').textContent = t('winmeta.notfound');
+    renderRef();
+
+    if (/minimi[sz]ed/i.test(e.message)) {
+      stagePanel('stage.minimised');
+      say('', '');
+    } else if (!items.length && !windowList.some(w => matchesSpec(w, (doc && doc.window) || {}))) {
+      // A freshly created profile. Showing some arbitrary window here would have you
+      // **drawing rectangles on the wrong program's screen** — the coordinates would
+      // belong to an entirely different window, so black is better. Picking one shows it
+      // immediately.
+      stagePanel('stage.pick');
+      say('', '');
+    } else {
+      stagePanel('stage.notfound', escapeHtml(e.message));
+      say('', '');
+    }
+    paint();
+  }
+}
+
+// The screen for having no profiles at all. There is nothing to look up or capture, so
+// neither is attempted.
+function noProfiles() {
+  profile = '';
+  doc = null;
+  items = [];
+  sel = -1;
+  client = [0, 0];
+  windowList = [];
+  shot.removeAttribute('src');
+  $('#winmeta').textContent = t('winmeta.noprof');
+  $('#profpick').innerHTML = `<option>${escapeHtml(t('opt.none'))}</option>`;
+  $('#list').innerHTML = '';
+  stagePanel('stage.noprofiles');
+  say('', '');
+  paint();
+}
+
+// Undoes both minimised and covered in one go. This is the recovery needed most often in
+// the editor, so it gets a button.
+async function restoreWindow() {
+  try {
+    const r = await fetch('/window/focus?x=1' + pq(), { method: 'POST' });
+    const b = await r.json().catch(() => ({}));
+    if (!r.ok) { say(t('err.restore', b.error || r.status), 'err'); return; }
+    await loadAll();
+  } catch (e) { say(t('err.restore', e), 'err'); }
+}
+
+// Turn one profile view from `/profiles` (arrays) back into the saved document shape.
+function toDoc(t) {
+  const d = {
+    description: t.description || '',
+    window: t.window,
+    reference_client: t.reference_client,
+    on_size_mismatch: t.on_size_mismatch,
+    regions: {}, buttons: {}, keys: {}
+  };
+  for (const r of t.regions) d.regions[r.name] = r.rect;
+  for (const g of t.buttons) {
+    const o = { rect: g.rect };
+    if (g.point) o.point = g.point;
+    if (g.click_button && g.click_button !== 'left') o.click_button = g.click_button;
+    if (g.double) o.double = true;
+    if (g.confirm) o.confirm = true;
+    if (g.settle_ms != null) o.settle_ms = g.settle_ms;
+    if (g.note) o.note = g.note;
+    d.buttons[g.name] = o;
+  }
+  for (const k of t.keys) d.keys[k.name] = k.keys;
+  return d;
+}
+
+function rebuildItems() {
+  items = [];
+  for (const [name, rect] of Object.entries(doc.regions)) items.push({ kind: 'region', name, rect: [...rect] });
+  for (const [name, b] of Object.entries(doc.buttons)) items.push({ kind: 'target', name, ...structuredClone(b) });
+  renderList(); renderRef(); paint();
+}
+
+function toDocFromItems() {
+  const d = structuredClone(doc);
+  d.regions = {}; d.buttons = {};
+  for (const it of items) {
+    if (it.kind === 'region') { d.regions[it.name] = it.rect; continue; }
+    const o = { rect: it.rect };
+    if (it.point) o.point = it.point;
+    if (it.click_button && it.click_button !== 'left') o.click_button = it.click_button;
+    if (it.double) o.double = true;
+    if (it.confirm) o.confirm = true;
+    if (it.settle_ms != null && it.settle_ms !== '') o.settle_ms = Number(it.settle_ms);
+    if (it.note) o.note = it.note;
+    d.buttons[it.name] = o;
+  }
+  return d;
+}
+
+let shotUrl = null;       // from createObjectURL — must be revoked when replaced
+let winPreviewTimer = null;
+
+// Capture using an **unsaved window spec**.
+//
+// GET /capture.png captures the window of the profile as saved on disk. So picking a
+// different program from [Programs] kept showing the old window until you saved, and a
+// freshly created profile showed whatever window had been seeded into it — which means
+// drawing rectangles on the wrong program's screen, and coordinates belonging to an
+// entirely different window. That is the worst kind of silent misbehaviour here.
+//
+// POST /preview.png finds the window from the candidate document in the body, so it
+// switches without saving. buttons=0 turns the server overlay off — the editor canvas
+// draws the rectangles itself.
+async function previewShot() {
+  if (!doc) return false;
+  let r;
+  try {
+    r = await fetch('/preview.png?save=false&buttons=0' + pq(), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(toDocFromItems())
+    });
+  } catch (e) {
+    stagePanel('stage.capwinfail', escapeHtml(String(e)));
+    return false;
+  }
+  if (!r.ok) {
+    let why = 'HTTP ' + r.status;
+    try { why = (await r.json()).error || why; } catch (_) {}
+    shot.removeAttribute('src');
+    stagePanel('stage.capwinfail', escapeHtml(why));
+    return false;
+  }
+  const url = URL.createObjectURL(await r.blob());
+  const ok = await new Promise(res => {
+    shot.onload = () => res(true); shot.onerror = () => res(false); shot.src = url;
+  });
+  if (shotUrl) URL.revokeObjectURL(shotUrl);
+  if (!ok) { URL.revokeObjectURL(url); shotUrl = null; return false; }
+  shotUrl = url;
+  showStage(true);
+  fitView();
+  return true;
+}
+
+// Adopt the chosen window as the editor's coordinate universe — the picture and the
+// client size have to move together.
+async function applyWindowChoice(w) {
+  const before = client;
+  client = w.client;
+  $('#winmeta').textContent = t('winmeta.unsaved', w.title, client[0], client[1]);
+  if (!(await previewShot())) { client = before; return; }
+  renderRef();
+  // Rectangles already drawn are relative to the **old window**. Swapping the window moves
+  // where every one of them points, so this does not pass silently.
+  if (items.length && before[0] && (before[0] !== client[0] || before[1] !== client[1])) {
+    say(tn('err.winchanged', items.length, before[0], before[1], client[0], client[1]), 'err');
+  }
+}
+
+// While the title or class is being typed, do not capture on every keystroke. Capture only
+// when exactly one window matches — zero means there is nothing to capture, and several
+// means the server would refuse to act anyway.
+function scheduleWindowPreview() {
+  clearTimeout(winPreviewTimer);
+  winPreviewTimer = setTimeout(() => {
+    if (!doc) return;
+    const hits = windowList.filter(w => matchesSpec(w, doc.window || {}));
+    if (hits.length === 1) applyWindowChoice(hits[0]);
+  }, 400);
+}
+
+async function refreshShot() {
+  // Always fetch at native size, so an editing coordinate *is* a client coordinate.
+  const url = '/capture.png?save=false&_=' + Date.now() + pq();
+  const ok = await new Promise(res => { shot.onload = () => res(true); shot.onerror = () => res(false); shot.src = url; });
+  if (!ok) {
+    // A failed capture does not leave the screen blank — show the reason so it can be retried.
+    let why = '';
+    try {
+      const r = await fetch('/capture.png?save=false' + pq());
+      const b = await r.json().catch(() => ({}));
+      why = b.error || ('HTTP ' + r.status);
+    } catch (e) { why = String(e); }
+    stagePanel('stage.capfail', escapeHtml(why));
+    return;
+  }
+  showStage(true);
+  fitView();
+}
+
+// If layout settles late, the canvas stays at its default size (300×150) and every
+// coordinate is off — which is exactly what happened on first load. So this is not called
+// once: it re-fits when the image loads, when the window resizes, and when the pane changes
+// size.
+let lastFitWidth = -1;
+function fitView() {
+  if (!shot.naturalWidth) return;
+  const avail = $('#stagewrap').clientWidth - 24;
+  if (avail < 60) return;                       // layout has not settled — try again later
+  lastFitWidth = avail;
+  view = Math.min(1, avail / shot.naturalWidth);
+  const w = Math.round(shot.naturalWidth * view), h = Math.round(shot.naturalHeight * view);
+  shot.style.width = w + 'px';
+  ov.width = w; ov.height = h;
+  ov.style.width = w + 'px'; ov.style.height = h + 'px';
+  paint();
+}
+// Keep retrying until layout settles. If the first fit happens over a zero-width layout,
+// the canvas stays at its default size (300×150), and every rectangle drawn in that state
+// is saved with wrong coordinates — the silent kind of wrong, so it has to be prevented.
+// This uses a timer rather than `requestAnimationFrame`: rAF does not run at all while the
+// page is hidden, so an editor opened in a background tab would stay at the default size
+// forever. Timers still run on a hidden page, just more slowly.
+function scheduleFit(tries = 40) {
+  if (shot.naturalWidth && $('#stagewrap').clientWidth - 24 >= 60) { fitView(); return; }
+  if (tries > 0) setTimeout(() => scheduleFit(tries - 1), 50);
+}
+addEventListener('resize', fitView);
+addEventListener('visibilitychange', () => scheduleFit());
+shot.addEventListener('load', () => scheduleFit());
+new ResizeObserver(() => { if (!drag) fitView(); }).observe($('#stagewrap'));
+
+// ── drawing ──────────────────────────────────────────────────────────
+function colorOf(it) {
+  if (it.kind === 'region') return COLOR.region;
+  const [px, py] = clickPoint(it);
+  if (px < 0 || py < 0 || px >= client[0] || py >= client[1]) return COLOR.warn;
+  return it.confirm ? COLOR.danger : COLOR.target;
+}
+function clickPoint(it) {
+  if (it.point) return it.point;
+  return [it.rect[0] + it.rect[2] / 2, it.rect[1] + it.rect[3] / 2];
+}
+
+function paint() {
+  // If layout settled late and the canvas is stuck at the wrong size, fix it here.
+  // **Never during a drag** — changing the scale mid-gesture makes the start and end points
+  // read in different coordinate systems, producing a wrong rectangle (measured).
+  const avail = $('#stagewrap').clientWidth - 24;
+  if (!drag && avail >= 60 && Math.abs(avail - lastFitWidth) > 2) { fitView(); return; }
+  ctx.clearRect(0, 0, ov.width, ov.height);
+
+  // ── dim everything except the selection ──
+  //
+  // The old emphasis was 1px of border and a slightly denser fill. On a screen carrying
+  // hundreds of rectangles from control detection, that difference is effectively
+  // invisible. What is needed here is not "slightly different" but **know instantly which
+  // one**, so everything else is covered and a hole is punched at the selection. It applies
+  // the same way regardless of kind (button or region).
+  if (sel >= 0 && items[sel]) {
+    const [sx, sy, sw, sh] = items[sel].rect.map(v => v * view);
+    ctx.fillStyle = 'rgba(0,0,0,.55)';
+    ctx.fillRect(0, 0, ov.width, ov.height);
+    ctx.clearRect(sx, sy, sw, sh);   // the hole — the original screen shows through here
+  }
+
+  items.forEach((it, i) => {
+    const on = i === sel;
+    const c = colorOf(it), [x, y, w, h] = it.rect.map(v => v * view);
+    ctx.lineWidth = on ? 3 : 2;
+    ctx.strokeStyle = c;
+    // The selection gets a **lighter** fill, not a heavier one — punching a hole and then
+    // painting colour over it would hide the very control you have to press.
+    ctx.fillStyle = c + (on ? '18' : '20');
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeRect(x, y, w, h);
+
+    if (on) {
+      // A white line inside and outside. Light UI or dark, one of the two always contrasts
+      // (the same problem the crosshair already had, solved the same way).
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = '#fff';
+      ctx.strokeRect(x - 2.5, y - 2.5, w + 5, h + 5);
+      ctx.strokeRect(x + 2.5, y + 2.5, Math.max(0, w - 5), Math.max(0, h - 5));
+      // Corner brackets — on a small rectangle an outline alone does not register.
+      const a = Math.max(6, Math.min(16, Math.min(w, h) / 3));
+      ctx.lineWidth = 3; ctx.strokeStyle = c;
+      ctx.beginPath();
+      ctx.moveTo(x, y + a); ctx.lineTo(x, y); ctx.lineTo(x + a, y);
+      ctx.moveTo(x + w - a, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + a);
+      ctx.moveTo(x + w, y + h - a); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w - a, y + h);
+      ctx.moveTo(x + a, y + h); ctx.lineTo(x, y + h); ctx.lineTo(x, y + h - a);
+      ctx.stroke();
+    }
+
+    const label = it.name + (it.confirm ? ' ⚠' : '');
+    ctx.font = (on ? 'bold 13px' : '11px') + ' "Segoe UI", sans-serif';
+    const tw = ctx.measureText(label).width, lh = on ? 18 : 14;
+    const ly = y > lh + 1 ? y - lh : y + 2;
+    ctx.fillStyle = c; ctx.fillRect(x, ly, tw + 8, lh);
+    ctx.fillStyle = '#000'; ctx.fillText(label, x + 4, ly + lh - 4);
+
+    if (it.kind === 'target') {                      // where the press actually lands
+      const [px, py] = clickPoint(it).map(v => v * view);
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 3; cross(px, py, 7);
+      ctx.strokeStyle = COLOR.danger; ctx.lineWidth = 1; cross(px, py, 7);
+    }
+    if (on) { ctx.fillStyle = c; ctx.fillRect(x + w - 8, y + h - 8, 8, 8); }
+  });
+}
+function cross(x, y, r) {
+  ctx.beginPath(); ctx.moveTo(x - r, y); ctx.lineTo(x + r, y);
+  ctx.moveTo(x, y - r); ctx.lineTo(x, y + r); ctx.stroke();
+}
+
+// ── mouse ────────────────────────────────────────────────────────────
+// Mouse coordinates → client coordinates.
+//
+// The scale is **re-measured from the actual rendered size every time**, not taken from the
+// cached `view`. If that cache is ever wrong (layout does sometimes settle late), every
+// rectangle a person draws is quietly saved at the wrong coordinates — exactly the class of
+// bug this tool exists to eliminate. Re-measuring here keeps the coordinates right even
+// when the cache is not.
+function at(e) {
+  const r = ov.getBoundingClientRect();
+  const sc = r.width / shot.naturalWidth || 1;
+  return [Math.round((e.clientX - r.left) / sc), Math.round((e.clientY - r.top) / sc)];
+}
+function hit(x, y) {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const [rx, ry, rw, rh] = items[i].rect;
+    if (x >= rx && y >= ry && x < rx + rw && y < ry + rh) return i;
+  }
+  return -1;
+}
+
+ov.addEventListener('mousedown', e => {
+  const [x, y] = at(e);
+  if (mode) {
+    items.push(mode === 'target'
+      ? { kind: 'target', name: uniq('target'), rect: [x, y, 1, 1], click_button: 'left', note: '' }
+      : { kind: 'region', name: uniq('region'), rect: [x, y, 1, 1] });
+    sel = items.length - 1;
+    drag = { type: 'resize', ox: x, oy: y };
+    mode = null; $('#addTarget').classList.remove('on'); $('#addRegion').classList.remove('on');
+    select(sel); return;
+  }
+  const i = hit(x, y);
+  if (i < 0) { select(-1); return; }
+  select(i);
+  const [rx, ry, rw, rh] = items[i].rect;
+  drag = (x >= rx + rw - 10 && y >= ry + rh - 10)
+    ? { type: 'resize', ox: rx, oy: ry }
+    : { type: 'move', dx: x - rx, dy: y - ry };
+});
+
+addEventListener('mousemove', e => {
+  if (!drag || sel < 0) return;
+  const [x, y] = at(e), it = items[sel];
+  if (drag.type === 'move') it.rect = [x - drag.dx, y - drag.dy, it.rect[2], it.rect[3]];
+  else it.rect = [Math.min(drag.ox, x), Math.min(drag.oy, y),
+                  Math.max(1, Math.abs(x - drag.ox)), Math.max(1, Math.abs(y - drag.oy))];
+  syncForm(); paint();
+});
+addEventListener('mouseup', () => { drag = null; });
+
+// Delete the selected item and **select the next one.** Control detection produces far more
+// to discard than to keep (252 on the FANUC panel), so deleting happens in runs — making
+// you re-select each time would make holding Delete impossible.
+function deleteSelected() {
+  if (sel < 0) return;
+  const gone = items[sel].name;
+  items.splice(sel, 1);
+  select(items.length ? Math.min(sel, items.length - 1) : -1);
+  // What was deleted is noted **quietly in the list header**. A modal would cover the
+  // screen and block the next Delete every time — and deleting is done dozens of times in a
+  // row, so that would be fatal. The variable is cleared immediately so the note disappears
+  // on the next list render, with no timer involved.
+  lastDeleted = gone;
+  renderList();
+  lastDeleted = '';
+  paint();
+  say('', '');   // close any standing message (never open a new one)
+}
+
+addEventListener('keydown', e => {
+  // Hands off while the cursor is in a text field — an item vanishing because Delete was
+  // pressed while editing its name is the worst thing that could come out of this.
+  if (sel < 0 || /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) return;
+  if (e.key === 'Delete') { e.preventDefault(); deleteSelected(); return; }
+  const step = e.shiftKey ? 10 : 1;
+  const d = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] }[e.key];
+  if (!d) return;
+  e.preventDefault();
+  items[sel].rect[0] += d[0]; items[sel].rect[1] += d[1];
+  syncForm(); paint();
+});
+
+// ── list / form ──────────────────────────────────────────────────────
+// Sequence numbers are **padded to four digits** (ctrl_0001, ctrl_0100).
+//
+// The list is ordered by name (the server holds it in a BTreeMap, so saving freezes that
+// order), and with ragged digit counts the alphabetical order tangles into
+// ctrl_199 → ctrl_2 → ctrl_20 → ctrl_200. Control detection creates hundreds at a time, so
+// that tangle becomes the entire list.
+function uniq(base) {
+  let n = 1, name;
+  do { name = base + '_' + String(n++).padStart(4, '0'); } while (items.some(i => i.name === name));
+  return name;
+}
+function renderList() {
+  const ul = $('#list'); ul.innerHTML = '';
+  const targets = items.filter(x => x.kind === 'target').length;
+  const regions = items.length - targets;
+  $('#listcount').textContent =
+    `${tn('count.buttons', targets)} · ${tn('count.regions', regions)}` +
+    (lastDeleted ? t('ok.deleted', lastDeleted) : '');
+  items.forEach((it, i) => {
+    const li = document.createElement('li');
+    if (i === sel) li.className = 'sel';
+    li.innerHTML = `<span class="swatch" style="background:${colorOf(it)}"></span>` +
+      `<span class="nm">${escapeHtml(it.name)}</span>` +
+      `<span class="xy">${it.rect.join(',')}</span>`;
+    li.onclick = () => select(i);
+    ul.appendChild(li);
+  });
+}
+function escapeHtml(s) { return s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+// A copy of the server's window-matching rule — substring or exact on the title, exact on
+// the class. It is counted here in advance because two or more matches make the server
+// **refuse rather than pick one**. Better to know while choosing than after saving.
+function matchesSpec(w, spec) {
+  const t = (w.title || '').toLowerCase();
+  const needle = (spec.title || '').trim().toLowerCase();
+  const cls = (spec.class || '').trim().toLowerCase();
+  const titleOk = !needle || (spec.title_exact ? t === needle : t.includes(needle));
+  const classOk = !cls || (w.class || '').toLowerCase() === cls;
+  return titleOk && classOk;
+}
+
+function renderWindowPicker() {
+  const sel = $('#winpick');
+  sel.innerHTML = `<option value="">${escapeHtml(t('winpick.ph'))}</option>` +
+    windowList.map((w, i) =>
+      `<option value="${i}">${escapeHtml(w.title)}  [${escapeHtml(w.class)}]  ${w.client[0]}×${w.client[1]}</option>`
+    ).join('');
+}
+
+function renderWindowMatch() {
+  const spec = (doc && doc.window) || {};
+  $('#w_title').value = spec.title || '';
+  $('#w_class').value = spec.class || '';
+  $('#w_exact').checked = !!spec.title_exact;
+  const hits = windowList.filter(w => matchesSpec(w, spec));
+  const el = $('#winmatch');
+  if (!spec.title && !spec.class) {
+    el.textContent = t('match.need');
+    el.style.color = '#ff3c3c';
+  } else if (hits.length === 0) {
+    el.textContent = t('match.none');
+    el.style.color = '#ff3c3c';
+  } else if (hits.length === 1) {
+    el.textContent = t('match.one', hits[0].title);
+    el.style.color = '';
+  } else {
+    el.textContent = t('match.many', hits.length);
+    el.style.color = '#ff8200';
+  }
+  if (windowChanged) {
+    el.textContent += t('match.unsaved');
+  }
+}
+
+function bindWindowFields() {
+  const push = () => {
+    if (!doc) return;
+    doc.description = $('#p_desc').value;
+    doc.window = {
+      title: $('#w_title').value,
+      title_exact: $('#w_exact').checked,
+      class: $('#w_class').value,
+    };
+    windowChanged = true;
+    renderWindowMatch();
+    scheduleWindowPreview();
+  };
+  ['p_desc', 'w_title', 'w_class', 'w_exact'].forEach(id => {
+    const el = $('#' + id);
+    el.oninput = push;
+    el.onchange = push;
+  });
+  $('#winpick').onchange = () => {
+    const i = $('#winpick').value;
+    if (i === '' || !doc) return;
+    const w = windowList[+i];
+    // Leave the title as a substring match and fill in the class alongside it — plenty of
+    // applications append the open file name, so an exact match stops finding the window
+    // the moment a document is opened.
+    doc.window = { title: w.title, title_exact: false, class: w.class };
+    windowChanged = true;
+    renderWindowMatch();
+    clearTimeout(winPreviewTimer);
+    applyWindowChoice(w).then(() => {
+      if (!items.length) say(t('ok.switched', w.title), 'ok');
+    });
+  };
+}
+
+// The admin code box says why it is needed and whether it is empty, before you try to save.
+// The value never comes from the server — only the boolean "is one required".
+function renderAdminHint() {
+  const box = $('#code');
+  if (!adminRequired) {
+    box.placeholder = t('code.ph.no');
+    box.style.borderColor = '';
+    box.title = t('code.t.no');
+    return;
+  }
+  box.placeholder = t('code.ph.yes');
+  box.title = t('code.t.yes');
+  box.style.borderColor = box.value ? '' : '#ff8200';
+}
+
+function renderProfiles(def) {
+  const sel = $('#profpick');
+  sel.innerHTML = profiles.map(n =>
+    `<option value="${n}"${n === profile ? ' selected' : ''}>${escapeHtml(n)}${n === def ? escapeHtml(t('profpick.default')) : ''}</option>`
+  ).join('');
+  sel.style.display = '';
+}
+
+// Switching profile **reloads everything.** The window, the coordinate system and the
+// buttons are an entirely different world, so carrying over even one thing on screen would
+// make it a coordinate belonging to the wrong window.
+//
+// A new profile = registering one more window with this tool. The file
+// profiles/deescreen.<name>.json appears and the server adds it to the list on the spot —
+// no config edit, no restart.
+async function newProfile() {
+  const name = (prompt(t('prompt.newname')) || '').trim();
+  if (!name) return;
+  if (!/^[A-Za-z0-9_-]+$/.test(name)) {
+    say(t('err.badname'), 'err');
+    return;
+  }
+  if (profiles.includes(name)) { say(t('err.nameexists', name), 'err'); return; }
+  if (adminRequired && !$('#code').value) {
+    say(t('err.needcode.new'), 'err');
+    return;
+  }
+  // An empty window spec fails server validation (an empty rule matches every window), so
+  // something has to go in. This used to seed the first open window, which meant **the wrong
+  // program's screen** appeared right after creation and you drew rectangles on it. Seeding
+  // the profile name as an exact match matches nothing, so the screen stays black until you
+  // pick.
+  const seed = {
+    description: '',
+    window: { title: name, title_exact: true, class: '' },
+    reference_client: null, on_size_mismatch: 'reject',
+    regions: {}, buttons: {}, keys: {}
+  };
+  try {
+    const res = await fetch('/admin/profile?profile=' + encodeURIComponent(name), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Code': $('#code').value },
+      body: JSON.stringify(seed)
+    });
+    const b = await res.json().catch(() => ({}));
+    if (!res.ok) { say(t('err.createfail', res.status, b.error || ''), 'err'); return; }
+    await switchProfile(name);
+    say(t('ok.created', name), 'ok');
+  } catch (e) { say(t('err.createfail2', e), 'err'); }
+}
+
+async function switchProfile(name) {
+  profile = name;
+  const u = new URL(location.href);
+  u.searchParams.set('profile', name);
+  history.replaceState(null, '', u);   // so a refresh comes back to the same profile
+  items = []; sel = -1; doc = null;
+  await loadAll();
+  scheduleFit();
+}
+
+// Showing the reference size. Without a way to fix `reference_client` from the editor,
+// freshly drawn coordinates get saved against a stale reference and are refused from the
+// moment you save.
+function renderRef() {
+  const r = doc && doc.reference_client;
+  const cur = `${client[0]}×${client[1]}`;
+  const el = $('#refmeta');
+  if (!r) { el.textContent = t('refmeta.none', cur); el.style.color = ''; return; }
+  const same = r[0] === client[0] && r[1] === client[1];
+  el.textContent = `${r[0]}×${r[1]}` + (same ? t('refmeta.same') : t('refmeta.diff', cur));
+  el.style.color = same ? '' : '#ff8200';
+}
+
+function select(i) {
+  sel = i;
+  $('#del').disabled = i < 0;
+  // A class rather than hidden — the space stays, it only dims.
+  $('#form').classList.toggle('empty', i < 0);
+  $('#selhint').textContent = i < 0 ? t('selhint.none')
+                                    : t(items[i].kind === 'target' ? 'selhint.button' : 'selhint.region');
+  const isTarget = i >= 0 && items[i].kind === 'target';
+  $('#targetOnly').classList.toggle('off', !isTarget);
+  $('#noteRow').classList.toggle('off', !isTarget);
+  if (i >= 0) { $('#f_kind').value = items[i].kind; syncForm(); }
+  renderList(); paint();
+}
+function syncForm() {
+  const it = items[sel]; if (!it) return;
+  $('#f_name').value = it.name;
+  [$('#f_x').value, $('#f_y').value, $('#f_w').value, $('#f_h').value] = it.rect;
+  if (it.kind !== 'target') return;
+  $('#f_button').value = it.click_button || 'left';
+  $('#f_double').checked = !!it.double;
+  $('#f_confirm').checked = !!it.confirm;
+  $('#f_settle').value = it.settle_ms ?? '';
+  $('#f_note').value = it.note || '';
+}
+// Button ↔ region conversion. Control detection brings everything in as buttons, and some
+// of them are places to *look at* rather than press (a status bar, a position readout).
+// Change the kind instead of making anyone redraw it.
+function changeKind(to) {
+  const it = items[sel];
+  if (!it || it.kind === to) return;
+
+  if (to === 'region') {
+    // A region is nothing but a rectangle — the button-only fields would not be saved, so
+    // drop them here where it can be said out loud.
+    const dropped = [];
+    if (it.confirm) dropped.push(t('drop.confirm'));
+    if (it.settle_ms != null && it.settle_ms !== '') dropped.push(t('drop.settle'));
+    if (it.note) dropped.push(t('drop.note'));
+    ['point', 'click_button', 'double', 'confirm', 'settle_ms', 'note']
+      .forEach(k => delete it[k]);
+    it.kind = 'region';
+    if (dropped.length) {
+      say(t('ok.toregion', dropped.join(' · ')), 'ok');
+    }
+  } else {
+    it.kind = 'target';
+    it.click_button = it.click_button || 'left';
+    it.note = it.note || '';
+  }
+  select(sel);
+  renderList();
+  paint();
+}
+
+function bindForm() {
+  const push = () => {
+    const it = items[sel]; if (!it) return;
+    it.name = $('#f_name').value.trim() || it.name;
+    it.rect = [+$('#f_x').value, +$('#f_y').value, Math.max(1, +$('#f_w').value), Math.max(1, +$('#f_h').value)];
+    if (it.kind === 'target') {
+      it.click_button = $('#f_button').value;
+      it.double = $('#f_double').checked;
+      it.confirm = $('#f_confirm').checked;
+      it.settle_ms = $('#f_settle').value === '' ? null : +$('#f_settle').value;
+      it.note = $('#f_note').value;
+    }
+    renderList(); paint();
+  };
+  ['f_name','f_x','f_y','f_w','f_h','f_button','f_double','f_confirm','f_settle','f_note']
+    .forEach(id => { const el = $('#' + id); el.oninput = push; el.onchange = push; });
+}
+
+// ── actions ──────────────────────────────────────────────────────────
+$('#addTarget').onclick = () => { mode = 'target'; $('#addTarget').classList.add('on'); $('#addRegion').classList.remove('on'); };
+$('#addRegion').onclick = () => { mode = 'region'; $('#addRegion').classList.add('on'); $('#addTarget').classList.remove('on'); };
+$('#delall').onclick = () => {
+  if (!items.length) return;
+  // Control detection usually creates far more to discard than to keep — removing them one
+  // at a time is torture.
+  if (!confirm(tn('confirm.delall', items.length))) return;
+  items = []; select(-1); renderList(); paint();
+  say(t('ok.cleared'), 'ok');
+};
+$('#del').onclick = deleteSelected;
+$('#refresh').onclick = () => refreshShot().then(() => say('', ''));
+$('#restore').onclick = restoreWindow;
+$('#profpick').onchange = () => switchProfile($('#profpick').value);
+$('#newprof').onclick = newProfile;
+$('#setref').onclick = () => {
+  if (!client[0] || !client[1]) { say(t('err.nosize'), 'err'); return; }
+  doc.reference_client = [client[0], client[1]];
+  renderRef();
+  say(t('ok.refset', client[0], client[1]), 'ok');
+};
+
+$('#detect').onclick = async () => {
+  try {
+    const r = await (await fetch('/controls?x=1' + pq())).json();
+    if (!r.count) { say(r.note, 'err'); return; }
+    let added = 0, skipped = 0;
+    const area = client[0] * client[1];
+    for (const c of r.controls) {
+      if (!c.visible || c.rect[2] < 6 || c.rect[3] < 6) { skipped++; continue; }
+      // Anything covering more than 40% of the screen is a panel or container, not a
+      // button. WinForms makes those windows too, so taking them all fills the list with
+      // rubbish.
+      if (area && c.rect[2] * c.rect[3] > area * 0.4) { skipped++; continue; }
+      const label = (c.text || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+      // With no caption, do not fall back to the class name — a list of
+      // windowsforms10_window_8_app_0_378734a_242 tells them apart from nothing. A short
+      // sequence number is better.
+      items.push({ kind: 'target', name: uniq(label || 'ctrl'), rect: c.rect, click_button: 'left',
+                   note: t('note.detected', c.class, c.text ? ' · ' + c.text : t('note.nocaption')) });
+      added++;
+    }
+    renderList(); paint();
+    say(t('ok.detected', added, skipped), 'ok');
+  } catch (e) { say(t('err.detect', e), 'err'); }
+};
+
+$('#export').onclick = () => {
+  const blob = new Blob([JSON.stringify(toDocFromItems(), null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `deescreen.${profile}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  say(t('ok.exported'), 'ok');
+};
+
+// The admin code lives in **session storage** — it disappears when the tab closes and never
+// touches disk. In localStorage it would outlive the session for whoever uses that PC next,
+// and this code is the key to rewriting *what can be pressed*, so there is no reason to keep
+// it alive that long.
+const CODE_KEY = 'deescreen.adminCode';
+$('#code').value = sessionStorage.getItem(CODE_KEY) || '';
+$('#code').oninput = renderAdminHint;
+
+$('#save').onclick = async () => {
+  // Catch it before the round trip — an empty box against a server that demands a code is
+  // a guaranteed 401.
+  if (adminRequired && !$('#code').value) {
+    renderAdminHint();
+    say(t('err.needcode.save'), 'err');
+    return;
+  }
+
+  const d = toDocFromItems();
+  const risky = Object.entries(d.buttons).filter(([, t]) => t.confirm).map(([n]) => n);
+  const msg = t('confirm.save',
+                tn('count.buttons', Object.keys(d.buttons).length),
+                tn('count.regions', Object.keys(d.regions).length)) +
+    (risky.length ? t('confirm.save.risky', risky.join(', ')) : t('confirm.save.none'));
+  if (!confirm(msg)) return;
+  try {
+    // The server refuses a save that takes a confirm flag off a button unless the request
+    // says so. Here the caller is a person who just unticked the box, so the answer is to
+    // ask them by name and pass that on - not to send the acknowledgement every time. The
+    // diff lives on the server; retrying on its refusal keeps one copy of that rule.
+    const send = (ack) => fetch('/admin/profile?x=1' + pq() + (ack ? '&confirm=true' : ''), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Code': $('#code').value },
+      body: JSON.stringify(d)
+    });
+    let res = await send(false);
+    let body = await res.json();
+    if (res.status === 403 && body.detail && body.detail.buttons) {
+      if (!confirm(t('confirm.unprotect', body.detail.buttons.join(', ')))) {
+        say(t('ok.unprotect.no'), 'ok');
+        return;
+      }
+      res = await send(true);
+      body = await res.json();
+    }
+    if (!res.ok) {
+      // Do not remember a wrong code — leaving it in place makes every later save fail for
+      // a reason that is now hard to see.
+      if (res.status === 401) {
+        sessionStorage.removeItem(CODE_KEY);
+        renderAdminHint();
+        say(t('err.badcode'), 'err');
+        return;
+      }
+      say(t('err.savefail', res.status, JSON.stringify(body, null, 2)), 'err');
+      return;
+    }
+    sessionStorage.setItem(CODE_KEY, $('#code').value);
+    say(t('ok.saved', body.backup), 'ok');
+    doc = d;
+    if (windowChanged) { windowChanged = false; await loadAll(); }
+  } catch (e) { say(t('err.savefail2', e), 'err'); }
+};
+
+$('#testClick').onclick = async () => {
+  const it = items[sel]; if (!it || it.kind !== 'target') return;
+  try {
+    const res = await fetch('/click', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profile, button: it.name, confirm: !!it.confirm, settle_ms: 400 })
+    });
+    const b = await res.json();
+    if (!res.ok) { say(t('err.clickfail', res.status, JSON.stringify(b, null, 2)), 'err'); return; }
+    say(t('ok.clicked'), 'ok');
+    await refreshShot();
+  } catch (e) { say(t('err.clickfail2', e), 'err'); }
+};
+
+$('#f_kind').onchange = () => changeKind($('#f_kind').value);
+$('#modalclose').onclick = closeMsg;
+$('#modal').onclick = e => { if (e.target.id === 'modal') closeMsg(); };
+addEventListener('keydown', e => { if (e.key === 'Escape') closeMsg(); });
+
+for (const b of document.querySelectorAll('#lang button')) {
+  b.onclick = () => setLang(b.dataset.lang);
+}
+
+bindForm();
+bindWindowFields();
+// Static text first, so nothing shows in the wrong language even for the moment before the
+// first response arrives.
+applyLang();
+loadAll().then(() => scheduleFit());
+</script>

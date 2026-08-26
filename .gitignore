@@ -1,0 +1,22 @@
+/target
+
+# Runtime output — the first run creates these in its home directory, which for a build from
+# this checkout is next to the exe. The config and the profiles
+# differ per PC, so they are not committed (config.example.json and profile.example.json show
+# the shape).
+config.json
+profiles/
+captures/
+
+# Logs MUST stay out. They contain window titles, PIDs, click coordinates and caller IPs.
+logs/
+
+# Editor and OS droppings. Nothing here has ever been committed; this is so it stays that way.
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+# Working files that are not part of the source. Real profiles live here while being edited.
+temp/

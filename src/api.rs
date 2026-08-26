@@ -1,0 +1,3577 @@
+//! The HTTP handlers.
+//!
+//! ## Why there are separate `.png` variants
+//!
+//! A file path is the easiest thing for an AI to act on — when the tool and the AI are on
+//! **the same PC**. This tool runs on
+//! the simulator PC while the AI is on a development PC, so a path on that disk is not
+//! something this end can open.
+//!
+//! So one behaviour gets two surfaces:
+//! - `/capture` and `/click` — JSON, with the server-side path and the metadata. For when the
+//!   tool and its consumer share a PC.
+//! - `/capture.png` and `/click.png` — the PNG bytes themselves. One `curl -o shot.png` puts a
+//!   file on the development PC for the AI to open. One round trip, done.
+//!
+//! The metadata (how it was captured, whether it was black, whether anything changed) follows
+//! the `.png` surface too, in the `X-Deescreen-Meta` header.
+
+use std::collections::HashMap;
+
+use axum::body::Bytes;
+use axum::extract::{Path as UrlPath, Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::captures::{self, Frame};
+use crate::draw;
+use crate::state::SharedState;
+use crate::targets::{ButtonDef, Rect, Targets};
+use crate::web::{ApiError, json_ok, png_response};
+use crate::win::capture::{self as wincap, BLACK_HINT};
+use crate::win::input::{self, Button};
+use crate::win::window::{self, FindError, WindowInfo};
+
+// ────────────────────────────── request shapes ──────────────────────────────
+
+// serde cannot combine `flatten` with `deny_unknown_fields` (the outer struct sees the
+// flattened fields as unknown keys). Capturing is read-only, so ignoring an unknown key here
+// is harmless and this one is the exception — the control requests (ClickReq, KeyReq) stay
+// strict.
+#[derive(Deserialize, Default)]
+pub struct CaptureReq {
+    /// Which profile, and therefore which window. Omitted, the default profile.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// A named region. Absent, the whole client area (`"client"`).
+    #[serde(default)]
+    pub region: Option<String>,
+    /// An ad-hoc region `[x, y, w, h]`, taking precedence over `region`. **Read-only, so there
+    /// is no whitelist** — the worst a bad crop does is produce a bad picture; nothing is
+    /// pressed.
+    #[serde(default)]
+    pub rect: Option<Rect>,
+    #[serde(default)]
+    pub scale: Option<f64>,
+    #[serde(default)]
+    pub max_width: Option<u32>,
+    /// Whether to also keep a file in the captures folder. Defaults to `true`.
+    #[serde(default)]
+    pub save: Option<bool>,
+    #[serde(default, flatten)]
+    pub overlay: Overlay,
+    /// Pixels to grow the capture rectangle by on every side.
+    #[serde(default)]
+    pub pad: Option<i32>,
+}
+
+/// What gets drawn over a capture. All **read-only** — none of it presses anything.
+#[derive(Deserialize, Default, Clone)]
+pub struct Overlay {
+    /// Grid spacing in client pixels. The labels carry source coordinates, so even in a
+    /// shrunken capture a number read off the picture goes straight into the profile.
+    #[serde(default)]
+    pub grid: Option<i32>,
+    /// Draw a crosshair at this point — for checking a guess **before** pressing.
+    #[serde(default)]
+    pub mark: Option<[i32; 2]>,
+    /// Magnification around the mark (1–8, default 3). A small button is barely a dot in the
+    /// whole picture, and without the magnified inset "middle or edge" is unanswerable.
+    #[serde(default)]
+    pub inset: Option<i32>,
+    /// The radius to magnify, in client pixels (default 40).
+    #[serde(default)]
+    pub inset_radius: Option<i32>,
+    /// Also draw the saved buttons and regions. `true`/`false`, or a mode name.
+    #[serde(default)]
+    pub buttons: Option<ButtonsOpt>,
+}
+
+/// How `buttons` gets drawn.
+///
+/// A mode rather than on/off, because the crosshair marks the **click point**, and that is
+/// usually the middle of a key, which is where the key's legend is. So naming buttons — a job
+/// that needs "the rectangle and its name" and "the lettering underneath" at the same time —
+/// meant capturing the same spot twice. The crosshair cannot simply go: on a button with an
+/// explicit `point`, the click point differs from the rectangle's centre and that mark is the
+/// only thing that shows it. Being able to turn it off is enough.
+#[derive(Deserialize, Clone, Copy, PartialEq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum ButtonMode {
+    /// Outline, name and crosshair. What `buttons=1` means — older calls keep working.
+    Full,
+    /// Outline and name. No crosshair.
+    Box,
+    /// Outline and **a number**, for when names are packed too tightly and cover each other.
+    /// The number is the 1-based position in `GET /buttons` (sorted by name), so no separate
+    /// legend table is needed.
+    Num,
+}
+
+/// Accepts `true`/`false` as well as `"box"`, `"num"` and `"full"`.
+#[derive(Deserialize, Clone, Copy, Debug)]
+#[serde(untagged)]
+pub enum ButtonsOpt {
+    On(bool),
+    Mode(ButtonMode),
+}
+
+impl ButtonsOpt {
+    fn mode(self) -> Option<ButtonMode> {
+        match self {
+            ButtonsOpt::On(true) => Some(ButtonMode::Full),
+            ButtonsOpt::On(false) => None,
+            ButtonsOpt::Mode(m) => Some(m),
+        }
+    }
+}
+
+impl Overlay {
+    fn from_query(q: &HashMap<String, String>) -> Result<Overlay, ApiError> {
+        let mark = match q_get(q, "mark") {
+            None => None,
+            Some(v) => {
+                let p: Result<Vec<i32>, _> = v.split(',').map(|s| s.trim().parse::<i32>()).collect();
+                match p {
+                    Ok(p) if p.len() == 2 => Some([p[0], p[1]]),
+                    _ => return Err(ApiError::bad_request(format!("mark must be 'x,y', got '{v}'"))),
+                }
+            }
+        };
+        Ok(Overlay {
+            grid: q_num(q, "grid")?,
+            mark,
+            inset: q_num(q, "inset")?,
+            inset_radius: q_num(q, "inset_radius")?,
+            buttons: q_buttons(q)?,
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.grid.is_none() && self.mark.is_none() && self.mode().is_none()
+    }
+
+    fn mode(&self) -> Option<ButtonMode> {
+        self.buttons.and_then(ButtonsOpt::mode)
+    }
+}
+
+/// `buttons=` takes a boolean or a mode name. What `1` means does not change — older calls
+/// have to keep working.
+fn q_buttons(q: &HashMap<String, String>) -> Result<Option<ButtonsOpt>, ApiError> {
+    let Some(v) = q_get(q, "buttons") else { return Ok(None) };
+    Ok(Some(match v.to_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "full" => ButtonsOpt::On(true),
+        "0" | "false" | "no" | "off" => ButtonsOpt::On(false),
+        "box" => ButtonsOpt::Mode(ButtonMode::Box),
+        "num" => ButtonsOpt::Mode(ButtonMode::Num),
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "buttons must be 1/0 or one of full, box, num — got '{other}'"
+            ))
+            .with_detail(json!({
+                "full": "outline + name + crosshair (same as buttons=1)",
+                "box": "outline + name, no crosshair — the crosshair sits on the key legend",
+                "num": "outline + number; numbers are 1-based positions in GET /buttons",
+            })));
+        }
+    }))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ClickReq {
+    /// Which profile, and therefore which window. Omitted, the default profile.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Press several saved buttons in order, in one request.
+    ///
+    /// Entering data on an MDI keypad is one click per character, and a partial string left
+    /// in the machine is worse than no string at all — press CYCLE START after it and an
+    /// unintended block runs. So this is not merely a round-trip saving: the whole array is
+    /// resolved and checked BEFORE anything is pressed, and if a press fails the sequence
+    /// stops there and the reply says which index it was.
+    ///
+    /// Mutually exclusive with `button` / `rect` / `point`.
+    #[serde(default)]
+    pub buttons: Option<Vec<String>>,
+    /// Milliseconds to wait between the presses of `buttons`.
+    #[serde(default)]
+    pub gap_ms: Option<u64>,
+    /// Pixels to grow the capture rectangle by on every side (client pixels, in the
+    /// profile's own coordinates). A toggle's lamp is usually just outside its button.
+    #[serde(default)]
+    pub pad: Option<i32>,
+    /// The name of the button to press — a key of `buttons` in the profile file.
+    ///
+    /// No alias for this field, `target` least of all: a request carrying both `target` and
+    /// `button` reads naturally as a button name plus a mouse button, and one of the two would
+    /// have to lose. `deny_unknown_fields` refuses the whole request instead.
+    #[serde(default)]
+    pub button: Option<String>,
+    /// **Press an unsaved area on the spot** — `[x, y, w, h]`, pressed at its centre.
+    ///
+    /// Controls that appear only on certain screens cannot be on the named list. To press one,
+    /// read the rectangle off a capture and send it. Nothing is stored. Requires
+    /// `allow_raw_clicks`.
+    #[serde(default)]
+    pub rect: Option<Rect>,
+    /// The point form of `rect`, for when the size is unknown.
+    #[serde(default)]
+    pub point: Option<[i32; 2]>,
+    /// Which mouse button to press with (`left` | `right` | `middle`).
+    /// Overrides the button definition's own `click_button`.
+    #[serde(default)]
+    pub click_button: Option<String>,
+    #[serde(default)]
+    pub double: Option<bool>,
+    /// Pressing a `confirm: true` button requires this on the request as well.
+    #[serde(default)]
+    pub confirm: bool,
+    #[serde(default)]
+    pub settle_ms: Option<u64>,
+    /// The region to capture after the press. Absent, nothing is captured.
+    #[serde(default)]
+    pub capture: Option<String>,
+    /// Rectangle to **exclude** from the change comparison (window client coordinates).
+    /// Put a clock in here and it stops making `changed` true on its own.
+    #[serde(default)]
+    pub ignore: Option<Rect>,
+    #[serde(default)]
+    pub scale: Option<f64>,
+    #[serde(default)]
+    pub max_width: Option<u32>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct KeyReq {
+    /// Which profile, and therefore which window. Omitted, the default profile.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// A name from the profile's `keys`.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// An unnamed chord — modifiers plus one key, struck together (`"f1"`, `"ctrl+alt+f1"`).
+    /// Requires `allow_raw_keys`.
+    ///
+    /// Deliberately not a spelling of `key`. That field looks a definition up in the profile;
+    /// this one bypasses the profile altogether, which is why it is gated. Opposite acts do not
+    /// get near-identical names — a slip of one letter must not be how you reach the gated one.
+    #[serde(default)]
+    pub chord: Option<String>,
+    /// Type a string. Also requires `allow_raw_keys`.
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub settle_ms: Option<u64>,
+    #[serde(default)]
+    pub capture: Option<String>,
+    /// Pixels to grow the capture rectangle by on every side.
+    #[serde(default)]
+    pub pad: Option<i32>,
+    /// Rectangle to **exclude** from the change comparison (window client coordinates).
+    /// Put a clock in here and it stops making `changed` true on its own.
+    #[serde(default)]
+    pub ignore: Option<Rect>,
+    #[serde(default)]
+    pub scale: Option<f64>,
+    #[serde(default)]
+    pub max_width: Option<u32>,
+}
+
+fn parse_body<T: serde::de::DeserializeOwned + Default>(body: &Bytes) -> Result<T, ApiError> {
+    if body.is_empty() {
+        return Ok(T::default());
+    }
+    serde_json::from_slice(body).map_err(|e| ApiError::bad_request(format!("invalid JSON body: {e}")))
+}
+
+// Query-string parsing — the `.png` variants take their parameters in the query rather than
+// a body, so one line of curl is enough.
+
+fn q_get(q: &HashMap<String, String>, k: &str) -> Option<String> {
+    q.get(k).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn q_num<T: std::str::FromStr>(q: &HashMap<String, String>, k: &str) -> Result<Option<T>, ApiError> {
+    match q_get(q, k) {
+        None => Ok(None),
+        Some(v) => v
+            .parse::<T>()
+            .map(Some)
+            .map_err(|_| ApiError::bad_request(format!("query parameter '{k}' is not a number: {v}"))),
+    }
+}
+
+fn q_bool(q: &HashMap<String, String>, k: &str) -> Result<Option<bool>, ApiError> {
+    match q_get(q, k) {
+        None => Ok(None),
+        Some(v) => match v.to_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(Some(true)),
+            "0" | "false" | "no" | "off" => Ok(Some(false)),
+            other => Err(ApiError::bad_request(format!("query parameter '{k}' is not a boolean: {other}"))),
+        },
+    }
+}
+
+fn q_rect_named(q: &HashMap<String, String>, key: &str) -> Result<Option<Rect>, ApiError> {
+    let Some(v) = q_get(q, key) else { return Ok(None) };
+    let parts: Result<Vec<i32>, _> = v.split(',').map(|p| p.trim().parse::<i32>()).collect();
+    match parts {
+        Ok(p) if p.len() == 4 => Ok(Some([p[0], p[1], p[2], p[3]])),
+        _ => Err(ApiError::bad_request(format!("{key} must be 'x,y,w,h', got '{v}'"))),
+    }
+}
+
+fn q_rect(q: &HashMap<String, String>) -> Result<Option<Rect>, ApiError> {
+    q_rect_named(q, "rect")
+}
+
+impl CaptureReq {
+    fn from_query(q: &HashMap<String, String>) -> Result<CaptureReq, ApiError> {
+        Ok(CaptureReq {
+            profile: q_get(q, "profile"),
+            region: q_get(q, "region"),
+            rect: q_rect(q)?,
+            scale: q_num(q, "scale")?,
+            max_width: q_num(q, "max_width")?,
+            save: q_bool(q, "save")?,
+            overlay: Overlay::from_query(q)?,
+            pad: q_num(q, "pad")?,
+        })
+    }
+}
+
+impl ClickReq {
+    fn from_query(q: &HashMap<String, String>) -> Result<ClickReq, ApiError> {
+        let point = match q_get(q, "point") {
+            None => None,
+            Some(v) => {
+                let parts: Result<Vec<i32>, _> = v.split(',').map(|p| p.trim().parse::<i32>()).collect();
+                match parts {
+                    Ok(p) if p.len() == 2 => Some([p[0], p[1]]),
+                    _ => return Err(ApiError::bad_request(format!("point must be 'x,y', got '{v}'"))),
+                }
+            }
+        };
+        // buttons=A,B,C — the .png variant has no body, so the sequence has to fit in a
+        // query string as well.
+        let buttons = q_get(q, "buttons").map(|v| {
+            v.split(',').map(|b| b.trim().to_string()).filter(|b| !b.is_empty()).collect()
+        });
+        Ok(ClickReq {
+            profile: q_get(q, "profile"),
+            buttons,
+            gap_ms: q_num(q, "gap_ms")?,
+            button: q_get(q, "button"),
+            rect: q_rect(q)?,
+            point,
+            click_button: q_get(q, "click_button"),
+            double: q_bool(q, "double")?,
+            confirm: q_bool(q, "confirm")?.unwrap_or(false),
+            settle_ms: q_num(q, "settle_ms")?,
+            capture: q_get(q, "capture"),
+            pad: q_num(q, "pad")?,
+            ignore: q_rect_named(q, "ignore")?,
+            scale: q_num(q, "scale")?,
+            max_width: q_num(q, "max_width")?,
+        })
+    }
+}
+
+// ────────────────────────── shared work (blocking) ──────────────────────────
+
+/// The profile a request selected. An unknown name comes back as 404 with the known list —
+/// **nothing is picked for you.** Clicking while it is unclear which window is being driven is
+/// the class of accident this tool was built to prevent.
+fn pick(state: &SharedState, name: Option<&str>) -> Result<std::sync::Arc<crate::state::Profile>, ApiError> {
+    state.profile(name).map_err(|e| {
+        ApiError::not_found(e).with_detail(json!({
+            "known_profiles": state.profile_names(),
+            "default": state.effective_default(),
+            "hint": "pass ?profile=NAME in the query, or \"profile\": \"NAME\" in the body",
+        }))
+    })
+}
+
+struct Placed {
+    /// How many labels had nowhere to go and were replaced by their number.
+    collided: usize,
+    /// The boxes of labels that **found** a spot. These never overlap each other — a promise
+    /// a test asserts directly (`labels_do_not_overlap_each_other`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    placed: Vec<[i32; 4]>,
+}
+
+/// Place labels so they **do not overlap each other**.
+///
+/// A name wider than its rectangle runs into its neighbour and reads as one thing — measured,
+/// that produced `"MDI_CASE_TMDI_Z"` (MDI_CASE_TOGGLE plus MDI_Z). From the picture there is no
+/// telling whether that is two names or one, so this is not an aesthetic problem: **an
+/// overlapping label is wrong information**.
+///
+/// Four spots are tried per rectangle — above, below, inside-top, inside-bottom — and if all
+/// are blocked the number is drawn instead of the name (the `GET /buttons` position). A number
+/// is one glyph wide, so it almost always fits.
+fn place_labels(
+    img: &mut image::RgbaImage,
+    labels: &[(i32, i32, i32, i32, String, draw::Color)],
+) -> Placed {
+    let mut taken: Vec<[i32; 4]> = Vec::with_capacity(labels.len());
+    let mut placed: Vec<[i32; 4]> = Vec::new();
+    let mut collided = 0usize;
+
+    for (i, (x, y, _w, h, text, color)) in labels.iter().enumerate() {
+        // Above → below → inside-top → inside-bottom. Above comes first because that was the
+        // old behaviour, and because most labels are done at the first spot.
+        let spots = [
+            (x + 2, y - draw::GLYPH_H - 4),
+            (x + 2, y + h + 4),
+            (x + 2, y + 3),
+            (x + 2, y + h - draw::GLYPH_H - 5),
+        ];
+        let mut done = false;
+        for (lx, ly) in spots {
+            if ly < 0 {
+                continue;
+            }
+            let b = draw::label_box(lx, ly, text);
+            if taken.iter().any(|t| draw::boxes_overlap(b, *t)) {
+                continue;
+            }
+            draw::text(img, lx, ly, text, 1, draw::BLACK, Some(*color));
+            taken.push(b);
+            placed.push(b);
+            done = true;
+            break;
+        }
+        if !done {
+            // The name did not fit anywhere. Fall back to the number, and draw it even if that
+            // overlaps: something overlapping beats nothing at all, and the count is reported.
+            collided += 1;
+            let num = format!("{}", i + 1);
+            let (lx, ly) = (x + 2, (y - draw::GLYPH_H - 4).max(y + 3));
+            let b = draw::label_box(lx, ly, &num);
+            draw::text(img, lx, ly, &num, 1, draw::BLACK, Some(*color));
+            taken.push(b);
+        }
+    }
+    Placed { collided, placed }
+}
+
+/// Compare the before and after captures and put `changed` — and the evidence for it — into
+/// the metadata.
+///
+/// A single boolean cannot answer this. `changed` mashes together **two independent
+/// questions**: (a) did the click land, and (b) did the screen change as a result. All four
+/// combinations are real:
+///
+/// | | screen changed | screen identical |
+/// |---|---|---|
+/// | landed | it worked | blank key · toggle already in that state · ignored in this mode |
+/// | did not land | a clock or animation moved on its own | the coordinate hit background |
+///
+/// So (a) is answered by `hit` — a window lookup, independent of pixels — and (b) is answered
+/// here, carrying **how much and where**, so the caller can tell one clock digit from a real
+/// change.
+fn apply_change(
+    meta: &mut Value,
+    before: &crate::captures::Frame,
+    after: &crate::captures::Frame,
+    ignore: Option<Rect>,
+    hit: Option<&crate::win::window::ControlHit>,
+) {
+    let Some(d) = before.diff(after, ignore) else {
+        // Different sizes = the window was resized in between, which pixel comparison
+        // cannot answer.
+        meta["changed"] = json!(true);
+        meta["changed_hint"] =
+            json!("the capture changed size between the two shots — the window was resized");
+        return;
+    };
+    let changed = d.pixels > 0;
+    meta["changed"] = json!(changed);
+    let total = (after.width() as u64) * (after.height() as u64);
+    meta["change"] = json!({
+        "pixels": d.pixels,
+        "fraction": if total == 0 { 0.0 } else { d.pixels as f64 / total as f64 },
+        "bbox": if changed { json!(d.bbox) } else { Value::Null },
+        "ignored": ignore.map(|r| json!(r)).unwrap_or(Value::Null),
+        "note": "bbox is in window client coordinates and is ONE rectangle around every \
+                 changed pixel, so two far-apart changes enclose everything between them. A \
+                 small bbox that sits in the same place every time is usually a clock or a \
+                 blinking cursor — pass ignore=x,y,w,h to drop it from the comparison.",
+    });
+    if !changed {
+        // This may be entirely correct (a toggle already in that state, a blank key, a
+        // disabled control). But UIPI blocking looks exactly the same, and what separates the
+        // two is `hit` plus `input.uipi_risk` in /health.
+        meta["changed_hint"] = json!(match hit {
+            Some(h) if h.is_window_itself =>
+                "nothing changed, and no control sits under that point — the coordinate most likely landed on panel background. Capture with ?mark=x,y&inset=4 and look.",
+            Some(h) if !h.enabled =>
+                "nothing changed, and the control under that point is disabled. This is a correct no-change: the click arrived and the control ignored it.",
+            Some(_) =>
+                "nothing changed, but a control does sit under that point, so the click was aimed at something real. If /health reports input.uipi_risk false, this is simply a control that does not repaint — a blank key, a toggle already in that state, or one ignored in the current mode.",
+            None =>
+                "the captured region looks identical before and after. That is normal for a control already in the requested state, but it is also what a UIPI-blocked input looks like — check /health input.uipi_risk.",
+        });
+    }
+}
+
+/// What was under a coordinate, shaped for the response.
+///
+/// Whether a click **arrived** cannot be answered with pixels, because buttons that change
+/// nothing when pressed legitimately exist (blank keys, a toggle already in that state, one
+/// ignored in the current mode). So the control that was under the point comes back as-is, and
+/// with it, arrival is settled independently of pixels.
+fn hit_json(h: &crate::win::window::ControlHit) -> Value {
+    json!({
+        "hwnd": h.hwnd,
+        "class": h.class,
+        "text": h.text,
+        "id": h.id,
+        "rect": h.rect,
+        "visible": h.visible,
+        "enabled": h.enabled,
+        "depth": h.depth,
+        "is_window_itself": h.is_window_itself,
+        "note": if h.is_window_itself {
+            "no child control sits at this point — either the coordinate landed on panel \
+             background, or this application does not split its controls into windows \
+             (WPF, a single-bitmap HMI). GET /controls returning an empty list means the latter."
+        } else if !h.enabled {
+            "the control is disabled — a click reaches it and nothing happens. That is a \
+             correct no-change, not a lost click."
+        } else if !h.visible {
+            "the control is not visible — the click may land on whatever is drawn over it."
+        } else {
+            "a control sits at this point, so the coordinate is aimed at something real. \
+             Whether it reacts is a separate question."
+        },
+    })
+}
+
+/// Find the one configured window. Nothing found, or several, fails with **what to do next**
+/// attached.
+fn find_window(t: &Targets) -> Result<WindowInfo, ApiError> {
+    let info = window::find(&t.window).map_err(|e| match e {
+        FindError::NotFound => ApiError::not_found(format!(
+            "no visible window matches {:?}",
+            t.window.title
+        ))
+        .with_detail(json!({
+            "spec": t.window,
+            "hint": "call GET /windows to list visible window titles, then fix the profile's window spec",
+        })),
+        FindError::Ambiguous(list) => ApiError::conflict(format!(
+            "{} windows match {:?} — refusing to guess which one to drive",
+            list.len(),
+            t.window.title
+        ))
+        .with_detail(json!({
+            "matches": list,
+            "hint": "narrow it with window.title_exact or window.class in the profile",
+        })),
+    })?;
+
+    if info.minimized {
+        return Err(ApiError::conflict("the target window is minimized").with_detail(json!({
+            "hint": "POST /window/focus restores and raises it",
+        })));
+    }
+    Ok(info)
+}
+
+/// For the control paths — find the window and **verify the coordinate system is still valid**.
+/// The returned factor is only ever other than 1 under `on_size_mismatch: "scale"`.
+fn bind_window(t: &Targets) -> Result<(WindowInfo, (f64, f64)), ApiError> {
+    let info = find_window(t)?;
+    let scale = t
+        .coordinate_scale(info.client_size)
+        .map_err(|e| ApiError::conflict(e).with_detail(json!({
+            "client": [info.client_size.0, info.client_size.1],
+            "reference_client": t.reference_client,
+        })))?;
+    Ok((info, scale))
+}
+
+/// The lenient version, used by the view-only paths (`/capture*`, `/preview.png`, `/window`).
+///
+/// A size mismatch does **not** refuse to show you a picture. A mismatch is exactly when you
+/// need to look — seeing what drifted and how is what decides whether to call `/window/fit`.
+/// Looking presses nothing, so there is no risk; the warning rides along in the response
+/// instead. The control path (`bind_window`) stays strict.
+/// The window, the coordinate factor, and a size warning if there was one.
+type ViewBinding = (WindowInfo, (f64, f64), Option<String>);
+
+fn bind_window_view(t: &Targets) -> Result<ViewBinding, ApiError> {
+    let info = find_window(t)?;
+    match t.coordinate_scale(info.client_size) {
+        Ok(s) => Ok((info, s, None)),
+        Err(_) => {
+            let (rw, rh) = t.reference_client.map(|r| (r[0], r[1])).unwrap_or((0, 0));
+            let warning = format!(
+                "client area is {}x{} but the buttons were measured at {rw}x{rh}, so any overlaid boxes are drawn unscaled and will not line up. Nothing is blocked for viewing, but /click and /key will refuse until the two agree. If the buttons match the window as it looks now, set reference_client to {}x{} (the editor has a button); if the window drifted from a good measurement, POST /window/fit to put it back to {rw}x{rh}.",
+                info.client_size.0, info.client_size.1, info.client_size.0, info.client_size.1
+            );
+            Ok((info, (1.0, 1.0), Some(warning)))
+        }
+    }
+}
+
+/// Capture the window and crop out the requested region.
+fn shoot(
+    info: &WindowInfo,
+    rect: Rect,
+    scale: Option<f64>,
+    max_width: Option<u32>,
+) -> Result<(Frame, &'static str, bool), ApiError> {
+    let shot = wincap::capture_client(info).map_err(ApiError::internal)?;
+    let (method, black) = (shot.method, shot.black);
+    let frame = captures::frame(&shot, rect, scale, max_width).map_err(ApiError::bad_request)?;
+    Ok((frame, method, black))
+}
+
+/// Encode a frame as PNG and, if asked, keep a file too. Returns the metadata JSON with it.
+fn deliver(
+    state: &SharedState,
+    frame: &Frame,
+    method: &str,
+    black: bool,
+    region_name: &str,
+    save: bool,
+) -> Result<(Vec<u8>, Value), ApiError> {
+    let png = frame.to_png().map_err(ApiError::internal)?;
+    let mut meta = json!({
+        "region": region_name,
+        "rect": frame.source_rect,
+        "width": frame.width(),
+        "height": frame.height(),
+        "scale": frame.scale,
+        "method": method,
+        "black": black,
+        "bytes": png.len(),
+    });
+    if black {
+        meta["hint"] = json!(BLACK_HINT);
+    }
+    if save {
+        let path = captures::save(&state.captures_dir, region_name, &png).map_err(ApiError::internal)?;
+        captures::cleanup(
+            &state.captures_dir,
+            state.config.captures.keep,
+            state.config.captures.max_age_minutes,
+        );
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        meta["path"] = json!(path.to_string_lossy());
+        meta["url"] = json!(format!("/captures/{name}"));
+    }
+    Ok((png, meta))
+}
+
+/// Draw the overlays, **onto the already-scaled image** — drawn first and then shrunk, the 1px
+/// grid lines and the text smear.
+///
+/// Drawing order is stacking order: grid (bottom) → regions → buttons → mark and inset (top).
+/// A crosshair drawn to check something, covered by something else, defeats the feature.
+fn apply_overlay(
+    frame: &mut Frame,
+    ov: &Overlay,
+    defs: Option<&Targets>,
+    coord_scale: (f64, f64),
+    client: (i32, i32),
+) -> Value {
+    let mut drawn = json!({});
+
+    if let Some(step) = ov.grid
+        && step > 0
+    {
+        draw::grid(
+            &mut frame.image,
+            (frame.source_rect[0], frame.source_rect[1]),
+            step,
+            frame.scale,
+        );
+        drawn["grid"] = json!(step);
+    }
+
+    if let Some(mode) = ov.mode()
+        && let Some(t) = defs
+    {
+        let mut outside: Vec<String> = Vec::new();
+        // Draw **all** the rectangles first and place the labels afterwards, so a label sits
+        // on top of other rectangles and can avoid the labels already placed.
+        let mut labels: Vec<(i32, i32, i32, i32, String, draw::Color)> = Vec::new();
+
+        for (name, r) in &t.regions {
+            let s = Targets::scale_rect(*r, coord_scale);
+            // Finish the coordinate conversion first — calling `frame.map_len` while holding
+            // `&mut frame.image` would borrow the same value mutably and immutably at once.
+            let (x, y) = frame.map(s[0], s[1]);
+            let (w, h) = (frame.map_len(s[2]), frame.map_len(s[3]));
+            draw::marked_rect(&mut frame.image, x, y, w, h, draw::REGION);
+            labels.push((x, y, w, h, name.clone(), draw::REGION));
+        }
+
+        // The number is the 1-based position in **`GET /buttons` order** (sorted by name).
+        // Both walk the same BTreeMap, so that correspondence holds by itself — which is why
+        // no legend table has to be sent, and why these two iterations diverging would be
+        // quietly wrong.
+        for (i, (name, tg)) in t.buttons.iter().enumerate() {
+            let s = Targets::scale_rect(tg.rect, coord_scale);
+            let (px, py) = Targets::click_point(tg, coord_scale);
+            // Buttons that fell outside the client area get a loud colour — this is the
+            // whole point of checking
+            let off = px < 0 || py < 0 || px >= client.0 || py >= client.1;
+            if off {
+                outside.push(name.clone());
+            }
+            let color = if off {
+                draw::WARN
+            } else if tg.confirm {
+                draw::DANGER
+            } else {
+                draw::TARGET
+            };
+            let (x, y) = frame.map(s[0], s[1]);
+            let (w, h) = (frame.map_len(s[2]), frame.map_len(s[3]));
+            draw::marked_rect(&mut frame.image, x, y, w, h, color);
+            if mode == ButtonMode::Full {
+                // Where the press actually lands — not necessarily the rectangle's centre (an
+                // explicit `point`). Not drawn in box/num: this crosshair sits exactly on the
+                // key's legend.
+                let (cx, cy) = frame.map(px, py);
+                draw::crosshair(&mut frame.image, cx, cy, 6);
+            }
+            let label = match mode {
+                ButtonMode::Num => format!("{}", i + 1),
+                _ if tg.confirm => format!("{name} (CONFIRM)"),
+                _ => name.clone(),
+            };
+            labels.push((x, y, w, h, label, color));
+        }
+
+        let placed = place_labels(&mut frame.image, &labels);
+
+        drawn["buttons"] = json!(t.buttons.len());
+        drawn["regions"] = json!(t.regions.len());
+        drawn["buttons_mode"] = json!(match mode {
+            ButtonMode::Full => "full",
+            ButtonMode::Box => "box",
+            ButtonMode::Num => "num",
+        });
+        if mode == ButtonMode::Num {
+            drawn["numbering"] = json!(
+                "each number is the 1-based position of that button in GET /buttons \
+                 (which is sorted by name), so no legend is needed"
+            );
+        }
+        if placed.collided > 0 {
+            // Do not leave overlaps silent. An overlapping label cannot be read, and the fact
+            // that it cannot be read does not show in the picture — two names simply look like
+            // one.
+            drawn["labels_crowded"] = json!(placed.collided);
+            drawn["labels_hint"] = json!(format!(
+                "{} label(s) had no free spot and were drawn as their number instead. Ask for \
+                 buttons=num to number them all, or capture a smaller region with scale>1.",
+                placed.collided
+            ));
+        }
+        if !outside.is_empty() {
+            drawn["outside_client"] = json!(outside);
+        }
+    }
+
+    if let Some([mx, my]) = ov.mark {
+        let (x, y) = frame.map(mx, my);
+
+        // Take the magnified inset **before** drawing the crosshair. The other way round, what
+        // you see magnified is not the underlying picture but the 5px crosshair blown up 4x
+        // (measured).
+        let wanted = ov.inset.unwrap_or(3);
+        let prepared = if wanted > 1 {
+            let want_radius = frame.map_len(ov.inset_radius.unwrap_or(40)).max(8);
+            let (iw, ih) = (frame.width() as i32, frame.height() as i32);
+            match draw::fit_inset(iw, ih, want_radius, wanted) {
+                Some((radius, factor)) => {
+                    Some((draw::inset(&frame.image, x, y, radius, factor), radius, factor, want_radius, iw, ih))
+                }
+                None => {
+                    let (iw, ih) = (frame.width() as i32, frame.height() as i32);
+                    // Never omit it silently — if there is none, say there is none.
+                    drawn["inset"] = json!(false);
+                    drawn["inset_skipped"] = json!(format!(
+                        "the {iw}x{ih} capture is too small to hold a magnified inset — \
+                         capture a larger region, or drop `scale`"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        draw::crosshair(&mut frame.image, x, y, 24);
+        draw::text(
+            &mut frame.image,
+            x + 10,
+            y + 10,
+            &format!("{mx},{my}"),
+            1,
+            draw::WHITE,
+            Some([0, 0, 0, 200]),
+        );
+
+        if let Some((ins, radius, factor, want_radius, iw, ih)) = prepared {
+            draw::paste_inset(&mut frame.image, &ins, (x, y));
+            drawn["inset"] = json!({"factor": factor, "radius": radius});
+            if factor < wanted || radius < want_radius {
+                drawn["inset_adjusted"] = json!(format!(
+                    "asked for {wanted}x at radius {want_radius}, drew {factor}x at radius \
+                     {radius} to fit the {iw}x{ih} image"
+                ));
+            }
+        }
+        drawn["mark"] = json!([mx, my]);
+    }
+
+    drawn
+}
+
+fn window_json(info: &WindowInfo) -> Value {
+    json!({
+        "title": info.title,
+        "class": info.class,
+        "pid": info.pid,
+        "client": [info.client_size.0, info.client_size.1],
+        "client_origin": [info.client_origin.0, info.client_origin.1],
+        "window_rect": info.window_rect,
+        "dpi": info.dpi,
+        "minimized": info.minimized,
+        "foreground": window::is_foreground(info.handle),
+    })
+}
+
+// ────────────────────────────── handlers ──────────────────────────────
+
+/// Answers only whether this is alive. Whitelist-exempt — it carries no information.
+pub async fn ping() -> Response {
+    json_ok(json!({"ok": true, "service": "deescreen", "version": env!("CARGO_PKG_VERSION"), "help": "/help"}))
+}
+
+/// Diagnose in one call whether this is in a state where it can act.
+///
+/// The failure modes that matter here — DPI scaling, UIPI, a locked session — all **work
+/// wrongly without raising an error**. So rather than noticing after the
+/// fact, this asks in advance.
+pub async fn health(State(state): State<SharedState>) -> Response {
+    let st = state.clone();
+    let body = tokio::task::spawn_blocking(move || {
+        let mut problems: Vec<String> = Vec::new();
+
+        let interactive = crate::win::is_interactive_session();
+        if !interactive {
+            problems.push(
+                "not running in an interactive desktop session — capture will be black and input \
+                 will be ignored. Run deescreen as the logged-in user, not as a service."
+                    .into(),
+            );
+        }
+        if !st.dpi_aware {
+            problems.push(
+                "per-monitor DPI awareness was not applied by this process. If the display scale \
+                 is not 100%, capture pixels and click coordinates may disagree."
+                    .into(),
+            );
+        }
+
+        let our = crate::win::own_elevation();
+
+        // Diagnosed per profile — one can be fine while another's window is closed, and
+        // blurring that together leaves "why does only that one fail" unanswerable.
+        let mut per_profile = serde_json::Map::new();
+        let snapshot = st.profiles.load();
+        if snapshot.is_empty() {
+            problems.push(
+                "no profiles exist yet. A profile is one window plus its buttons and regions; \
+                 nothing can be captured or pressed until one exists. Open /editor and use \
+                 [＋ Profile] to create one."
+                    .into(),
+            );
+        }
+        for (name, prof) in snapshot.iter() {
+            let t = prof.targets();
+            let mut entry = json!({
+                "description": t.description,
+                // Give a count without saying where the names come from and the reader starts
+                // inventing them. What to call next goes right here.
+                "names": format!("/profiles?profile={name}"),
+                "path": prof.path.to_string_lossy(),
+                "buttons": t.buttons.len(),
+                "regions": t.regions.len(),
+                "keys": t.keys.len(),
+                "reference_client": t.reference_client,
+                "on_size_mismatch": t.on_size_mismatch,
+                "window_spec": t.window,
+            });
+            if size_check_is_inert(&t) {
+                problems.push(format!(
+                    "profile '{name}': on_size_mismatch is \"reject\" but reference_client is not set, so nothing is checking the window size and every coordinate is used at whatever size the window happens to be. Open the window, read client_size from GET /window?profile={name}, and save it back as reference_client."
+                ));
+            }
+            match bind_window(&t) {
+                Err(e) => {
+                    problems.push(format!("profile '{name}': {}", e.message));
+                    entry["status"] = json!("unusable");
+                    entry["error"] = json!(e.message);
+                }
+                Ok((info, _scale)) => {
+                    let theirs = crate::win::process_elevation(info.pid);
+                    let uipi_risk = our != crate::win::Elevation::Elevated
+                        && theirs != crate::win::Elevation::Normal;
+                    if uipi_risk {
+                        problems.push(format!(
+                            "profile '{name}': the target process looks {} while deescreen is {} \
+                             — Windows UIPI will silently discard mouse and keyboard input.",
+                            theirs.as_str(),
+                            our.as_str()
+                        ));
+                    }
+                    entry["window"] = window_json(&info);
+                    entry["input"] = json!({
+                        "our_elevation": our.as_str(),
+                        "target_elevation": theirs.as_str(),
+                        "uipi_risk": uipi_risk,
+                    });
+                    match wincap::capture_client(&info) {
+                        Err(e) => {
+                            problems.push(format!("profile '{name}': capture failed: {e}"));
+                            entry["capture"] = json!({"ok": false, "error": e});
+                            entry["status"] = json!("degraded");
+                        }
+                        Ok(shot) => {
+                            if shot.black {
+                                problems.push(format!("profile '{name}': {BLACK_HINT}"));
+                            }
+                            entry["capture"] = json!({
+                                "ok": !shot.black,
+                                "method": shot.method,
+                                "black": shot.black,
+                                "size": [shot.width, shot.height],
+                            });
+                            entry["status"] = json!(if shot.black { "degraded" } else { "ok" });
+                        }
+                    }
+                }
+            }
+            per_profile.insert(name.clone(), entry);
+        }
+
+        json!({
+            "status": if problems.is_empty() { "ok" } else { "degraded" },
+            "problems": problems,
+            "session": {"interactive": interactive},
+            "home": {
+                "dir": crate::config::home().dir.to_string_lossy(),
+                "why": crate::config::home().kind.as_str(),
+            },
+            "dpi_aware": st.dpi_aware,
+            "our_elevation": our.as_str(),
+            "default_profile": st.effective_default(),
+            "profiles": per_profile,
+            "policy": {
+                "allow_raw_clicks": st.config.allow_raw_clicks,
+                "allow_raw_keys": st.config.allow_raw_keys,
+                "allow_profile_editing": st.config.allow_profile_editing,
+                "admin_code_required": !st.config.admin_code.is_empty(),
+                "default_settle_ms": st.config.default_settle_ms,
+                "max_settle_ms": st.config.max_settle_ms,
+            },
+        })
+    })
+    .await
+    .unwrap_or_else(|e| json!({"status": "degraded", "problems": [format!("health check panicked: {e}")]}));
+
+    json_ok(body)
+}
+
+/// Visible top-level windows — **where you find the target window's title.**
+pub async fn windows() -> Result<Response, ApiError> {
+    let list = tokio::task::spawn_blocking(window::enumerate)
+        .await
+        .map_err(|e| ApiError::internal(format!("enumerate failed: {e}")))?;
+    let items: Vec<Value> = list
+        .iter()
+        .map(|w| {
+            json!({
+                "title": w.title,
+                "class": w.class,
+                "pid": w.pid,
+                "client": [w.client_size.0, w.client_size.1],
+                "window_rect": w.window_rect,
+                "dpi": w.dpi,
+                "minimized": w.minimized,
+            })
+        })
+        .collect();
+    Ok(json_ok(json!({"count": items.len(), "windows": items})))
+}
+
+/// The configured window's current state.
+pub async fn window_info(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let prof = pick(&state, q_get(&q, "profile").as_deref())?;
+    let t = prof.targets();
+    let (info, scale, warning) = tokio::task::spawn_blocking(move || bind_window_view(&t))
+        .await
+        .map_err(|e| ApiError::internal(format!("lookup failed: {e}")))??;
+    let mut body = json!({
+        "profile": prof.name,
+        "window": window_json(&info),
+        "coordinate_scale": [scale.0, scale.1],
+    });
+    if let Some(w) = warning {
+        body["size_mismatch"] = json!(w);
+    }
+    Ok(json_ok(body))
+}
+
+/// One profile's definition as JSON. Shared by `/profiles`, `/buttons` and `/regions` — build
+/// the same thing in three places and one day the three disagree.
+fn profile_view(prof: &crate::state::Profile) -> Value {
+    let t = prof.targets();
+    let buttons: Vec<Value> = t
+        .buttons
+        .iter()
+        .map(|(name, b)| {
+            json!({
+                "name": name,
+                "rect": b.rect,
+                "point": b.point,
+                "click_button": b.click_button,
+                "double": b.double,
+                "confirm": b.confirm,
+                "settle_ms": b.settle_ms,
+                "note": b.note,
+            })
+        })
+        .collect();
+    let regions: Vec<Value> = t
+        .regions
+        .iter()
+        .map(|(name, r)| json!({"name": name, "rect": r}))
+        .collect();
+    let keys: Vec<Value> = t
+        .keys
+        .iter()
+        .map(|(name, spec)| json!({"name": name, "keys": spec}))
+        .collect();
+
+    json!({
+        "description": t.description,
+        "window": t.window,
+        "reference_client": t.reference_client,
+        "on_size_mismatch": t.on_size_mismatch,
+        "buttons": buttons,
+        "regions": regions,
+        "keys": keys,
+    })
+}
+
+/// `on_size_mismatch: "reject"` with no `reference_client` asks for a check that cannot run:
+/// there is no measured size to compare the window against, so every coordinate is reused at
+/// any window size in silence. That is the default state of a profile nobody pinned, and the
+/// setting reads as protection, so it has to be said out loud rather than inferred from a null.
+fn size_check_is_inert(t: &Targets) -> bool {
+    t.reference_client.is_none() && t.on_size_mismatch == crate::targets::SizeMismatch::Reject
+}
+
+/// Server-wide policy — it does not vary per profile.
+fn policy_json(state: &SharedState) -> Value {
+    json!({
+        "allow_raw_clicks": state.config.allow_raw_clicks,
+        "allow_raw_keys": state.config.allow_raw_keys,
+        "allow_profile_editing": state.config.allow_profile_editing,
+        "admin_code_required": !state.config.admin_code.is_empty(),
+    })
+}
+
+/// **Every profile's definition at once.** With this, neither `/buttons` nor `/regions` is
+/// needed.
+///
+/// `?profile=NAME` returns just that one. The editor reads its whole document through here.
+pub async fn profiles(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let wanted = q_get(&q, "profile");
+    let mut out = serde_json::Map::new();
+    match &wanted {
+        Some(name) => {
+            let prof = pick(&state, Some(name))?;
+            out.insert(prof.name.clone(), profile_view(&prof));
+        }
+        None => {
+            for (name, prof) in state.profiles.load().iter() {
+                out.insert(name.clone(), profile_view(prof));
+            }
+        }
+    }
+    let mut body = json!({
+        "default_profile": state.effective_default(),
+        "profiles": out,
+        "policy": policy_json(&state),
+    });
+    if let Some(name) = wanted {
+        body["profile"] = json!(name);
+    }
+    Ok(json_ok(body))
+}
+
+/// What can be pressed — this list is the ceiling on capability.
+/// (A subset of `/profiles`; smaller when only the buttons are needed.)
+pub async fn list_buttons(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let prof = pick(&state, q_get(&q, "profile").as_deref())?;
+    let view = profile_view(&prof);
+    Ok(json_ok(json!({
+        "profile": prof.name,
+        "description": view["description"],
+        "buttons": view["buttons"],
+        "profiles": state.profile_names(),
+        "default_profile": state.effective_default(),
+    })))
+}
+
+/// The named regions that can be captured. The coordinates are **absolute to the window**, so
+/// something spotted inside one can be used as a reference directly (see the cropped-coordinate
+/// section of `/help`).
+pub async fn list_regions(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let prof = pick(&state, q_get(&q, "profile").as_deref())?;
+    let view = profile_view(&prof);
+    Ok(json_ok(json!({
+        "profile": prof.name,
+        "description": view["description"],
+        "regions": view["regions"],
+        "note": "rect is [x, y, w, h] in window client coordinates; 'client' is reserved and \
+                 means the whole client area",
+        "profiles": state.profile_names(),
+        "default_profile": state.effective_default(),
+    })))
+}
+
+/// Capture — JSON response, including the server-side path.
+pub async fn capture_json(State(state): State<SharedState>, body: Bytes) -> Result<Response, ApiError> {
+    let req: CaptureReq = parse_body(&body)?;
+    let (_png, meta, window) = do_capture(&state, req).await?;
+    Ok(json_ok(json!({"capture": meta, "window": window})))
+}
+
+/// Capture — PNG bytes. `curl -o shot.png "…/capture.png?region=status_bar&scale=0.5"`
+pub async fn capture_png(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let req = CaptureReq::from_query(&q)?;
+    let (png, meta, _window) = do_capture(&state, req).await?;
+    Ok(png_response(png, &meta))
+}
+
+async fn do_capture(state: &SharedState, req: CaptureReq) -> Result<(Vec<u8>, Value, Value), ApiError> {
+    let prof = pick(state, req.profile.as_deref())?;
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let t = prof.targets();
+        capture_with(&st, &prof.name, &t, req, None)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("capture task failed: {e}")))?
+}
+
+/// The shared path that produces one capture — `/capture*` and `/preview.png` both run it.
+///
+/// `defs` is the definition to draw as an overlay. `None` uses whatever is loaded;
+/// `/preview.png` passes **an unsaved candidate**. That is what keeps checking ahead of
+/// applying, always.
+fn capture_with(
+    st: &SharedState,
+    profile: &str,
+    live: &Targets,
+    req: CaptureReq,
+    defs: Option<&Targets>,
+) -> Result<(Vec<u8>, Value, Value), ApiError> {
+    let defs_for_lookup = defs.unwrap_or(live);
+    let (info, coord_scale, size_warning) = bind_window_view(defs_for_lookup)?;
+
+    let region_name = req.region.clone().unwrap_or_else(|| "client".to_string());
+    // `pad` grows the region on every side. A toggle's lamp usually sits just outside its
+    // button, so `region=button:NAME&pad=25` is what you actually want to look at — and doing
+    // that arithmetic in the caller means doing it against numbers the server already holds.
+    let pad = req.pad.unwrap_or(0).max(0);
+    let rect = match req.rect {
+        Some(r) => Targets::pad_rect(r, pad),
+        None => Targets::scale_rect(
+            Targets::pad_rect(
+                defs_for_lookup.region(&region_name, info.client_size).map_err(|e| {
+                    ApiError::bad_request(e)
+                        .with_detail(json!({"known_regions": defs_for_lookup.region_names()}))
+                })?,
+                pad,
+            ),
+            coord_scale,
+        ),
+    };
+
+    let (mut frame, method, black) = shoot(&info, rect, req.scale, req.max_width)?;
+
+    let ov_mark = req.overlay.mark;
+    let mut overlay = req.overlay.clone();
+    // /preview.png is called in order to draw — do not make every caller add buttons=1.
+    if defs.is_some() && overlay.buttons.is_none() {
+        overlay.buttons = Some(ButtonsOpt::On(true));
+    }
+    let drawn = if overlay.is_empty() {
+        Value::Null
+    } else {
+        apply_overlay(&mut frame, &overlay, Some(defs_for_lookup), coord_scale, info.client_size)
+    };
+
+    // ?mark=x,y means "let me check this coordinate before pressing". If so, what sits under
+    // that point should be answered too — more certain than picking the picture apart by eye,
+    // and obtainable without pressing anything.
+    let mark_hit = ov_mark.and_then(|[mx, my]| window::control_at(info.handle, mx, my));
+
+    let what = if defs.is_some() {
+        "preview"
+    } else if req.rect.is_some() {
+        "rect"
+    } else {
+        region_name.as_str()
+    };
+    // With several profiles, the file name has to say which window a capture belongs to.
+    let label = format!("{profile}_{}", safe_label(what));
+    let (png, mut meta) = deliver(st, &frame, method, black, &label, req.save.unwrap_or(true))?;
+    meta["profile"] = json!(profile);
+    if !drawn.is_null() {
+        meta["overlay"] = drawn;
+    }
+    if let Some(h) = &mark_hit {
+        meta["hit"] = hit_json(h);
+    }
+    if let Some(w) = size_warning {
+        meta["size_mismatch"] = json!(w);
+    }
+    Ok((png, meta, window_json(&info)))
+}
+
+/// Draw a candidate definition over the current screen and return it, **saving nothing**.
+///
+/// The essential ordering of checking lives here: render after saving and it went live before
+/// anyone checked. Taking the candidate in the body lets a person look at the picture and then
+/// decide whether to apply it. It stores nothing and presses nothing, so it is a read path.
+pub async fn preview_png(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    if body.is_empty() {
+        return Err(ApiError::bad_request(
+            "POST /preview.png needs a candidate profile document as its body",
+        )
+        .with_detail(json!({
+            "hint": "send the same shape as a profile file; nothing is saved",
+        })));
+    }
+    let candidate: Targets = serde_json::from_str(
+        std::str::from_utf8(&body).map_err(|_| ApiError::bad_request("body must be UTF-8 JSON"))?,
+    )
+    .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid profile document: {e}")))?;
+    // Validation happens here too, so an agent filters itself out before involving a person.
+    candidate
+        .validate()
+        .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+
+    let mut req = CaptureReq::from_query(&q)?;
+    // A preview is a picture for checking, not a record — it does not save by default.
+    if req.save.is_none() {
+        req.save = Some(false);
+    }
+
+    let prof = pick(&state, req.profile.clone().as_deref())?;
+    let st = state.clone();
+    let (png, meta, _win) = tokio::task::spawn_blocking(move || {
+        let live = prof.targets();
+        capture_with(&st, &prof.name, &live, req, Some(&candidate))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("preview task failed: {e}")))??;
+    Ok(png_response(png, &meta))
+}
+
+/// The child controls inside the window — where this works, nothing is measured by eye.
+///
+/// **An empty list is not a failure but an answer**: that application does not split its
+/// controls into windows, and the way forward is drawing them by hand in `/editor`. The
+/// response says exactly that.
+pub async fn controls(State(state): State<SharedState>, Query(q): Query<HashMap<String, String>>) -> Result<Response, ApiError> {
+    let prof = pick(&state, q_get(&q, "profile").as_deref())?;
+    tokio::task::spawn_blocking(move || {
+        let t = prof.targets();
+        let info = find_window(&t)?;
+        let list = window::enumerate_controls(info.handle);
+        let items: Vec<Value> = list
+            .items
+            .iter()
+            .map(|c| {
+                json!({
+                    "class": c.class,
+                    "text": c.text,
+                    "id": c.id,
+                    "rect": c.rect,
+                    "depth": c.depth,
+                    "visible": c.visible,
+                })
+            })
+            .collect();
+        let note = if items.is_empty() {
+            "no child windows — this application draws its controls itself (WPF/WinUI, or a \
+             custom-painted operator panel). Measure the buttons by hand in /editor; that is \
+             the expected path, not a failure."
+        } else {
+            "rect is already in client coordinates and is the reliable part. 'text' is often \
+             empty even on a real button, so this list tells you WHERE the controls are, not \
+             what they do — read the legend off the screen at each rect \
+             (capture.png?rect=x,y,w,h&scale=4) before naming it. Many entries are layout \
+             containers rather than buttons: keep the ones that are visible, at least 6x6, and \
+             under 40% of the client area, then check the survivors with buttons=1."
+        };
+        let mut body = json!({
+            "count": items.len(),
+            "note": note,
+            "window": window_json(&info),
+            "controls": items,
+        });
+        // Never leave a truncation silent. Build a profile from a cut list and buttons are
+        // missing, which surfaces later only as "you told me to press it and there is no such
+        // button".
+        if list.total > items.len() {
+            body["truncated"] = json!({
+                "found": list.total,
+                "returned": items.len(),
+                "limit": window::CONTROL_LIMIT,
+                "note": "this window has more child windows than one response carries. The ones \
+                         you did not get are mostly deep inside lists and trees, but do not \
+                         assume that — if a button you expect is missing, it may simply be past \
+                         the cut. Measure that one by hand in /editor.",
+            });
+        }
+        Ok(json_ok(body))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("controls task failed: {e}")))?
+}
+
+/// Return the profile document **exactly as `POST /admin/profile` accepts it**.
+///
+/// ## Why `/profiles` will not do
+///
+/// `/profiles` flattens into arrays for reading and iterating (`buttons: [{name, rect, ...}]`).
+/// The saved shape is a map (`buttons: {name: {rect, ...}}`). So read-edit-write meant every
+/// client hand-writing a converter between the two, and the rules for that (drop a field when
+/// it holds the default, and so on) lived only inside the editor's JavaScript.
+///
+/// The real problem is ahead of us. **Add one field to a button and a hand-written converter
+/// saves without it.** It disappears on the next save and nothing errors. Being able to send
+/// back exactly what you received means there is no converter, and therefore nothing to lose.
+///
+/// `/profiles` stays as it is — this is not a replacement but one more endpoint, for round
+/// trips.
+pub async fn admin_get_profile(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let prof = pick(&state, q_get(&q, "profile").as_deref())?;
+    let doc = serde_json::to_value(&*prof.targets())
+        .map_err(|e| ApiError::internal(format!("could not serialize the profile: {e}")))?;
+    Ok(json_ok(doc))
+}
+
+/// Buttons that carried `confirm` before and do not carry it after — whether the flag was
+/// cleared or the whole button was removed. Both are the same act from a caller's side: the
+/// name stops being protected, and so does any raw coordinate that lands inside it.
+fn confirm_flags_lost(before: &Targets, after: &Targets) -> Vec<String> {
+    before
+        .buttons
+        .iter()
+        .filter(|(_, b)| b.confirm)
+        .filter(|(name, _)| after.buttons.get(*name).is_none_or(|now| !now.confirm))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// The gate that guards the gate.
+///
+/// A confirm flag is one person's judgement that pressing this needs a human. An edit endpoint
+/// that can remove it silently makes that judgement advisory: refused at `/click`, patch the
+/// flag off, press. Three calls and nobody was asked. So taking a flag away asks for exactly
+/// what pressing the button would have asked for.
+///
+/// It catches the accidental case too, which is the likelier one — a round-trip POST that
+/// re-types 140 buttons and drops a `true` somewhere would otherwise save and answer success.
+fn allow_losing_confirm(
+    q: &HashMap<String, String>,
+    before: &Targets,
+    after: &Targets,
+) -> Result<Vec<String>, ApiError> {
+    let lost = confirm_flags_lost(before, after);
+    if lost.is_empty() || q_bool(q, "confirm")?.unwrap_or(false) {
+        return Ok(lost);
+    }
+    Err(ApiError::forbidden(format!(
+        "this would take the confirm flag off {}: {}. Nothing was written.",
+        if lost.len() == 1 { "a button" } else { "buttons" },
+        lost.join(", ")
+    ))
+    .with_detail(json!({
+        "buttons": lost,
+ "why": "a person marked those as needing a human before they are pressed. Removing the flag is the same decision as pressing one, so it asks the same way.",
+ "hint": "resend with &confirm=true if removing it is part of the work you were asked to do. If you are here because a press was refused, this is not the way around that — the press itself takes \"confirm\": true, and leaves the flag where it is for whoever comes next.",
+ "note": "dropping a button that had the flag counts too — a raw coordinate inside it stops being protected the moment the button is gone",
+    })))
+}
+
+/// JSON Merge Patch, RFC 7386, applied to the saved document.
+///
+/// `null` means **remove this key** — the whole of the specification's delete syntax. Anything
+/// else replaces the value at that key and leaves its siblings alone, recursively.
+///
+/// Merge patch is usually described as unable to *store* a null, which would make an optional
+/// field unclearable. That does not apply here, because a profile never stores one: an unset
+/// option is written by leaving the key out, so removing the key and clearing the value are
+/// the same act. `removing_a_key_is_how_a_patch_clears_a_value` in targets.rs holds that.
+fn merge_patch(target: &mut Value, patch: &Value) {
+    let Value::Object(fields) = patch else {
+        *target = patch.clone();
+        return;
+    };
+    if !target.is_object() {
+        *target = Value::Object(serde_json::Map::new());
+    }
+    let Some(obj) = target.as_object_mut() else { return };
+    for (k, v) in fields {
+        if v.is_null() {
+            obj.remove(k);
+        } else {
+            merge_patch(obj.entry(k.clone()).or_insert(Value::Null), v);
+        }
+    }
+}
+
+/// Which names in one of the by-name maps came, went, or changed. A patch that turns out to
+/// match what was already there has to be reported as the nothing it was, rather than as a
+/// save — otherwise "it worked" and "it was already like that" look identical from here.
+fn map_diff(before: Option<&Value>, after: Option<&Value>) -> Value {
+    let empty = serde_json::Map::new();
+    let b = before.and_then(Value::as_object).unwrap_or(&empty);
+    let a = after.and_then(Value::as_object).unwrap_or(&empty);
+    json!({
+        "added": a.keys().filter(|k| !b.contains_key(*k)).cloned().collect::<Vec<_>>(),
+        "removed": b.keys().filter(|k| !a.contains_key(*k)).cloned().collect::<Vec<_>>(),
+        "modified": a.iter()
+            .filter(|(k, v)| b.get(*k).is_some_and(|old| old != *v))
+            .map(|(k, _)| k.clone())
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// **Change one corner of a profile without resending it.** A 140-button document is around
+/// 6,000 tokens; read-modify-write costs that twice to add a single button, and every one of
+/// those re-typed rectangles is a chance to move a coordinate by a digit in a way that
+/// validates, saves, and answers success. A patch touches only what it names.
+///
+/// Merge patch semantics (RFC 7386): `{"buttons": {"NEW": {...}, "OLD": null}}` adds one,
+/// deletes one, and leaves every other button exactly as it was.
+///
+/// It does not create profiles — an unknown name is a 404, because `POST` is where creating
+/// happens and a mistyped name must not quietly become a new empty profile.
+pub async fn admin_patch_profile(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    editing_allowed(&state)?;
+    let text = std::str::from_utf8(&body)
+        .map_err(|_| ApiError::bad_request("body must be UTF-8 JSON"))?;
+    let patch: Value = serde_json::from_str(text)
+        .map_err(|e| ApiError::bad_request(format!("invalid patch: {e}")))?;
+    let Some(fields) = patch.as_object() else {
+        return Err(ApiError::bad_request(
+            "a merge patch has to be a JSON object naming the parts to change",
+        )
+        .with_detail(json!({
+            "example": {"buttons": {"NEW_KEY": {"rect": [10, 20, 30, 40]}, "GONE": Value::Null}},
+        })));
+    };
+    if fields.is_empty() {
+        return Err(ApiError::bad_request("the patch is empty — nothing would change"));
+    }
+
+    let prof = pick(&state, q_get(&q, "profile").as_deref())?;
+    let before = prof.targets();
+    let before_doc = serde_json::to_value(&*before)
+        .map_err(|e| ApiError::internal(format!("could not serialize the profile: {e}")))?;
+
+    let mut doc = before_doc.clone();
+    merge_patch(&mut doc, &patch);
+
+    // The merged document goes through the same door a whole POST does: unknown fields are
+    // refused, so a typo inside the patch cannot delete the field it meant to set.
+    let fresh: Targets = serde_json::from_value(doc).map_err(|e| {
+        ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, format!("the patched profile is not valid: {e}"))
+            .with_detail(json!({"note": "nothing was written — the profile on disk is unchanged"}))
+    })?;
+    fresh.validate().map_err(|e| {
+        ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e)
+            .with_detail(json!({"note": "nothing was written — the profile on disk is unchanged"}))
+    })?;
+    let after_doc = serde_json::to_value(&fresh)
+        .map_err(|e| ApiError::internal(format!("could not serialize the patched profile: {e}")))?;
+
+    // A patch that asks for what is already there must not be written. Saving would rotate a
+    // good .bak away for no reason, and "saved" would be the wrong answer to "did anything
+    // change".
+    if after_doc == before_doc {
+        return Ok(json_ok(json!({
+            "saved": false,
+            "changed": false,
+            "profile": prof.name,
+            "note": "the patch matches what the profile already says — nothing was written, and the backup file is untouched",
+        })));
+    }
+
+    let lost_confirm = allow_losing_confirm(&q, &before, &fresh)?;
+    let scalars: Vec<String> = ["description", "window", "reference_client", "on_size_mismatch"]
+        .iter()
+        .filter(|f| before_doc.get(**f) != after_doc.get(**f))
+        .map(|f| (*f).to_string())
+        .collect();
+    let changed = json!({
+        "buttons": map_diff(before_doc.get("buttons"), after_doc.get("buttons")),
+        "regions": map_diff(before_doc.get("regions"), after_doc.get("regions")),
+        "keys": map_diff(before_doc.get("keys"), after_doc.get("keys")),
+        "fields": scalars,
+    });
+
+    let path = prof.path.clone();
+    let saved = tokio::task::spawn_blocking(move || fresh.save(&path).map(|()| fresh))
+        .await
+        .map_err(|e| ApiError::internal(format!("save task failed: {e}")))?
+        .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+
+    log::warn!(
+        "profile '{}' PATCHED over HTTP ({}) — now {} buttons, {} regions, {} keys",
+        prof.name,
+        prof.path.display(),
+        saved.buttons.len(),
+        saved.regions.len(),
+        saved.keys.len()
+    );
+    if !lost_confirm.is_empty() {
+        log::warn!(
+            "profile '{}': confirm flag REMOVED from {} — acknowledged with confirm=true",
+            prof.name,
+            lost_confirm.join(", ")
+        );
+    }
+    let summary = json!({
+        "saved": true,
+        "changed": changed,
+        "confirm_removed": lost_confirm,
+        "profile": prof.name,
+        "path": prof.path.to_string_lossy(),
+        "backup": prof.path.with_extension("json.bak").to_string_lossy(),
+        "buttons": saved.buttons.len(),
+        "regions": saved.regions.len(),
+        "keys": saved.keys.len(),
+        "confirm_buttons": saved.buttons.values().filter(|t| t.confirm).count(),
+        "size_check": if size_check_is_inert(&saved) {
+            json!({
+                "active": false,
+                "why": "reference_client is not set, so on_size_mismatch \"reject\" has nothing to compare against and the window size is never checked",
+                "fix": format!("read client_size from GET /window?profile={} and save it back as reference_client", prof.name),
+            })
+        } else {
+            json!({"active": saved.reference_client.is_some(), "measured_at": saved.reference_client})
+        },
+    });
+    prof.targets.store(std::sync::Arc::new(saved));
+    Ok(json_ok(summary))
+}
+
+/// The editor writing a profile file. Requires `allow_profile_editing: true`, plus a matching
+/// `admin_code` if one is configured (none configured means none is demanded — it started out
+/// required and was removed once real use showed it produced only friction, 2026-08-26).
+///
+/// This endpoint being open means **the permission boundary has moved from file permissions to
+/// HTTP reachability**. So it is closed by default, and the refusal says exactly that.
+pub async fn admin_save_profile(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    editing_allowed(&state)?;
+    // Parse and validate the body **first**. This used to create the profile file and then
+    // look at the body, so a broken body left an unusable file behind (measured). Side effects
+    // come after validation.
+    let text = std::str::from_utf8(&body)
+        .map_err(|_| ApiError::bad_request("body must be UTF-8 JSON"))?
+        .to_string();
+    let fresh: Targets = serde_json::from_str(&text).map_err(|e| {
+        ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid profile document: {e}"))
+    })?;
+    fresh
+        .validate()
+        .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+
+    // Saving under an unknown name **creates a profile** — requiring a config edit and a
+    // restart to add one application would break the premise that this tool is not specific to
+    // any one program. It widens no access (the whitelist is untouched).
+    let asked = q_get(&q, "profile");
+    let (prof, created) = match &asked {
+        Some(name) if state.profile(Some(name)).is_err() => {
+            if !crate::config::is_safe_profile_name(name) {
+                return Err(ApiError::bad_request(format!(
+                    "'{name}' is not a valid profile name — letters, digits, '-' and '_' only"
+                )));
+            }
+            let path = crate::config::profile_path(name);
+            if path.exists() {
+                return Err(ApiError::conflict(format!(
+                    "{} already exists but is not a loaded profile — POST /admin/reload to rescan",
+                    path.display()
+                )));
+            }
+            // The file is created by save() below. Not writing it here is the same rule: a
+            // failed save has to leave no trace at all.
+            let p = std::sync::Arc::new(crate::state::Profile {
+                name: name.clone(),
+                path,
+                targets: arc_swap::ArcSwap::from(std::sync::Arc::new(fresh.clone())),
+            });
+            (p, true)
+        }
+        other => (pick(&state, other.as_deref())?, false),
+    };
+
+    // A whole-document POST is where a confirm flag goes missing by accident: 140 buttons
+    // re-typed, one `true` dropped, saved, "success". Same gate as the patch.
+    let lost_confirm =
+        if created { Vec::new() } else { allow_losing_confirm(&q, &prof.targets(), &fresh)? };
+    if !lost_confirm.is_empty() {
+        log::warn!(
+            "profile '{}': confirm flag REMOVED from {} — acknowledged with confirm=true",
+            prof.name,
+            lost_confirm.join(", ")
+        );
+    }
+
+    let path = prof.path.clone();
+    let saved = tokio::task::spawn_blocking(move || fresh.save(&path).map(|()| fresh))
+        .await
+        .map_err(|e| ApiError::internal(format!("save task failed: {e}")))?
+        .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+
+    log::warn!(
+        "profile '{}' REWRITTEN over HTTP ({}) — {} buttons, {} regions, {} keys",
+        prof.name,
+        prof.path.display(),
+        saved.buttons.len(),
+        saved.regions.len(),
+        saved.keys.len()
+    );
+    let summary = json!({
+        "saved": true,
+        "created": created,
+        "profile": prof.name,
+        "path": prof.path.to_string_lossy(),
+        "backup": prof.path.with_extension("json.bak").to_string_lossy(),
+        "buttons": saved.buttons.len(),
+        "regions": saved.regions.len(),
+        "keys": saved.keys.len(),
+        "confirm_buttons": saved.buttons.values().filter(|t| t.confirm).count(),
+        "confirm_removed": lost_confirm,
+        "size_check": if size_check_is_inert(&saved) {
+            json!({
+                "active": false,
+                "why": "reference_client is not set, so on_size_mismatch \"reject\" has nothing to compare against and the window size is never checked",
+                "fix": format!("read client_size from GET /window?profile={} and save it back as reference_client", prof.name),
+            })
+        } else {
+            json!({"active": saved.reference_client.is_some(), "measured_at": saved.reference_client})
+        },
+    });
+    prof.targets.store(std::sync::Arc::new(saved));
+    if created {
+        // Only add it to the list once the file really exists.
+        let mut map = (**state.profiles.load()).clone();
+        map.insert(prof.name.clone(), prof.clone());
+        state.profiles.store(std::sync::Arc::new(map));
+        log::warn!("new profile '{}' created at {}", prof.name, prof.path.display());
+    }
+    Ok(json_ok(summary))
+}
+
+/// The manual for agents — **pure documentation. It carries no server state.**
+///
+/// This originally included the current window, the button list and the policy. Reading once
+/// and acting immediately was convenient, but it made the document different on every call,
+/// which left it neither a manual nor a status report. The roles are now split:
+///
+/// - `/help`    — **how** to use it. It does not change
+/// - `/health`  — **what exists right now and whether it works**: profiles, window state, policy
+/// - `/buttons` — one profile's button, region and key names
+///
+/// Which is why this text has to end by saying plainly what to call next. Without that, the
+/// reader starts inventing endpoint names.
+pub async fn help(headers: axum::http::HeaderMap) -> Response {
+    let base = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|h| format!("http://{h}"))
+        .unwrap_or_else(|| "http://HOST:PORT".to_string());
+
+    let mut hdrs = axum::http::HeaderMap::new();
+    hdrs.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    (StatusCode::OK, hdrs, build_help(&base)).into_response()
+}
+
+fn build_help(base: &str) -> String {
+    format!(
+        r#"deescreen v{version} - drive a Windows GUI window over HTTP.
+
+This page is a manual and does not change. For what exists on this server right now,
+call:
+  GET {base}/health      which profiles exist, which windows, is it working
+  GET {base}/profiles    every profile's full definition - buttons, regions, keys, window
+                         (?profile=NAME for just one)
+
+COORDINATES
+  Every coordinate is a pixel inside the TARGET WINDOW's client area - not the screen,
+  not the monitor. (0,0) is the top-left of the window's content, below the title bar
+  and any menu bar. Captures use the same coordinate system, so a pixel measured in a
+  capture PNG can be sent straight back as a click.
+  Moving the window or changing screen resolution does not shift these. Resizing the
+  window does - that is what the size check below is for.
+
+PROFILES
+  One profile = one window plus its own coordinates, buttons, regions and keys. A
+  different application is a different coordinate universe, so profiles do not share
+  anything. Every window-facing call takes ?profile=NAME (or "profile" in the body).
+  GET /health lists them with a human-written description each, and GET /profiles
+  gives their full definitions. If a person names an application rather than a
+  profile, match what they said against those descriptions and window titles - do
+  not guess.
+
+  Omitting profile works only when it is unambiguous: when the operator set a default,
+  or when exactly one profile exists. With two or more and no default you get a 404
+  listing the names - name one. Nothing picks alphabetically on your behalf, because
+  then adding a profile would silently re-aim every call that left it out.
+
+  If there are no profiles at all, nothing can be captured or pressed yet. That is not
+  a fault: a person has to create one in the editor, where the window and its buttons
+  are pointed at by hand. Say so and stop - there is no coordinate you can send that
+  would work.
+
+PRESS A SAVED BUTTON - click, wait for it to settle, re-capture, one round trip
+  curl -s -X POST -o shot.png "{base}/click.png?button=NAME&capture=REGION&settle_ms=500"
+  Then look at shot.png. Metadata rides back in the X-Deescreen-Meta header: how it was
+  captured, whether the screen actually changed, byte size.
+
+  JSON variant - no image in the body, a server-side path and /captures URL instead:
+  curl -s -X POST -H "Content-Type: application/json" \
+    -d '{{"button":"NAME","capture":"REGION","settle_ms":500}}' {base}/click
+
+  settle_ms is how long to wait after the press before re-capturing. Left out it uses
+  the server's default; ask for more than the server's ceiling and it is CLAMPED, not
+  refused. Both numbers are in /health under "policy", and every reply reports the
+  settle_ms actually used - so read that rather than assuming you got what you asked.
+
+  A LEFT SINGLE CLICK IS THE DEFAULT. "click_button": "right" (or "middle") and
+  "double": true change that, on a saved button and on a raw coordinate alike. A button
+  can carry either as its own default in the profile, so a context-menu button works
+  without the caller having to know; passing it in the request overrides that.
+
+PRESS SEVERAL BUTTONS IN ORDER - for keypads, where a half-entry is worse than none
+  Entering data on an MDI keypad is one press per character. Send the sequence instead:
+
+  curl -s -X POST -H "Content-Type: application/json" -d '{{
+    "buttons": ["MDI_G","MDI_9","MDI_1","MDI_X","MDI_0","MDI_EOB","MDI_INSERT"],
+    "gap_ms": 150, "capture": "hmi_display" }}' {base}/click
+
+  This is not mainly about saving round trips. A partial string left in the machine is
+  worse than no string at all - press CYCLE START after it and an unintended block runs.
+  So:
+    - Every name is resolved and checked BEFORE anything is pressed. A typo in element
+      eight costs nothing instead of leaving seven characters in the machine.
+    - A press that fails STOPS the sequence. "sequence.failed" gives the index and the
+      button, and "pressed" lists what did go in, each with its own hit. Read a partial
+      sequence as an unfinished entry: look at the screen before doing anything else.
+    - A confirm button inside the array follows the same rule as a single press - refused
+      unless the request carries "confirm": true. An array is not a way around it. Even
+      then, prefer pressing that one on its own.
+    - capture, ignore and settle_ms apply ONCE, after the last press. gap_ms is the pause
+      between presses; it defaults to 500ms because a panel that drops input when pressed
+      too fast fails silently, which is the failure this endpoint exists to prevent. Lower
+      it once you have measured yours.
+  "buttons" cannot be combined with "button", "rect" or "point". At most 200 per request.
+  In the query form (/click.png) it is a comma-separated list: buttons=MDI_G,MDI_9.
+
+BUTTONS MARKED CONFIRM - the one thing in here that is about judgement
+  Some buttons carry "confirm": true. Pressing one needs "confirm": true in the request
+  as well, and without it you get 403.
+
+  THIS IS NOT A REQUEST FOR PERMISSION. Nothing here contacts anybody and nothing waits
+  for a reply. Resending with "confirm": true is the entire mechanism and it is yours to
+  send - you are expected to run alone. What the flag buys is that the press cannot
+  happen by ACCIDENT: not from a rectangle you computed, not swept up inside a sequence,
+  not as a reflex after a refusal. Only as a second request that names the button on
+  purpose.
+
+  So spend the gap on the thing it is there for. GET /buttons gives "confirm" and "note"
+  for every button before you press anything; the note is a person telling you what that
+  button does. Read it, then answer one question:
+
+      Is this press part of the work I was actually asked to do?
+
+    yes - press it. Say afterwards that you did, and why.
+    no, it is my own idea of a shortcut to something else - this is the case the flag
+        exists for. Do not press it. Find another route, or come back and say what you
+        found and what you think it needs.
+
+  The test is whether the button is inside your task, not whether somebody is watching.
+  And the note is better information than the screen: it was written by someone standing
+  at a machine you cannot see.
+
+  Raw coordinates do not get you around it. A rect or point that lands inside a saved
+  confirm button is refused the same way, because the alternative is that the flag
+  quietly stops meaning anything the moment you compute coordinates instead of using a
+  name.
+
+PRESS SOMETHING THAT IS NOT A SAVED BUTTON
+  Some controls only exist on certain screens, so they cannot be in the saved list.
+  Send the rectangle itself; the click lands in its centre, exactly as a saved button
+  would, and nothing is stored.
+
+  ASK BEFORE YOU MEASURE. GET /controls often hands you the rectangle outright, with
+  the control's caption next to it - no pixels involved, so no misreading:
+    curl -s "{base}/controls?profile=NAME"
+  It works where controls are separate windows (Win32, MFC, WinForms) and returns an
+  empty list where they are not (WPF, a single-bitmap HMI). An empty list is an answer,
+  not a failure: it means this application must be read from the screen. Captions are
+  often blank even when the rectangle is right, so treat position as the reliable part.
+
+  Otherwise capture and work out where the control is.
+
+  curl -s -X POST -H "Content-Type: application/json" \
+    -d '{{"rect":[820,640,60,40]}}' {base}/click
+  curl -s -X POST -o shot.png "{base}/click.png?rect=820,640,60,40&capture=client"
+
+  `point` works too when you do not know the size: {{"point":[850,660]}}.
+  This needs allow_raw_clicks in config.json - /health reports whether it is on, and
+  the refusal says so plainly.
+
+  CHECK YOUR READING FIRST. This draws a crosshair and a magnified inset at a
+  coordinate without touching anything:
+  curl -s -o check.png "{base}/capture.png?mark=850,660&inset=4"
+  A misread rectangle presses whatever is actually there, and that is silent.
+  The X-Deescreen-Meta of that response carries "hit" - the control sitting at that
+  exact point (class, text, its own rect). If hit.is_window_itself is true there is no
+  control there and you are about to press background. hit.rect is the control's real
+  rectangle, so it is also the answer when your coordinate is close but off-centre.
+
+LOOK AT SOMETHING
+  curl -s -o shot.png "{base}/capture.png?region=NAME"
+  curl -s -o shot.png "{base}/capture.png?rect=0,940,1280,60"     ad-hoc rectangle
+  curl -s -o shot.png "{base}/capture.png"                        whole client area
+  Overlays for measuring: &grid=50 &mark=x,y &inset=4 &inset_radius=40 &buttons=1
+  (inset_radius is how many client pixels around the mark get magnified; default 40)
+
+  READING SMALL TEXT - scale magnifies, but only on a crop:
+    curl -s -o shot.png "{base}/capture.png?rect=820,600,300,80&scale=4"
+  scale<1 shrinks (any capture), scale>1 magnifies (needs region= or rect=, capped at
+  8x and 4 megapixels, nearest-neighbour so the strokes stay crisp). Magnifying the
+  whole client area is refused - crop first. max_width caps the output width either
+  way, so &scale=8&max_width=1200 means "as big as fits in 1200px".
+
+  &buttons= draws the saved buttons and regions over the capture, three ways:
+    buttons=1     outline + name + crosshair at the click point
+    buttons=box   outline + name, NO crosshair - the crosshair sits exactly on the key
+                  legend, so use this when you are reading what a key says
+    buttons=num   outline + a number. The number is that button's 1-based position in
+                  GET /buttons (which is sorted by name), so no legend is needed. Use
+                  this where buttons are packed too tightly for names to fit.
+  Names that cannot be placed without covering a neighbour are drawn as their number
+  instead, and the metadata says how many ("labels_crowded").
+  CAPTURE A BUTTON, WITH A MARGIN. A toggle's state is usually NOT inside its button - on
+  an operator panel the lamp sits just above the key. Do not read the rect from
+  GET /buttons and add a margin yourself; name the button and say how much:
+    curl -s -o shot.png "{base}/capture.png?region=button:OPT_STOP&pad=25"
+    curl -s -X POST -o shot.png "{base}/click.png?button=OPT_STOP&capture=button&pad=25"
+  pad grows the rectangle on every side, in the same client pixels as the numbers in the
+  profile, and anything past the window edge is clamped rather than refused. On a click,
+  `capture=button` with no name means the button you just pressed (the last one, for a
+  sequence), so you do not have to write it twice.
+
+  Region names and their absolute rects come from GET /regions (or /profiles). "client" is reserved and means the whole
+  client area. A capture attached to a click costs two renders (before and after), so
+  ask for one when you intend to look.
+
+  A CROPPED CAPTURE STARTS AT ITS OWN (0,0), NOT THE WINDOW'S.
+  If you read a pixel off a region capture and send it back as a click, it is wrong by
+  the crop offset - silently. Two ways to be right:
+
+  1. Ask for a grid. Its labels are WINDOW coordinates even on a crop, so the number
+     you read is the number you send. No arithmetic:
+       curl -s -o shot.png "{base}/capture.png?region=status_bar&grid=20"
+
+  2. Or convert, using the X-Deescreen-Meta header of that same response, which
+     carries the crop rect and the scale that were applied:
+       window_x = rect[0] + png_x / scale
+       window_y = rect[1] + png_y / scale
+
+  Capturing "client" (or omitting the region) needs no conversion at all - that image
+  already is the window's coordinate system.
+
+ENDPOINTS
+  GET  /  ·  /help     this page. It never changes; /health is what changes
+  GET  /health         is it operable right now - check this first when anything fails.
+                       "home" is where config.json, profiles/, captures/ and logs/ live on
+                       that PC, and why that directory was chosen - the answer when a person
+                       asks where their settings are. Moving them is theirs to do, not
+                       yours: the DEESCREEN_HOME environment variable, then a restart.
+                       "status" is ok or degraded and "problems" lists what is wrong, in
+                       plain language - a locked session, a profile that failed to parse,
+                       a window that is not open. "policy" says which of the gated things
+                       this server allows, including whether an admin code is required
+  GET  /profiles       every profile's full definition; one call tells you everything
+  GET  /buttons        just the button list of one profile (subset of /profiles)
+  GET  /regions        just the region list of one profile (subset of /profiles)
+  GET  /windows        every visible top-level window (to find a title)
+  GET  /controls       every child control inside the target window, with its rectangle
+                       in window coordinates and its caption. Rectangles you can read
+                       instead of measure - see below.
+  GET  /window         the configured window's current state
+  GET  /capture.png    ?region= &rect=x,y,w,h &pad= &scale= &max_width= plus the overlays
+                       above. region=button:NAME captures that button's own rectangle.
+                       With &mark=x,y the metadata also carries "hit" for that point -
+                       verify a coordinate without pressing anything.
+  POST /capture        the same as /capture.png but the reply is JSON - the metadata plus
+                       the server-side path and /captures URL, and no image in the body.
+                       Use it when you want the picture kept and referred to rather than
+                       read right now. Parameters go in the body
+  POST /click          {{button | buttons[] | rect | point, confirm, click_button, double,
+                       settle_ms, gap_ms, capture, pad, ignore}} - the reply carries "hit"
+                       (what was under the point) and "change" (pixels + bbox). With
+                       "buttons" it presses them in order and stops at the first failure
+  POST /click.png      same, returns PNG bytes; parameters go in the query string
+  POST /key            {{key}} - a saved key; the names are in GET /profiles under "keys"
+                       (NOT in /buttons - that endpoint is buttons only). {{chord}} presses an
+                       unnamed combination ("f1", "ctrl+alt+f1") and {{text}} types a string;
+                       both need allow_raw_keys.
+                       Takes {{capture, ignore, settle_ms, scale, max_width}} too, so one
+                       call presses and shows you the result. There is no "hit" here -
+                       a key has no coordinate, so "did it arrive" has no cheap answer;
+                       check /health input.uipi_risk instead.
+  POST /window/focus   raise it / un-minimize it
+  POST /window/fit     restore the client area to the size the buttons were measured at
+  POST /preview.png    draw a candidate profile document over the live screen, saving nothing
+  GET  /admin/profile  the profile as a document, in EXACTLY the shape POST takes
+  POST /admin/profile  replace that document (needs allow_profile_editing)
+  PATCH /admin/profile change PART of it - send only what differs. See below
+  DEL  /admin/profile  ?profile=NAME&confirm=true - delete it. The file is moved aside,
+                       not erased, but only a person on that PC can put it back
+  POST /admin/profile/rename ?profile=OLD&to=NEW - rename in place
+  POST /admin/reload   re-read the profile files from disk. POST /admin/profile already
+                       takes effect immediately; this is for when a PERSON edited a file
+                       on that PC or dropped a new one in. Without ?profile= it rescans
+                       the folder, so a new profile appears without a restart.
+  GET  /captures/{{name}} fetch a capture the server kept - but only for a while: the
+                       oldest are deleted as new ones arrive, so a URL you set aside can
+                       404 later. Download it when you get it. The JSON click/capture replies
+                       give you the name and the URL; PNG replies you already have.
+  GET  /ping           alive? The one endpoint no IP whitelist applies to. If everything
+                       else returns 403 and this does not, you are simply not on the list.
+
+THE /admin ENDPOINTS MAY ASK FOR A CODE
+  Everything under /admin passes one more check when the operator set an admin_code.
+  It travels as a header, on every /admin call:
+    curl -s -H "X-Admin-Code: THECODE" "{base}/admin/profile?profile=NAME"
+  Check "policy.admin_code_required" in GET /health before you start, rather than
+  finding out at the save. Without the header you get 401 and the reply names it. Where
+  the operator left admin_code empty nothing is demanded, and the IP whitelist is then
+  the only thing in front of these endpoints. The code is not yours to guess or to
+  brute force: if you do not have it, say so and ask the person who runs that PC.
+
+CREATE A PROFILE FROM SCRATCH
+  A person usually does this in /editor by drawing rectangles. You can do it too, if
+  allow_profile_editing is on. POST with a ?profile= name that does not exist CREATES
+  it - there is nothing to read first, so this is the one case where you do not start
+  with GET.
+
+  1. Find the window. GET /windows lists every visible top-level window with its title,
+     class and client size. Match on what the person called the application, and keep
+     the SHORTEST title fragment that still picks exactly one - titles often carry the
+     open file name, so an exact match on today's title stops matching tomorrow.
+     Check your fragment: how many windows contain it? If more than one, add "class".
+
+  2. Create it. The name is yours to choose: letters, digits, '-' and '_' only, because
+     it travels in URLs and capture file names.
+       curl -s -X POST -H "Content-Type: application/json" \
+         -d '{{"description": "the Mitsubishi CNC simulator the operator calls NC plus",
+              "window": {{"title": "NC Trainer2", "title_exact": false, "class": ""}}}}' \
+         "{base}/admin/profile?profile=nctrainer"
+     WRITE THE DESCRIPTION IN PLAIN LANGUAGE. It is the only thing connecting what a
+     person says ("use the NC simulator") to a profile named nctrainer. Leaving it
+     empty means the next agent has to guess.
+
+  3. Pin the size. GET /window?profile=nctrainer gives the client size right now; put it
+     in reference_client and save again. Without it, coordinates measured today are
+     reused at any other window size with no complaint.
+
+  4. Get the rectangles. GET /controls?profile=nctrainer. On a WinForms panel this
+     returns hundreds of entries and most are not buttons. What the editor keeps:
+       visible, and                          - invisible ones cannot be clicked
+       width >= 6 and height >= 6, and       - separators and hairlines
+       area <= 40% of the client area        - those are panels and containers
+     Expect to throw most of them away.
+
+     THIS LIST TELLS YOU WHERE, NOT WHAT. "text" is empty on most custom-drawn buttons
+     (21 of 128 keys on one FANUC panel are blank keys with no legend at all), so you
+     cannot name a button from this response alone. Read the legend off the screen at
+     that rectangle before you name it:
+       curl -s -o key.png "{base}/capture.png?profile=nctrainer&rect=820,600,60,40&scale=6"
+     If a "truncated" block comes back, the window had more child windows than one
+     response carries and a button you expect may simply be past the cut.
+
+  5. Name them and save the whole document back. Two names that are the same are
+     refused, so pick carefully where an application repeats a legend - the MDI letter
+     keys X/Y/Z and the axis-select buttons X/Y/Z are the same word for different
+     things. Mark anything a person would have to undo by hand with "confirm": true.
+
+     ADDING A CONFIRM FLAG IS YOURS TO DECIDE. It costs a caller one field and it is the
+     right answer when you are unsure - a button you keep aiming at by mistake, or one
+     whose legend you could not read. Say why in that button's "note", because nothing
+     here records who set a flag: a month from now neither you nor a person can tell your
+     caution apart from someone's hard requirement, and the note is the only place that
+     difference can live. Adding one is not free either - taking it off later asks.
+
+     TAKING ONE OFF IS A HEAVIER CALL. That flag is somebody's judgement about a machine
+     you cannot see, and removing it changes this server for everyone who uses it after
+     you, not just for the press in front of you. &confirm=true is yours to send - the
+     gate is there so it cannot happen by accident, and the server logs it - but it
+     should follow from the work you were asked to do, not from a refusal you would
+     rather not have had. Flag looks wrong? Leaving it and saying so costs nothing.
+
+  6. Verify before you trust it. You can look at a document BEFORE saving it - the same
+     overlay, drawn from the body you send, storing nothing and touching no file:
+       curl -s -X POST -H "Content-Type: application/json" --data-binary @p.json          -o check.png "{base}/preview.png?profile=nctrainer&buttons=1"
+     It takes the capture parameters too (region, rect, scale, pad), and it validates the
+     document, so a rectangle off the window is refused here rather than saved. After
+     saving, the same picture comes from a plain capture:
+       curl -s -o check.png "{base}/capture.png?profile=nctrainer&buttons=1"
+     Every rectangle should sit on the control you named it after. Metadata reports
+     outside_client for any that fell off the window.
+
+EDITING A PROFILE FROM A PROGRAM
+  Read it, change it, send it back - the same shape both ways:
+    curl -s "{base}/admin/profile?profile=NAME" > p.json
+    ...edit p.json...
+    curl -s -X POST -H "Content-Type: application/json" \
+      --data-binary @p.json "{base}/admin/profile?profile=NAME"
+
+  Use THIS, not GET /profiles, when you intend to write back. /profiles flattens the
+  document into arrays for reading (buttons: [{{name, rect, ...}}]); the saved shape is a
+  map keyed by name (buttons: {{name: {{rect, ...}}}}). Converting by hand works today and
+  silently drops whatever field this server gains tomorrow. Round-tripping the document
+  has no converter, so it has nothing to lose.
+
+  POST REPLACES THE WHOLE DOCUMENT. Anything you leave out is gone. Send back what you
+  read, with your edits applied - not a fragment.
+
+  CHANGING ONE THING? USE PATCH, NOT POST. A 140-button profile is around 6,000 tokens, so
+  read-modify-write costs that twice to add a single button - and re-typing 140 rectangles
+  is 140 chances to move a coordinate by one digit in a way that validates, saves, and
+  answers success. PATCH sends only the difference:
+
+    curl -s -X PATCH -H "Content-Type: application/json"       -d '{{"buttons": {{"NEW_KEY": {{"rect": [820,640,60,40]}}, "OLD_KEY": null}}}}'       "{base}/admin/profile?profile=NAME"
+
+  It is a JSON merge patch (RFC 7386), and there are only three rules:
+    - a value REPLACES what is at that key
+    - an object MERGES into what is at that key, leaving its other fields alone. Patching a
+      button's rect keeps that button's confirm and note
+    - null PUTS THE KEY BACK THE WAY IT WAS BEFORE ANYONE SET IT. Nothing in a profile is
+      ever stored as a literal null - an option that is not set is simply absent - so
+      removing the key and clearing the value are the same act here:
+        "reference_client": null   the size check goes back to unpinned
+        "settle_ms": null          that button waits the server default again
+        "point": null              back to pressing the centre of the rect
+        "on_size_mismatch": null   back to "reject"
+        "regions": null            empties that whole collection
+  Everything not named is untouched. Fixing a size and adding a button are one line each:
+    -d '{{"reference_client": [1280,1000]}}'
+    -d '{{"regions": {{"alarm_bar": [0,940,1280,60]}}}}'
+
+  To empty a collection send null, not {{}}. An empty object merges nothing, so
+  {{"buttons": {{}}}} asks for no change at all - and the reply will say "changed": false
+  rather than pretending it emptied anything.
+
+  The reply says what actually changed - added, removed and modified names per collection.
+  A patch that matches what the profile already said writes nothing and tells you so
+  ("changed": false), so "it worked" and "it was already like that" never look the same.
+  A typo inside the patch is refused like any other unknown field, and nothing is written.
+  PATCH does not create profiles; an unknown name is a 404. POST is where creating happens.
+
+  Profile files are strict JSON with no comments, so there is nothing in one that a
+  round trip can quietly drop. Anything a person needs to record about a button goes in
+  "description" or that button's "note", which are real fields and come back to you.
+
+  Removing one button is just leaving it out of the document you send back. Removing
+  the PROFILE is a different endpoint, and it asks first:
+    curl -s -X DELETE "{base}/admin/profile?profile=NAME&confirm=true"
+  Without confirm=true it refuses and tells you so. The file is moved aside as
+  deescreen.<name>.json.deleted-<timestamp>, which nothing here ever overwrites or
+  cleans up - but putting it back is a person's job on that PC, so treat delete as
+  one-way from here.
+
+  To rename, use the rename endpoint, NOT "save under a new name":
+    curl -s -X POST "{base}/admin/profile/rename?profile=OLD&to=NEW"
+  Saving under a new name COPIES. You would leave two profiles pointing at one window,
+  and omitting ?profile= would stop working the moment there are two of them. Rename
+  moves it, so neither happens. The old name then 404s with the known list - nothing is
+  silently redirected.
+
+  Neither one touches the profile that config.json names as default_profile: losing it
+  would break every request that omits ?profile=, and only a config edit plus a restart
+  could undo that. Both refuse with 409 and say so.
+
+  A FIELD NAME THIS SERVER DOES NOT KNOW STOPS THE SAVE. Nothing is dropped quietly: the
+  reply names the field and lists the ones that were expected, and no file is touched. The
+  field most worth getting right is "confirm" - spelled wrong it would store the emergency
+  stop with no confirmation required and answer "saved". Same for the config file, which
+  refuses to start rather than run with a setting it did not understand.
+
+  TAKING A CONFIRM FLAG OFF ASKS THE SAME WAY PRESSING WOULD. A save or patch that leaves
+  a button without a "confirm" it used to have - flag cleared, or the whole button removed -
+  is refused unless the request carries &confirm=true, and the refusal names the buttons.
+  Nothing is written either way.
+
+  Read that refusal carefully if you got here from a 403 at /click. Removing the flag and
+  then pressing is three calls in which nobody was asked, and it leaves the button unprotected
+  for everyone after you. It is not the way around a confirm - saying what you are about to
+  press and letting a person answer is. When a person HAS asked for the flag to go, resend
+  with &confirm=true; the reply lists what was removed and the server logs it.
+
+  Two names that are the same are refused at parse time, not merged, so you can never
+  send 128 buttons and save 127. Names travel in ?button=NAME, so characters that would
+  be cut there (& = # ? % + / \ whitespace) are refused when saving. Letters, digits,
+  '_', '-', '.' are always safe; non-ASCII letters are fine too.
+
+TRAPS - these fail quietly or confusingly. Read once, save yourself an hour.
+  403 confirm      A button marked CONFIRM needs "confirm": true in the request too, and
+                   so does a raw coordinate that lands inside one. Not a fault and not a
+                   permission slip - resending is yours to do. It is here so the press
+                   cannot happen by accident. Read the button's note first; see BUTTONS
+                   MARKED CONFIRM above.
+  401 admin code   An /admin call on a server whose operator set an admin_code. Resend
+                   with the "X-Admin-Code" header. You cannot obtain that value from
+                   here - ask the person who runs that PC.
+  409 size         The window is no longer the size the buttons were measured at, so
+                   every coordinate would be off. POST /window/fit. If the window is the
+                   one that is right and reference_client is the stale number, update
+                   that field instead. A panel that genuinely stretches with its window
+                   can set "on_size_mismatch": "scale", or "ignore" where the panel stays
+                   pinned to the top-left; the default, "reject", is this 409.
+  409 minimized    POST /window/focus.
+  black capture    The console session is locked or RDP is disconnected. Nothing will
+                   work until a human unlocks it. /health says so explicitly.
+  a person at that PC
+                   Input goes into the one real input stream that PC has: the pointer moves,
+                   the window is brought to the front, and focus is taken. The press itself
+                   cannot be knocked off target, and requests never overlap each other, but
+                   nothing stops a person clicking between two of your presses. If someone is
+                   working at that machine, a keypad sequence can come out with something
+                   spliced into it. Reads (/health, /capture.png) are always safe.
+  changed          DO NOT read this as "did my click work". It answers one question -
+                   did these pixels move - and that is not the same question. Two
+                   independent things are in play, and all four combinations happen:
+
+                                     screen changed        screen identical
+                     hit a control   it worked             blank key / toggle already
+                                                           in that state / ignored in
+                                                           this mode - ALL NORMAL
+                     hit nothing     a clock or animation  the coordinate landed on
+                                     moved on its own      panel background
+
+                   So use "hit", not the pixels, to answer "did the click land":
+                     hit present, is_window_itself false -> aimed at a real control
+                     hit.is_window_itself true           -> you pressed background
+                     hit.enabled false                   -> it arrived and was ignored
+                   With a hit and /health input.uipi_risk false, changed=false is
+                   simply a control that does not repaint. Nothing is wrong.
+
+                   For the other half, "change" carries pixels + bbox (window
+                   coordinates), so a one-cell clock tick is distinguishable from a
+                   real repaint. If a clock keeps forcing changed=true, exclude it:
+                     ignore=x,y,w,h   (query, or "ignore":[x,y,w,h] in the body)
+
+                   Check a coordinate WITHOUT pressing anything - this reports hit too:
+                     curl -s -o check.png ".../capture.png?mark=850,660&inset=4"
+
+                   Caveat: hit only works where controls are separate windows (Win32,
+                   MFC, WinForms). If GET /controls comes back empty, this application
+                   draws its own controls and every point reports is_window_itself.
+
+HOW TO VERIFY WHAT YOU DID
+  Prefer the application's own API over the screen wherever one exists. Use the screen
+  to ACT and to see what only the screen shows; read the resulting state back from the
+  API. That loop is far more robust than reading pixels.
+"#,
+        version = env!("CARGO_PKG_VERSION"),
+        base = base,
+    )
+}
+
+/// The button editor — drag rectangles onto a live capture.
+pub async fn editor() -> Response {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    headers.insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+    (StatusCode::OK, headers, include_str!("editor.html")).into_response()
+}
+
+/// Click — JSON response.
+pub async fn click_json(State(state): State<SharedState>, body: Bytes) -> Result<Response, ApiError> {
+    let req: ClickReq = parse_body(&body)?;
+    let (_png, result) = do_click(&state, req).await?;
+    Ok(json_ok(result))
+}
+
+/// Click, wait to settle and re-capture **in one round trip**, returning the PNG itself.
+/// With no capture region given, the whole client area is captured.
+pub async fn click_png(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let mut req = ClickReq::from_query(&q)?;
+    if req.capture.is_none() {
+        req.capture = Some("client".to_string());
+    }
+    let (png, result) = do_click(&state, req).await?;
+    match png {
+        Some(bytes) => Ok(png_response(bytes, &result)),
+        None => Err(ApiError::internal("click succeeded but produced no image")),
+    }
+}
+
+/// Capture file names are built from the region name, and `button:NAME` carries a colon,
+/// which Windows will not accept in a path. Fold anything unusual into '_' rather than
+/// letting the save fail for a reason that has nothing to do with the capture.
+fn safe_label(region: &str) -> String {
+    region
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
+}
+
+/// One press, worked out completely before anything moves.
+///
+/// The sequence path resolves **every** press up front and only then starts clicking. A name
+/// typo in element eight must not leave seven characters sitting in the machine.
+struct Press {
+    name: String,
+    point: (i32, i32),
+    button: Button,
+    double: bool,
+    settle_ms: Option<u64>,
+    /// Whether the saved definition is marked confirm (for the audit log).
+    was_confirm: bool,
+    /// Not a saved name — coordinates sent for this one request only.
+    adhoc: bool,
+}
+
+/// Everything about a request that can be judged without the window.
+///
+/// Kept separate so a bad request is answered as a bad request. `bind_window` fails whenever
+/// the application is not running, and if that ran first, every typo and every mis-shaped body
+/// would come back as "no visible window matches" — pointing at the one thing that is not
+/// wrong.
+/// The `/key` counterpart of [`precheck`]. Same reason: a request that is wrong on its own
+/// terms must say so, whether or not the window happens to be open. Everything here needs only
+/// the profile, so it can run before the window is bound.
+fn precheck_key(state: &SharedState, t: &Targets, req: &KeyReq) -> Result<(), ApiError> {
+    match (&req.key, &req.chord, &req.text) {
+        (Some(name), _, _) => {
+            if !t.keys.contains_key(name) {
+                return Err(ApiError::not_found(format!("unknown key '{name}'")).with_detail(
+                    json!({
+                        "known_keys": t.keys.keys().cloned().collect::<Vec<_>>(),
+                        "note": "'key' takes a name from the profile's keys. An unnamed chord goes in 'chord' instead, which needs allow_raw_keys",
+                    }),
+                ));
+            }
+        }
+        (None, Some(_), _) | (None, None, Some(_)) => {
+            if !state.config.allow_raw_keys {
+                return Err(raw_keys_denied(t));
+            }
+        }
+        (None, None, None) => {
+            return Err(ApiError::bad_request("one of 'key', 'chord' or 'text' is required")
+                .with_detail(json!({
+                    "known_keys": t.keys.keys().cloned().collect::<Vec<_>>(),
+                })));
+        }
+    }
+    Ok(())
+}
+
+fn precheck(t: &Targets, req: &ClickReq) -> Result<(), ApiError> {
+    let Some(names) = &req.buttons else { return Ok(()) };
+    if req.button.is_some() || req.rect.is_some() || req.point.is_some() {
+        return Err(ApiError::bad_request(
+            "'buttons' cannot be combined with 'button', 'rect' or 'point' — send one sequence \
+             or one press",
+        ));
+    }
+    if names.is_empty() {
+        return Err(ApiError::bad_request("'buttons' is empty — nothing to press"));
+    }
+    if names.len() > MAX_SEQUENCE {
+        return Err(ApiError::bad_request(format!(
+            "'buttons' has {} entries; the limit is {MAX_SEQUENCE}",
+            names.len()
+        )));
+    }
+    // Check every name and every confirm flag now. A typo in element eight has to cost
+    // nothing, not seven characters already sitting in the machine.
+    for (i, n) in names.iter().enumerate() {
+        let tg = t.buttons.get(n).ok_or_else(|| {
+            ApiError::not_found(format!("unknown button '{n}' at index {i} of 'buttons'"))
+                .with_detail(json!({
+                    "index": i,
+                    "known_buttons": t.button_names(),
+                    "note": "nothing was pressed — the whole sequence is checked before any of it runs",
+                }))
+        })?;
+        if tg.confirm && !req.confirm {
+            return Err(ApiError::forbidden(format!(
+                "'{n}' at index {i} of 'buttons' is marked confirm — a sequence is not a way \
+                 around that. Resend with \"confirm\": true, or better, press it on its own"
+            ))
+            .with_detail(json!({"index": i, "button": n, "note": tg.note})));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve one saved button. Everything that can refuse, refuses here.
+fn resolve_saved(
+    t: &Targets,
+    name: &str,
+    req: &ClickReq,
+    scale: (f64, f64),
+) -> Result<Press, ApiError> {
+    let tg = t.buttons.get(name).ok_or_else(|| {
+        ApiError::not_found(format!("unknown button '{name}'"))
+            .with_detail(json!({"known_buttons": t.button_names()}))
+    })?;
+    if tg.confirm && !req.confirm {
+        return Err(ApiError::forbidden(format!(
+            "button '{name}' is marked confirm — resend with \"confirm\": true"
+        ))
+        .with_detail(json!({"note": tg.note})));
+    }
+    Ok(Press {
+        name: name.to_string(),
+        point: Targets::click_point(tg, scale),
+        button: Button::parse(req.click_button.as_deref().unwrap_or(&tg.click_button))
+            .map_err(ApiError::bad_request)?,
+        double: req.double.unwrap_or(tg.double),
+        settle_ms: tg.settle_ms,
+        was_confirm: tg.confirm,
+        adhoc: false,
+    })
+}
+
+/// Default pause between the presses of a `buttons` sequence.
+///
+/// Deliberately unhurried. An operator panel that drops input when pressed too fast fails
+/// silently — you get a half-typed block and no error — and this endpoint exists precisely to
+/// stop half-typed blocks. Callers who have measured their panel can lower it.
+const DEFAULT_GAP_MS: u64 = 500;
+/// Ceiling on how many presses one request may carry.
+const MAX_SEQUENCE: usize = 200;
+
+async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>, Value), ApiError> {
+    let prof = pick(state, req.profile.as_deref())?;
+    // One input at a time, across every profile. There is one mouse and one foreground on a
+    // PC, so driving two windows at once would have them stealing focus from each other.
+    let _guard = state.input_lock.lock().await;
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let t = prof.targets();
+
+        // Answer request-shape problems BEFORE looking up the window. A typo in a button name
+        // does not depend on the window being there, and reporting it as "no visible window
+        // matches" sends the caller off to fix the wrong thing entirely.
+        precheck(&t, &req)?;
+
+        let (info, scale) = bind_window(&t)?;
+
+        // ── work out what to press ── (this is the safety boundary: a name, or a refusal)
+        let sequence = req.buttons.is_some();
+        let presses: Vec<Press> = match (&req.buttons, &req.button, req.rect, req.point) {
+            // `precheck` already accepted the names, the confirm flags and the shape of the
+            // request; this only turns them into coordinates.
+            (Some(names), _, _, _) => names
+                .iter()
+                .map(|n| resolve_saved(&t, n, &req, scale))
+                .collect::<Result<Vec<_>, _>>()?,
+            (None, Some(name), _, _) => vec![resolve_saved(&t, name, &req, scale)?],
+
+            // ── a rectangle that was never saved ──
+            // Controls that appear only on some screens cannot be on the named list. Read the
+            // capture, send the rectangle, and its centre gets pressed — the same rule a saved
+            // button follows, so this also previews how it would behave once saved.
+            (None, None, Some(r), _) => {
+                if !st.config.allow_raw_clicks {
+                    return Err(adhoc_denied(&t));
+                }
+                if r[2] <= 0 || r[3] <= 0 {
+                    return Err(ApiError::bad_request(format!(
+                        "rect [{},{},{},{}] must have positive width and height",
+                        r[0], r[1], r[2], r[3]
+                    )));
+                }
+                let [rx, ry, rw, rh] = Targets::scale_rect(r, scale);
+                vec![Press {
+                    name: format!("(rect {},{},{},{})", r[0], r[1], r[2], r[3]),
+                    point: (rx + rw / 2, ry + rh / 2),
+                    button: Button::parse(req.click_button.as_deref().unwrap_or("left"))
+                        .map_err(ApiError::bad_request)?,
+                    double: req.double.unwrap_or(false),
+                    settle_ms: None,
+                    was_confirm: false,
+                    adhoc: true,
+                }]
+            }
+
+            (None, None, None, Some([x, y])) => {
+                if !st.config.allow_raw_clicks {
+                    return Err(adhoc_denied(&t));
+                }
+                vec![Press {
+                    name: format!("(point {x},{y})"),
+                    point: (
+                        (x as f64 * scale.0).round() as i32,
+                        (y as f64 * scale.1).round() as i32,
+                    ),
+                    button: Button::parse(req.click_button.as_deref().unwrap_or("left"))
+                        .map_err(ApiError::bad_request)?,
+                    double: req.double.unwrap_or(false),
+                    settle_ms: None,
+                    was_confirm: false,
+                    adhoc: true,
+                }]
+            }
+
+            (None, None, None, None) => {
+                return Err(ApiError::bad_request(
+                    "one of 'button', 'buttons', 'rect' or 'point' is required",
+                )
+                .with_detail(json!({
+                    "known_buttons": t.button_names(),
+                    "hint": "a saved name presses a known control; 'buttons' presses several in \
+                             order; rect/point press whatever is at those client coordinates now",
+                })));
+            }
+        };
+
+        // ── checks that apply to every press, still before any input ──
+        let (cw, ch) = info.client_size;
+        for p in &presses {
+            // Raw coordinates must not slip past confirm.
+            //
+            // The confirm check above only covers named buttons — no name, no flag. But a
+            // rectangle computed from a capture can happen to land on the emergency stop, and
+            // then a person's "think twice about this one" quietly is not there. So an
+            // unnamed press that falls inside a saved confirm button clears the same bar.
+            // Deliberate presses pass with confirm: true; accidental ones are caught.
+            if p.adhoc
+                && !req.confirm
+                && let Some((guarded, tg)) = confirm_button_at(&t, p.point, scale)
+            {
+                return Err(ApiError::forbidden(format!(
+                    "that point is inside '{guarded}', which is marked confirm — resend with \
+                     \"confirm\": true if you meant it"
+                ))
+                .with_detail(json!({
+                    "button": guarded,
+                    "note": tg.note,
+                    "rect": tg.rect,
+                    "why": "a person marked this control as needing a second thought. Sending raw \
+                            coordinates does not bypass that, on purpose.",
+                })));
+            }
+            // Pressing outside the client area is a configuration mistake — stop before
+            // clicking somewhere on the desktop.
+            if p.point.0 < 0 || p.point.1 < 0 || p.point.0 >= cw || p.point.1 >= ch {
+                return Err(ApiError::bad_request(format!(
+                    "click point ({}, {}) for '{}' is outside the {cw}x{ch} client area",
+                    p.point.0, p.point.1, p.name
+                )));
+            }
+        }
+
+        // ── choose the capture region (grab the "before" frame first) ──
+        // Only the request decides what to look at. Buttons used to be able to carry a default
+        // capture region, and since most clicks need no confirmation it fired on every one of
+        // them (twice, for change detection) with no way for the caller to turn it off.
+        // Buttons have coordinates, so whoever needs to look can choose then.
+        //
+        // `capture=button` with no name means "the button just pressed" — for a sequence, the
+        // last one. Pressing and then looking at that same control is the common case, and
+        // repeating the name there is noise.
+        let region_name = req.capture.clone().filter(|r| !r.is_empty()).map(|r| {
+            if r == "button" {
+                format!("button:{}", presses.last().map(|p| p.name.as_str()).unwrap_or(""))
+            } else {
+                r
+            }
+        });
+        let pad = req.pad.unwrap_or(0).max(0);
+        let crop = match &region_name {
+            None => None,
+            Some(r) => Some(Targets::scale_rect(
+                Targets::pad_rect(
+                    t.region(r, info.client_size).map_err(|e| {
+                        ApiError::bad_request(e)
+                            .with_detail(json!({"known_regions": t.region_names()}))
+                    })?,
+                    pad,
+                ),
+                scale,
+            )),
+        };
+        // Hold the whole frame, not a digest. A digest is enough for a boolean, but reporting
+        // where and how much changed needs the pixels.
+        let before = match crop {
+            Some(rect) => shoot(&info, rect, req.scale, req.max_width).ok().map(|(f, _, _)| f),
+            None => None,
+        };
+
+        // ── the actual input ──
+        window::focus(info.handle).map_err(|e| ApiError::conflict(e).with_detail(json!({
+            "hint": "another window is holding the foreground, or the session is locked",
+        })))?;
+        // The window may have just moved, so measure the origin again.
+        let mut info = window::describe(info.handle)
+            .ok_or_else(|| ApiError::conflict("the target window disappeared while focusing it"))?;
+
+        let gap = st.config.clamp_settle(Some(req.gap_ms.unwrap_or(DEFAULT_GAP_MS)));
+        let mut done: Vec<Value> = Vec::with_capacity(presses.len());
+        let mut failure: Option<Value> = None;
+        // The last press is the one the "nothing changed" hint has to reason about.
+        let mut last_hit: Option<crate::win::window::ControlHit> = None;
+
+        for (i, pr) in presses.iter().enumerate() {
+            if i > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(gap));
+                // The application may have closed or replaced the window mid-sequence.
+                match window::describe(info.handle) {
+                    Some(w) => info = w,
+                    None => {
+                        failure = Some(json!({
+                            "index": i,
+                            "button": pr.name,
+                            "error": "the target window disappeared part-way through the sequence",
+                        }));
+                        break;
+                    }
+                }
+            }
+            let (sx, sy) = window::client_to_screen(&info, pr.point.0, pr.point.1);
+            // Look under the point **immediately before** pressing. Afterwards the application
+            // may have destroyed and recreated controls, so you would be seeing what is left
+            // rather than what was aimed at.
+            let hit = window::control_at(info.handle, pr.point.0, pr.point.1);
+
+            if let Err(e) = input::click(sx, sy, pr.button, pr.double) {
+                // Stop here. Carrying on would finish a string nobody asked for, and that is
+                // the worst kind of quietly wrong result.
+                log::error!(
+                    "CLICK profile={} target={} FAILED at {}/{} — {e}",
+                    prof.name, pr.name, i + 1, presses.len()
+                );
+                failure = Some(json!({"index": i, "button": pr.name, "error": e}));
+                break;
+            }
+
+            // Audit line, written **immediately after the press**. Even if settling or
+            // re-capturing then fails, the fact that it was pressed is already recorded. This
+            // tool can press an emergency stop; without a record of what was pressed and when,
+            // there is nowhere to look afterwards.
+            //
+            // confirm targets and unnamed coordinates are WARN — the two kinds that have to
+            // stand out when skimming. Everything else is INFO.
+            let mut line = format!(
+                "CLICK profile={} target={} button={} double={} client=({},{}) screen=({sx},{sy}) window={:?} pid={}",
+                prof.name,
+                pr.name,
+                pr.button.as_str(),
+                pr.double,
+                pr.point.0,
+                pr.point.1,
+                info.title,
+                info.pid
+            );
+            if sequence {
+                line = format!("{line} seq={}/{}", i + 1, presses.len());
+            }
+            // Record what was aimed at too — asked later why a press did nothing, coordinates
+            // alone cannot answer.
+            line = match &hit {
+                Some(h) if !h.is_window_itself => format!(
+                    "{line} hit={:?}/{:?}{}",
+                    h.class,
+                    h.text,
+                    if h.enabled { "" } else { " DISABLED" }
+                ),
+                _ => format!("{line} hit=none(window background)"),
+            };
+            if pr.was_confirm || pr.adhoc {
+                log::warn!("{line} confirm={}", pr.was_confirm);
+            } else {
+                log::info!("{line}");
+            }
+
+            last_hit = hit.clone();
+            done.push(json!({
+                "index": i,
+                "button": pr.name,
+                "point": {"client": [pr.point.0, pr.point.1], "screen": [sx, sy]},
+                // Answers "did the press land on something", independent of pixels.
+                "hit": hit.as_ref().map(hit_json),
+            }));
+        }
+
+        // settle_ms belongs to the whole request, not to each press — the sequence has its own
+        // spacing in gap_ms, and what the caller waits for is the state after the last one.
+        let settle = st.config.clamp_settle(
+            req.settle_ms.or_else(|| presses.last().and_then(|p| p.settle_ms)),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(settle));
+
+        // ── report ──
+        let last = done.last().cloned().unwrap_or(Value::Null);
+        let mut result = json!({
+            "profile": prof.name,
+            "settle_ms": settle,
+            "window": window_json(&info),
+        });
+        if sequence {
+            result["pressed"] = json!(done);
+            result["sequence"] = json!({
+                "requested": presses.len(),
+                "pressed": done.len(),
+                "gap_ms": gap,
+                "complete": failure.is_none(),
+                "failed": failure.clone(),
+                "note": "presses stop at the first failure. Anything already pressed is in \
+                         'pressed'; treat a partial sequence as an unfinished entry and look at \
+                         the screen before doing anything else.",
+            });
+        } else {
+            result["clicked"] = last["button"].clone();
+            result["button"] = json!(presses[0].button.as_str());
+            result["double"] = json!(presses[0].double);
+            result["point"] = last["point"].clone();
+            result["hit"] = last["hit"].clone();
+        }
+
+        let mut png_out = None;
+        if let (Some(rect), Some(region)) = (crop, region_name.clone()) {
+            let (frame, method, black) = shoot(&info, rect, req.scale, req.max_width)?;
+            let label = format!("{}_{}", prof.name, safe_label(&region));
+            let (png, mut meta) = deliver(&st, &frame, method, black, &label, true)?;
+            if let Some(b) = before {
+                apply_change(&mut meta, &b, &frame, req.ignore, last_hit.as_ref());
+                if meta["changed"] == json!(false) {
+                    log::warn!(
+                        "CLICK target={} produced no visible change in region {region}",
+                        presses.last().map(|p| p.name.as_str()).unwrap_or("")
+                    );
+                }
+            }
+            if pad > 0 {
+                meta["pad"] = json!(pad);
+            }
+            result["capture"] = meta;
+            png_out = Some(png);
+        }
+        // A failed sequence is still a 200: input really was sent, and the caller has to know
+        // exactly how far it got. An error status with no body would leave them guessing.
+        Ok((png_out, result))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("click task failed: {e}")))?
+}
+
+/// Key input — on an application that maps panel keys to the PC keyboard, this is often more
+/// reliable than clicking.
+pub async fn key(State(state): State<SharedState>, body: Bytes) -> Result<Response, ApiError> {
+    let req: KeyReq = parse_body(&body)?;
+    let prof = pick(&state, req.profile.as_deref())?;
+    let _guard = state.input_lock.lock().await;
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let t = prof.targets();
+        // Answer request-shape and policy problems BEFORE binding the window, so a typo in a
+        // key name does not come back as "no visible window matches".
+        precheck_key(&st, &t, &req)?;
+        let (info, scale) = bind_window(&t)?;
+
+        enum Action {
+            Chord(input::Chord),
+            Text(String),
+        }
+        let (label, action) = match (&req.key, &req.chord, &req.text) {
+            (Some(name), _, _) => {
+                let spec = t.keys.get(name).ok_or_else(|| {
+                    ApiError::not_found(format!("unknown key '{name}'")).with_detail(json!({
+                        "known_keys": t.keys.keys().cloned().collect::<Vec<_>>(),
+                    }))
+                })?;
+                (
+                    format!("{name} ({spec})"),
+                    Action::Chord(input::parse_chord(spec).map_err(ApiError::internal)?),
+                )
+            }
+            (None, Some(spec), _) => {
+                if !st.config.allow_raw_keys {
+                    return Err(raw_keys_denied(&t));
+                }
+                (
+                    spec.clone(),
+                    Action::Chord(input::parse_chord(spec).map_err(ApiError::bad_request)?),
+                )
+            }
+            (None, None, Some(text)) => {
+                if !st.config.allow_raw_keys {
+                    return Err(raw_keys_denied(&t));
+                }
+                if text.chars().count() > 512 {
+                    return Err(ApiError::bad_request("text is limited to 512 characters"));
+                }
+                (format!("text[{} chars]", text.chars().count()), Action::Text(text.clone()))
+            }
+            (None, None, None) => {
+                return Err(ApiError::bad_request("one of 'key', 'chord' or 'text' is required")
+                    .with_detail(json!({
+                        "known_keys": t.keys.keys().cloned().collect::<Vec<_>>(),
+                    })));
+            }
+        };
+
+        let region_name = req.capture.clone();
+        let pad = req.pad.unwrap_or(0).max(0);
+        let crop = match &region_name {
+            None => None,
+            Some(r) => Some(Targets::scale_rect(
+                Targets::pad_rect(
+                    t.region(r, info.client_size).map_err(|e| {
+                        ApiError::bad_request(e)
+                            .with_detail(json!({"known_regions": t.region_names()}))
+                    })?,
+                    pad,
+                ),
+                scale,
+            )),
+        };
+        let before = match crop {
+            Some(rect) => shoot(&info, rect, req.scale, req.max_width).ok().map(|(f, _, _)| f),
+            None => None,
+        };
+
+        window::focus(info.handle).map_err(ApiError::conflict)?;
+        log::info!("KEY profile={} sent={label} window={:?} pid={}", prof.name, info.title, info.pid);
+        match &action {
+            Action::Chord(c) => input::send_chord(c).map_err(ApiError::internal)?,
+            Action::Text(s) => input::send_text(s).map_err(ApiError::internal)?,
+        }
+
+        let settle = st.config.clamp_settle(req.settle_ms);
+        std::thread::sleep(std::time::Duration::from_millis(settle));
+
+        let info = window::describe(info.handle)
+            .ok_or_else(|| ApiError::conflict("the target window disappeared"))?;
+        let mut result = json!({
+            "profile": prof.name,
+            "sent": label,
+            "settle_ms": settle,
+            "window": window_json(&info),
+        });
+        if let (Some(rect), Some(region)) = (crop, region_name) {
+            let (frame, method, black) = shoot(&info, rect, req.scale, req.max_width)?;
+
+            let (_png, mut meta) =
+                deliver(&st, &frame, method, black, &format!("{}_{}", prof.name, safe_label(&region)), true)?;
+            if let Some(b) = before {
+                apply_change(&mut meta, &b, &frame, req.ignore, None);
+            }
+            result["capture"] = meta;
+        }
+        Ok(json_ok(result))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("key task failed: {e}")))?
+}
+
+/// An attempt to press an unsaved area while the policy is closed.
+fn adhoc_denied(t: &Targets) -> ApiError {
+    ApiError::forbidden("ad-hoc clicks are disabled — only saved buttons can be pressed").with_detail(
+        json!({
+            "known_buttons": t.button_names(),
+            "hint": "set \"allow_raw_clicks\": true in config.json and restart. That is what lets a caller press a control that only appears on some screens and therefore cannot be in the saved list.",
+        }),
+    )
+}
+
+fn raw_keys_denied(t: &Targets) -> ApiError {
+    ApiError::forbidden("raw key input is disabled — use a named key from the profile").with_detail(
+        json!({
+            "known_keys": t.keys.keys().cloned().collect::<Vec<_>>(),
+            "hint": "set \"allow_raw_keys\": true in config.json and restart to allow 'chord' and 'text'",
+        }),
+    )
+}
+
+/// Bring the window to the front. Done automatically before a click, but also useful when a
+/// person wants to look at the screen.
+pub async fn window_focus(State(state): State<SharedState>, Query(q): Query<HashMap<String, String>>) -> Result<Response, ApiError> {
+    let prof = pick(&state, q_get(&q, "profile").as_deref())?;
+    let _guard = state.input_lock.lock().await;
+    tokio::task::spawn_blocking(move || {
+        let t = prof.targets();
+        // Not `find_window` — that one refuses a minimised window, and undoing minimisation is
+        // precisely this endpoint's job. (`/window/fit` bypasses the size check for the same
+        // reason.) A recovery must not be blocked by the state it recovers from.
+        let before = window::find(&t.window).map_err(|_| {
+            ApiError::not_found("target window not found")
+                .with_detail(json!({"hint": "GET /windows lists visible window titles"}))
+        })?;
+        let minimized_before = before.minimized;
+        window::focus(before.handle).map_err(ApiError::conflict)?;
+        let info = window::describe(before.handle)
+            .ok_or_else(|| ApiError::conflict("the target window disappeared"))?;
+        Ok(json_ok(json!({
+            "focused": true,
+            "restored": minimized_before,
+            "window": window_json(&info),
+        })))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("focus task failed: {e}")))?
+}
+
+/// Restore the client area to `reference_client` — the one move that recovers from a window
+/// size drifting and taking every coordinate with it.
+pub async fn window_fit(State(state): State<SharedState>, Query(q): Query<HashMap<String, String>>) -> Result<Response, ApiError> {
+    let prof = pick(&state, q_get(&q, "profile").as_deref())?;
+    let _guard = state.input_lock.lock().await;
+    tokio::task::spawn_blocking(move || {
+        let t = prof.targets();
+        let Some([rw, rh]) = t.reference_client else {
+            return Err(ApiError::bad_request(
+                "this profile has no reference_client, so there is no size to fit to",
+            ));
+        };
+        // A size mismatch is the reason this endpoint gets called, so it bypasses
+        // bind_window's check.
+        let info = window::find(&t.window)
+            .map_err(|_| ApiError::not_found("target window not found"))?;
+        let before = info.client_size;
+        let after = window::fit_client(info.handle, rw, rh).map_err(ApiError::internal)?;
+        let info = window::describe(info.handle)
+            .ok_or_else(|| ApiError::conflict("the target window disappeared"))?;
+        if after != (rw, rh) {
+            return Err(ApiError::conflict(format!(
+                "asked for a {rw}x{rh} client area but the window settled at {}x{} — \
+                 it may have a minimum size or a fixed layout",
+                after.0, after.1
+            ))
+            .with_detail(json!({"before": [before.0, before.1], "after": [after.0, after.1]})));
+        }
+        Ok(json_ok(json!({
+            "fitted": true,
+            "before": [before.0, before.1],
+            "after": [after.0, after.1],
+            "window": window_json(&info),
+        })))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("fit task failed: {e}")))?
+}
+
+/// Serve a stored capture — GET the `url` from a `/click` response as-is.
+pub async fn capture_file(
+    State(state): State<SharedState>,
+    UrlPath(name): UrlPath<String>,
+) -> Result<Response, ApiError> {
+    if !captures::safe_capture_name(&name) {
+        return Err(ApiError::bad_request("invalid capture name"));
+    }
+    let path = state.captures_dir.join(&name);
+    let bytes = std::fs::read(&path).map_err(|_| ApiError::not_found(format!("no such capture: {name}")))?;
+    Ok(png_response(bytes, &json!({"name": name})))
+}
+
+/// Whether that coordinate is **inside a button marked confirm**.
+///
+/// The test that stops an unnamed click from bypassing confirm. Pulled out on its own because
+/// the path it lives on needs a window to reach — this way the rule itself is testable without
+/// one.
+fn confirm_button_at(
+    t: &Targets,
+    point: (i32, i32),
+    scale: (f64, f64),
+) -> Option<(&String, &ButtonDef)> {
+    t.buttons.iter().find(|(_, tg)| {
+        if !tg.confirm {
+            return false;
+        }
+        let [x, y, w, h] = Targets::scale_rect(tg.rect, scale);
+        point.0 >= x && point.0 < x + w && point.1 >= y && point.1 < y + h
+    })
+}
+
+/// Whether the editing endpoints are open. Three handlers have to refuse with one sentence.
+fn editing_allowed(state: &SharedState) -> Result<(), ApiError> {
+    if state.config.allow_profile_editing {
+        return Ok(());
+    }
+    Err(ApiError::forbidden(
+        "profile editing over HTTP is disabled — edit the files under profiles/ on the target PC",
+    )
+    .with_detail(json!({
+        "why": "with this off, the permission boundary is filesystem access to the profile files. \
+                Turning it on moves that boundary to HTTP reachability.",
+        "hint": "set \"allow_profile_editing\": true in config.json and restart",
+    })))
+}
+
+/// The default profile the config **named** can be neither deleted nor renamed.
+///
+/// Losing it kills every request that omits `profile`, and the only way back is editing
+/// `config.json` and restarting — which means a person, physically at that PC. One HTTP call
+/// should not be able to create a state that requires that.
+fn not_the_configured_default(state: &SharedState, name: &str) -> Result<(), ApiError> {
+    if state.config.default_profile == name {
+        return Err(ApiError::conflict(format!(
+            "'{name}' is the default_profile in config.json — removing or renaming it would \
+             break every request that omits ?profile=, and only a config edit plus a restart \
+             could fix that"
+        ))
+        .with_detail(json!({
+            "hint": "change default_profile in config.json and restart, then try again",
+        })));
+    }
+    Ok(())
+}
+
+/// **Delete** a profile. The file is moved aside under a timestamped name.
+///
+/// `confirm=true` is required for the same reason a `confirm` button needs it: undoing this
+/// takes a person. Restoring a deleted profile means finding the archive on that PC, renaming
+/// it back, and calling `/admin/reload`.
+pub async fn admin_delete_profile(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    editing_allowed(&state)?;
+    let Some(name) = q_get(&q, "profile") else {
+        return Err(ApiError::bad_request("which profile? pass ?profile=NAME")
+            .with_detail(json!({"known_profiles": state.profile_names()})));
+    };
+    if !q_bool(&q, "confirm")?.unwrap_or(false) {
+        return Err(ApiError::forbidden(format!(
+            "deleting '{name}' needs confirm=true — this is not undoable from here"
+        ))
+        .with_detail(json!({
+            "hint": format!("DELETE /admin/profile?profile={name}&confirm=true"),
+            "what_survives": "the file is moved aside as deescreen.<name>.json.deleted-<timestamp> \
+                              on the target PC, so a person can put it back",
+        })));
+    }
+    let prof = pick(&state, Some(&name))?;
+    not_the_configured_default(&state, &prof.name)?;
+
+    let path = prof.path.clone();
+    let archived = tokio::task::spawn_blocking(move || crate::targets::archive(&path))
+        .await
+        .map_err(|e| ApiError::internal(format!("delete task failed: {e}")))?
+        .map_err(ApiError::internal)?;
+
+    let t = prof.targets();
+    let mut map = (**state.profiles.load()).clone();
+    map.remove(&prof.name);
+    let remaining: Vec<String> = map.keys().cloned().collect();
+    state.profiles.store(std::sync::Arc::new(map));
+
+    // Logged at WARN — this is the moment everything that could be pressed disappears.
+    log::warn!(
+        "profile '{}' DELETED over HTTP — {} buttons, {} regions, {} keys; kept at {}",
+        prof.name,
+        t.buttons.len(),
+        t.regions.len(),
+        t.keys.len(),
+        archived.display()
+    );
+    Ok(json_ok(json!({
+        "deleted": true,
+        "profile": prof.name,
+        "was": {"buttons": t.buttons.len(), "regions": t.regions.len(), "keys": t.keys.len()},
+        "archived": archived.to_string_lossy(),
+        "note": "the archive name carries a timestamp, so deleting the same name twice never \
+                 overwrites the earlier copy. Nothing here deletes archives — a person does.",
+        "profiles": remaining,
+    })))
+}
+
+/// **Rename** a profile.
+///
+/// One might ask why not just save under the new name — because that **copies**. The old one
+/// stays, two profiles point at one window, and omitting `profile`, which only works with
+/// exactly one, breaks that moment. Renaming has to be atomic for none of that to happen.
+pub async fn admin_rename_profile(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    editing_allowed(&state)?;
+    let Some(to) = q_get(&q, "to") else {
+        return Err(ApiError::bad_request("rename to what? pass &to=NEWNAME"));
+    };
+    if !crate::config::is_safe_profile_name(&to) {
+        return Err(ApiError::bad_request(format!(
+            "'{to}' is not a valid profile name — letters, digits, '-' and '_' only"
+        )));
+    }
+    let prof = pick(&state, q_get(&q, "profile").as_deref())?;
+    if prof.name == to {
+        return Err(ApiError::bad_request(format!("'{to}' is already its name")));
+    }
+    not_the_configured_default(&state, &prof.name)?;
+
+    let dest = crate::config::profile_path(&to);
+    // Refuse if the file exists even when it is not in the list — overwriting would make
+    // that file quietly disappear.
+    if state.profiles.load().contains_key(&to) || dest.exists() {
+        return Err(ApiError::conflict(format!("'{to}' already exists")).with_detail(json!({
+            "path": dest.to_string_lossy(),
+            "hint": "pick another name, or delete that profile first",
+        })));
+    }
+
+    let from = prof.path.clone();
+    let d = dest.clone();
+    tokio::task::spawn_blocking(move || crate::targets::move_profile_files(&from, &d))
+        .await
+        .map_err(|e| ApiError::internal(format!("rename task failed: {e}")))?
+        .map_err(ApiError::internal)?;
+
+    let moved = std::sync::Arc::new(crate::state::Profile {
+        name: to.clone(),
+        path: dest.clone(),
+        targets: arc_swap::ArcSwap::from(prof.targets()),
+    });
+    let mut map = (**state.profiles.load()).clone();
+    map.remove(&prof.name);
+    map.insert(to.clone(), moved);
+    let names: Vec<String> = map.keys().cloned().collect();
+    state.profiles.store(std::sync::Arc::new(map));
+
+    log::warn!("profile '{}' RENAMED to '{to}' ({})", prof.name, dest.display());
+    Ok(json_ok(json!({
+        "renamed": true,
+        "from": prof.name,
+        "to": to,
+        "path": dest.to_string_lossy(),
+        "note": "callers using the old name now get 404 with the known list — nothing is \
+                 silently redirected",
+        "profiles": names,
+    })))
+}
+
+/// Re-read the profiles, so coordinates can be corrected without a restart.
+/// **A bad file is not applied** — if parsing or validation fails, the old definition lives on.
+pub async fn admin_reload(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    // With no `?profile=` this **rescans the disk** — drop in a new
+    // profiles/deescreen.<name>.json, call this, and the profile exists without a restart.
+    // Naming one re-reads only that one.
+    let Some(name) = q_get(&q, "profile") else {
+        let st = state.clone();
+        let (fresh, notes) =
+            tokio::task::spawn_blocking(move || crate::state::build_profiles(&st.config))
+                .await
+                .map_err(|e| ApiError::internal(format!("rescan task failed: {e}")))?;
+
+        // A rescan that would lose the default profile the config **named** is refused —
+        // accepting it would quietly send every request that omits `profile` to a different
+        // window. With none named, the omit rule is "only when there is exactly one", so there
+        // is nothing to protect.
+        if !state.default_profile.is_empty() && !fresh.contains_key(&state.default_profile) {
+            return Err(ApiError::conflict(format!(
+                "after rescanning, the default profile '{}' would be gone",
+                state.default_profile
+            ))
+            .with_detail(json!({
+                "found": fresh.keys().cloned().collect::<Vec<_>>(),
+                "note": "the previous profiles are still in effect",
+            })));
+        }
+        let names: Vec<String> = fresh.keys().cloned().collect();
+        state.profiles.store(std::sync::Arc::new(fresh));
+        log::info!("profiles rescanned: {}", names.join(", "));
+        return Ok(json_ok(json!({
+            "rescanned": true,
+            "profiles": names,
+            "default_profile": state.effective_default(),
+            "notes": notes,
+        })));
+    };
+
+    let prof = pick(&state, Some(&name))?;
+    let path = prof.path.clone();
+    let fresh = tokio::task::spawn_blocking(move || Targets::load(&path))
+        .await
+        .map_err(|e| ApiError::internal(format!("reload task failed: {e}")))?
+        .map_err(|e| {
+            ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e)
+                .with_detail(json!({"note": "the previous targets are still in effect"}))
+        })?;
+
+    let summary = json!({
+        "reloaded": true,
+        "profile": prof.name,
+        "path": prof.path.to_string_lossy(),
+        "window": fresh.window,
+        "buttons": fresh.buttons.len(),
+        "regions": fresh.regions.len(),
+        "keys": fresh.keys.len(),
+    });
+    prof.targets.store(std::sync::Arc::new(fresh));
+    log::info!("profile '{}' reloaded from {}", prof.name, prof.path.display());
+    Ok(json_ok(summary))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lbl(x: i32, y: i32, w: i32, h: i32, t: &str) -> (i32, i32, i32, i32, String, draw::Color) {
+        (x, y, w, h, t.to_string(), draw::TARGET)
+    }
+
+    /// Placed labels **must not overlap each other.** Overlapping, two names read as one
+    /// (measured: `"MDI_CASE_TMDI_Z"`), and from the picture there is no telling whether that
+    /// is two run together or a name in its own right. So this is not an aesthetic problem but
+    /// a **wrong information** problem.
+    #[test]
+    fn labels_do_not_overlap_each_other() {
+        let mut img = image::RgbaImage::new(400, 300);
+        // Names far wider than their rectangles, 3px apart — an arrangement that cannot
+        // avoid overlapping
+        let labels: Vec<_> = (0..12)
+            .map(|i| lbl(10 + i * 3, 100, 4, 4, &format!("MDI_CASE_TOGGLE_{i}")))
+            .collect();
+
+        let out = place_labels(&mut img, &labels);
+
+        // **What gets placed never overlaps** — the placer's one and only promise.
+        for (i, a) in out.placed.iter().enumerate() {
+            for b in &out.placed[i + 1..] {
+                assert!(!draw::boxes_overlap(*a, *b), "{a:?} and {b:?} overlap");
+            }
+        }
+        // Out of room, it falls back to numbers — it never quietly draws them on top of each
+        // other.
+        assert!(out.collided > 0, "this arrangement cannot fit every name");
+        assert!(out.collided < labels.len(), "all of them failing means the placer did nothing");
+    }
+
+    /// Given room, it staggers above and below to **keep the names**.
+    #[test]
+    fn crowded_but_solvable_layouts_stagger_instead_of_giving_up() {
+        let mut img = image::RgbaImage::new(600, 300);
+        // Touching horizontally, but few enough to spread across the four rows
+        let labels: Vec<_> =
+            (0..4).map(|i| lbl(10 + i * 20, 100, 18, 30, &format!("KEY_SWITCH_{i}"))).collect();
+        let out = place_labels(&mut img, &labels);
+        assert_eq!(out.collided, 0, "four spots exist, so every one should keep its name");
+        assert_eq!(out.placed.len(), 4);
+    }
+
+    /// With space to spare every name stays — falling back to a number is a last resort.
+    #[test]
+    fn roomy_layouts_keep_every_name() {
+        let mut img = image::RgbaImage::new(400, 400);
+        let labels: Vec<_> = (0..4).map(|i| lbl(10, 10 + i * 90, 200, 40, "CYCLE_START")).collect();
+        assert_eq!(place_labels(&mut img, &labels).collided, 0);
+    }
+
+    /// Draw the overlay over a synthetic capture and check, in pixels, **what each mode draws
+    /// and what it does not**.
+    fn overlay_probe(mode: &str) -> (image::RgbaImage, Value) {
+        let mut t = crate::targets::Targets {
+            description: String::new(),
+            window: crate::win::window::WindowSpec {
+                title: "x".into(),
+                title_exact: false,
+                class: String::new(),
+            },
+            reference_client: None,
+            on_size_mismatch: crate::targets::SizeMismatch::Ignore,
+            regions: std::collections::BTreeMap::new(),
+            buttons: std::collections::BTreeMap::new(),
+            keys: std::collections::BTreeMap::new(),
+        };
+        t.buttons.insert(
+            "CYCLE_START".to_string(),
+            crate::targets::ButtonDef {
+                rect: [20, 20, 60, 60],
+                point: None,
+                click_button: "left".into(),
+                double: false,
+                confirm: false,
+                settle_ms: None,
+                note: String::new(),
+            },
+        );
+        let mut frame = crate::captures::Frame {
+            image: image::RgbaImage::from_pixel(200, 200, image::Rgba([9, 9, 9, 255])),
+            source_rect: [0, 0, 200, 200],
+            scale: 1.0,
+        };
+        let mut q = HashMap::new();
+        q.insert("buttons".to_string(), mode.to_string());
+        let ov = Overlay::from_query(&q).expect("overlay");
+        let drawn = apply_overlay(&mut frame, &ov, Some(&t), (1.0, 1.0), (200, 200));
+        (frame.image, drawn)
+    }
+
+    /// The crosshair sits on the click point = usually the middle of the key = **on top of the
+    /// key's legend**. So it has to be switchable off, and off has to really mean not drawn.
+    #[test]
+    fn box_mode_draws_the_outline_without_the_crosshair() {
+        // The click point is the rectangle's centre (50,50). The crosshair paints around the
+        // centre pixel and leaves that one alone, so this samples a few px to the side. That is
+        // **inside** the rectangle, where the translucent fill is already down, so the modes are
+        // compared against each other rather than against the original background.
+        let at = |m: &str| overlay_probe(m).0.get_pixel(50, 46).0;
+
+        assert_ne!(at("1"), at("box"), "only buttons=1 should draw the crosshair");
+        assert_eq!(at("box"), at("num"), "box and num should both be without it");
+
+        // All three still draw the rectangle — the crosshair is the only thing switched off.
+        let bg = [9u8, 9, 9, 255];
+        for m in ["1", "box", "num"] {
+            assert_ne!(overlay_probe(m).0.get_pixel(20, 20).0, bg, "outline for buttons={m}");
+        }
+    }
+
+    #[test]
+    fn overlay_reports_which_mode_it_drew() {
+        for (q, want) in [("1", "full"), ("box", "box"), ("num", "num")] {
+            assert_eq!(overlay_probe(q).1["buttons_mode"], json!(want));
+        }
+        // The numbered mode has to say for itself that no legend table is needed — otherwise
+        // the caller goes looking for a way to turn a number back into a name and stops.
+        assert!(overlay_probe("num").1["numbering"].is_string());
+        assert!(overlay_probe("box").1["numbering"].is_null());
+    }
+
+    /// Coordinates must not get past confirm.
+    ///
+    /// A rectangle computed from a capture landing on the emergency stop happens by accident.
+    /// If a person's "think twice about this one" quietly is not there in that moment, the mark
+    /// is decoration that only applies when you call it by name.
+    #[test]
+    fn raw_coordinates_do_not_slip_past_a_confirm_button() {
+        let mut t = crate::targets::Targets {
+            description: String::new(),
+            window: crate::win::window::WindowSpec {
+                title: "x".into(),
+                title_exact: false,
+                class: String::new(),
+            },
+            reference_client: None,
+            on_size_mismatch: crate::targets::SizeMismatch::Ignore,
+            regions: std::collections::BTreeMap::new(),
+            buttons: std::collections::BTreeMap::new(),
+            keys: std::collections::BTreeMap::new(),
+        };
+        let def = |rect, confirm| crate::targets::ButtonDef {
+            rect,
+            point: None,
+            click_button: "left".into(),
+            double: false,
+            confirm,
+            settle_ms: None,
+            note: String::new(),
+        };
+        t.buttons.insert("estop".into(), def([100, 100, 60, 60], true));
+        t.buttons.insert("jog".into(), def([200, 100, 60, 60], false));
+
+        let one = (1.0, 1.0);
+        assert_eq!(confirm_button_at(&t, (130, 130), one).map(|(n, _)| n.as_str()), Some("estop"));
+        assert_eq!(confirm_button_at(&t, (100, 100), one).map(|(n, _)| n.as_str()), Some("estop"));
+        // the edge is exclusive — 159 is inside, 160 is outside
+        assert!(confirm_button_at(&t, (159, 159), one).is_some());
+        assert!(confirm_button_at(&t, (160, 160), one).is_none());
+        // a button without confirm is not blocked
+        assert!(confirm_button_at(&t, (230, 130), one).is_none());
+        // nor is empty space
+        assert!(confirm_button_at(&t, (10, 10), one).is_none());
+
+        // With a factor applied because the window size differs, it still has to guard the same
+        // place — applying the factor on one side only makes the test wrong on a scaled screen.
+        let two = (2.0, 2.0);
+        assert!(confirm_button_at(&t, (260, 260), two).is_some(), "inside, after scaling");
+        assert!(confirm_button_at(&t, (130, 130), two).is_none(), "outside, after scaling");
+    }
+
+    /// Messages must not carry the indentation of the source they were written in.
+    ///
+    /// A `\` at the end of a line inside a Rust string literal swallows the newline and the
+    /// next line's leading spaces. Lose that one character — an editor reflowing, a script
+    /// rewriting the file — and the literal silently becomes one long line with a run of
+    /// spaces wedged into the middle of a sentence. It compiles. It ships. It is visible only
+    /// in the JSON somebody else receives, which is why it had gone unnoticed in four
+    /// `changed_hint` strings until this test was written.
+    ///
+    /// The manual is a raw string whose columns line up on purpose, so it is skipped.
+    #[test]
+    fn no_message_carries_its_own_indentation() {
+        let src = include_str!("api.rs");
+        let mut in_manual = false;
+        let mut bad = Vec::new();
+        for (n, line) in src.lines().enumerate() {
+            if line.contains("r#\"deescreen v{version}") {
+                in_manual = true;
+            } else if in_manual && line.trim_start().starts_with("\"#") {
+                in_manual = false;
+            }
+            if in_manual {
+                continue;
+            }
+            // Odd-numbered pieces of a split on `"` are the insides of string literals.
+            for body in line.split('"').skip(1).step_by(2) {
+                let squashed = body.trim();
+                if squashed.contains("    ") && squashed.split("    ").count() > 1 {
+                    let joined_words = squashed
+                        .split("    ")
+                        .filter(|p| !p.is_empty())
+                        .count()
+                        > 1;
+                    if joined_words && !squashed.starts_with('-') && !squashed.contains("{:?}") {
+                        bad.push(format!("api.rs:{}: {}", n + 1, &squashed[..squashed.len().min(70)]));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "a lost line-continuation left indentation inside a message:\n{}", bad.join("\n"));
+    }
+
+    /// Losing a confirm flag is detected whether the flag was cleared or the whole button
+    /// went away. Both end the same way — that name, and any raw coordinate inside it, stop
+    /// being protected — so an edit endpoint that noticed only one of them would leave the
+    /// other as the way around it.
+    #[test]
+    fn taking_a_confirm_flag_away_is_noticed_either_way() {
+        let doc = r#"{"window":{"title":"x"},"buttons":{
+            "E":{"rect":[1,2,30,40],"confirm":true},
+            "S":{"rect":[5,6,7,8],"confirm":true},
+            "P":{"rect":[9,9,9,9]}}}"#;
+        let before: Targets = serde_json::from_str(doc).expect("parses");
+
+        let flag_off: Targets = serde_json::from_str(
+            r#"{"window":{"title":"x"},"buttons":{
+                "E":{"rect":[1,2,30,40],"confirm":false},
+                "S":{"rect":[5,6,7,8],"confirm":true},
+                "P":{"rect":[9,9,9,9]}}}"#,
+        )
+        .expect("parses");
+        assert_eq!(confirm_flags_lost(&before, &flag_off), vec!["E".to_string()]);
+
+        let button_gone: Targets = serde_json::from_str(
+            r#"{"window":{"title":"x"},"buttons":{
+                "S":{"rect":[5,6,7,8],"confirm":true},
+                "P":{"rect":[9,9,9,9]}}}"#,
+        )
+        .expect("parses");
+        assert_eq!(confirm_flags_lost(&before, &button_gone), vec!["E".to_string()]);
+
+        // Adding one, moving one, and dropping an unprotected button are all free.
+        let harmless: Targets = serde_json::from_str(
+            r#"{"window":{"title":"x"},"buttons":{
+                "E":{"rect":[0,0,50,50],"confirm":true},
+                "S":{"rect":[5,6,7,8],"confirm":true},
+                "N":{"rect":[1,1,1,1],"confirm":true}}}"#,
+        )
+        .expect("parses");
+        assert!(confirm_flags_lost(&before, &harmless).is_empty(), "no flag was lost");
+    }
+
+    /// Merge patch, the three rules that matter: a null removes, an object merges into what is
+    /// already there rather than replacing it, and anything else replaces outright. The middle
+    /// one is the whole point — patching one button must not disturb the other 139.
+    #[test]
+    fn a_patch_touches_only_what_it_names() {
+        let base = json!({
+            "description": "d",
+            "buttons": {
+                "A": {"rect": [1, 2, 3, 4], "confirm": true},
+                "B": {"rect": [5, 6, 7, 8]}
+            }
+        });
+
+        let mut doc = base.clone();
+        merge_patch(&mut doc, &json!({"buttons": {"C": {"rect": [9, 9, 9, 9]}, "B": Value::Null}}));
+        assert_eq!(doc["buttons"]["A"], base["buttons"]["A"], "A is untouched");
+        assert!(doc["buttons"].get("B").is_none(), "null removed B");
+        assert_eq!(doc["buttons"]["C"]["rect"][0], 9, "C was added");
+        assert_eq!(doc["description"], "d", "an unnamed sibling is left alone");
+
+        // Merging INTO a button keeps its other fields. Replacing would silently drop the
+        // confirm flag, which is the one field that must never go missing by accident.
+        let mut doc = base.clone();
+        merge_patch(&mut doc, &json!({"buttons": {"A": {"rect": [0, 0, 1, 1]}}}));
+        assert_eq!(doc["buttons"]["A"]["rect"][2], 1, "rect was replaced");
+        assert_eq!(doc["buttons"]["A"]["confirm"], true, "confirm survived the patch");
+
+        // A scalar replaces, and an explicit null on a leaf removes the key entirely.
+        let mut doc = base.clone();
+        merge_patch(&mut doc, &json!({"description": "new"}));
+        assert_eq!(doc["description"], "new");
+        let mut doc = base.clone();
+        merge_patch(&mut doc, &json!({"description": Value::Null}));
+        assert!(doc.get("description").is_none());
+    }
+
+    /// A field name this struct does not know must be refused, not dropped. Serde's default is
+    /// to ignore it, and then `{"keys": "ctrl+alt+f1"}` parses into a request carrying no key at
+    /// all — a caller who mistyped gets "one of 'key', 'chord' or 'text' is required" and no
+    /// idea which part was wrong. `deny_unknown_fields` turns that into an answer.
+    #[test]
+    fn a_misspelled_field_is_refused_rather_than_ignored() {
+        let r: KeyReq = serde_json::from_str(r#"{"chord":"ctrl+alt+f1"}"#).expect("chord body");
+        assert_eq!(r.chord.as_deref(), Some("ctrl+alt+f1"));
+        assert!(r.key.is_none() && r.text.is_none());
+
+        // KeyReq has no Debug, so unwrap the error by hand rather than derive one for a test.
+        let Err(e) = serde_json::from_str::<KeyReq>(r#"{"keys":"ctrl+alt+f1"}"#) else {
+            panic!("an unknown field must be refused, not dropped");
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("keys"), "names what was wrong: {msg}");
+        assert!(msg.contains("chord"), "names what to use instead: {msg}");
+    }
+
+    /// A sequence and a single press are mutually exclusive, and the body shape parses.
+    #[test]
+    fn a_click_request_takes_either_one_press_or_a_sequence() {
+        let r: ClickReq = serde_json::from_str(
+            r#"{"buttons":["MDI_G","MDI_9"],"gap_ms":150,"capture":"hmi","pad":25}"#,
+        )
+        .expect("sequence body");
+        assert_eq!(r.buttons.as_deref(), Some(&["MDI_G".to_string(), "MDI_9".to_string()][..]));
+        assert_eq!(r.gap_ms, Some(150));
+        assert_eq!(r.pad, Some(25));
+        assert!(r.button.is_none());
+
+        // The .png variant has no body, so a sequence has to survive a query string too.
+        let mut q = HashMap::new();
+        q.insert("buttons".to_string(), "MDI_G, MDI_9 ,MDI_1".to_string());
+        let r = ClickReq::from_query(&q).expect("sequence query");
+        assert_eq!(r.buttons.expect("parsed").len(), 3, "whitespace around names is trimmed");
+
+        // Empty entries are dropped rather than becoming a press of "".
+        let mut q = HashMap::new();
+        q.insert("buttons".to_string(), "A,,B,".to_string());
+        assert_eq!(ClickReq::from_query(&q).unwrap().buttons.unwrap(), vec!["A", "B"]);
+    }
+
+    /// The gap default is deliberately slow. A panel that drops input when pressed too fast
+    /// fails silently — a half-typed block and no error — which is the thing this endpoint
+    /// exists to prevent.
+    #[test]
+    fn the_default_gap_is_unhurried() {
+        assert_eq!(DEFAULT_GAP_MS, 500);
+    }
+
+    /// Capture file names are built from the region name, and `button:NAME` has a colon in it.
+    #[test]
+    fn capture_labels_never_carry_a_colon() {
+        assert_eq!(safe_label("button:CYCLE_START"), "button_CYCLE_START");
+        assert_eq!(safe_label("status_bar"), "status_bar");
+        assert_eq!(safe_label("a/b\\c"), "a_b_c");
+    }
+
+    #[test]
+    fn buttons_query_accepts_flags_and_modes() {
+        let q = |v: &str| {
+            let mut m = HashMap::new();
+            m.insert("buttons".to_string(), v.to_string());
+            q_buttons(&m).map(|o| o.and_then(ButtonsOpt::mode))
+        };
+        // what 1 means does not change — older calls have to keep working
+        assert_eq!(q("1").unwrap(), Some(ButtonMode::Full));
+        assert_eq!(q("true").unwrap(), Some(ButtonMode::Full));
+        assert_eq!(q("0").unwrap(), None);
+        assert_eq!(q("box").unwrap(), Some(ButtonMode::Box));
+        assert_eq!(q("NUM").unwrap(), Some(ButtonMode::Num));
+        assert!(q("boks").is_err());
+    }
+
+    /// The JSON body has to take a boolean and a mode name alike.
+    #[test]
+    fn buttons_body_accepts_flags_and_modes() {
+        let m = |j: &str| {
+            serde_json::from_str::<ButtonsOpt>(j).map(ButtonsOpt::mode).expect("parse")
+        };
+        assert_eq!(m("true"), Some(ButtonMode::Full));
+        assert_eq!(m("false"), None);
+        assert_eq!(m("\"box\""), Some(ButtonMode::Box));
+        assert_eq!(m("\"num\""), Some(ButtonMode::Num));
+    }
+}
