@@ -365,6 +365,18 @@ mod tests {
         assert_eq!(f.source_rect, [0, 273, 244, 444], "width shrank by what fell off");
         assert_eq!(f.width(), 244);
 
+        // The example printed in /help and the README, asserted end to end: a button 22 wide
+        // sitting 22 from the left edge, asked for with pad=200. Every number in that
+        // paragraph is one of these, because a sentence doing pixel arithmetic in prose is
+        // worth exactly as much as the arithmetic.
+        let button = [22, 300, 22, 40];
+        let asked = crate::targets::Targets::pad_rect(button, 200);
+        assert_eq!(asked, [-178, 100, 422, 440], "22 - 200, and 22 + 2x200");
+        let f = frame(&shot, asked, None, None).expect("crops");
+        assert_eq!(f.source_rect, [0, 100, 244, 440]);
+        //          left margin 22 + button 22 + right margin 200 = 244
+        assert_eq!(f.source_rect[2], 22 + button[2] + 200);
+
         // Off the top, same rule.
         let f = frame(&shot, [10, -30, 50, 100], None, None).expect("crops");
         assert_eq!(f.source_rect, [10, 0, 50, 70]);

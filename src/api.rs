@@ -2014,11 +2014,16 @@ LOOK AT SOMETHING
     curl -s -o shot.png "{base}/capture.png?region=button:OPT_STOP&pad=25"
     curl -s -X POST -o shot.png "{base}/click.png?button=OPT_STOP&capture=button&pad=25"
   pad grows the rectangle on every side, in the same client pixels as the numbers in the
-  profile. Where that runs past the window edge the picture is CUT, not slid across: a
-  button 22px from the left with pad=200 gives you the 222px there is room for on that side,
-  not 200px taken from somewhere else. So the button is NOT necessarily in the middle of the
-  image near an edge - read its position from the "rect" in the metadata (the crop's own
-  origin) against the button's rect from GET /buttons, rather than assuming it is centred. On a click,
+  profile. Where that runs past the window edge the picture is CUT there, not slid across:
+  you get the margin there was room for on that side, and the full margin on the others.
+  Measured, on a button 22 wide sitting 22 from the left edge, with pad=200:
+    asked for   [-178, y-200, 422, h+400]      22 - 200 = -178, and 22 + 2x200 = 422
+    came back   [   0, y-200, 244, h+400]      178 columns were outside, so 244 remain
+                                               left margin 22 + button 22 + right margin 200
+  So near an edge the button is NOT in the middle of the image. Work out where it is from
+  the "rect" in the metadata, which is the crop's own origin, against the button's rect from
+  GET /buttons - do not assume it is centred, and do not predict the width without
+  subtracting what falls outside. On a click,
   `capture=button` with no name means the button you just pressed (the last one, for a
   sequence), so you do not have to write it twice.
 
@@ -2285,7 +2290,12 @@ TRAPS - these fail quietly or confusingly. Read once, save yourself an hour.
   404 unknown name A button, region or key name that is not in the profile. The reply does
                    not list every name - on a big panel that is a wall of text for a typo -
                    it gives the closest few as "did_you_mean", how many exist, and where the
-                   full list is. Usually the name you meant is right there.
+                   full list is.
+                   Those guesses are spelling, so they find a slip and not a synonym: ask
+                   for MDI_DOT when the panel calls it MDI_PERIOD and no distance connects
+                   the two, so it will not be in the list. That case is what "same_prefix"
+                   is for - it says how many names share MDI_ - and then one filtered read
+                   of GET /buttons settles it.
   401 admin code   An /admin call on a server whose operator set an admin_code. Resend
                    with the "X-Admin-Code" header. You cannot obtain that value from
                    here - ask the person who runs that PC.

@@ -165,7 +165,7 @@ the **button editor** in a browser. Right-click menu:
 
 | item | |
 |---|---|
-| `deescreen v0.2.0` / `http://127.0.0.1:8090` | display only |
+| `deescreen v0.2.1` / `http://127.0.0.1:8090` | display only |
 | **Open button editor** | same as double-click |
 | **Status (/health)** | is it in a state where it can act |
 | **Open settings folder** | the home directory — where `config.json`, `profiles/` and `logs/` actually are |
@@ -701,8 +701,14 @@ curl -s -X POST -o shot.png ".../click.png?button=OPT_STOP&capture=button&pad=25
 ```
 
 - `region=button:NAME` is that button's own rectangle, straight from the profile.
-- `pad` grows it on every side, in the same client pixels as the numbers in the file.
-  Anything past the window edge is clamped when the crop happens, not refused.
+- `pad` grows it on every side, in the same client pixels as the numbers in the file. Where
+  that runs past the window edge the picture is **cut there, not slid across** — you get the
+  margin there was room for on that side and the full margin on the others, so **near an edge
+  the button is not in the middle of the image**. A button 22 wide at x=22 with `pad=200` asks
+  for `[-178, …, 422, …]` and comes back `[0, …, 244, …]`: 22 of margin on the left because
+  that is all there was, the button's 22, then the 200 asked for on the right. Read its
+  position from the `rect` in the metadata rather than assuming, and subtract what falls
+  outside before predicting a width.
 - On a click, **`capture=button` with no name means the button you just pressed** (the last
   one, for a sequence), so the name is not written twice.
 
