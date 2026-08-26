@@ -165,7 +165,7 @@ the **button editor** in a browser. Right-click menu:
 
 | item | |
 |---|---|
-| `deescreen v0.1.0` / `http://127.0.0.1:8090` | display only |
+| `deescreen v0.1.1` / `http://127.0.0.1:8090` | display only |
 | **Open button editor** | same as double-click |
 | **Status (/health)** | is it in a state where it can act |
 | **Open settings folder** | the home directory — where `config.json`, `profiles/` and `logs/` actually are |
@@ -1008,8 +1008,16 @@ that can press a button.
 ## Development
 
 ```bash
-cargo test          # 81 — coordinate math, crop/scale, overlays, key parsing, ACL classification, example schemas
+cargo test          # 82 — coordinate math, crop/scale, overlays, key parsing, ACL classification, example schemas
 cargo build --release
+```
+
+Nothing on the Rust side parses `src/editor.html` — it is `include_str!`'d and served as
+bytes, so a syntax error in its script passes every check above while the page does nothing at
+all. If you edit that file, check it:
+
+```bash
+python -c "import re,pathlib;print(re.search(r'<script[^>]*>(.*?)</script>',pathlib.Path('src/editor.html').read_text(encoding='utf-8'),re.S).group(1))" > /tmp/e.js && node --check /tmp/e.js
 ```
 
 | file | holds |

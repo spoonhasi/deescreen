@@ -3370,6 +3370,42 @@ mod tests {
         assert!(confirm_button_at(&t, (130, 130), two).is_none(), "outside, after scaling");
     }
 
+    /// The editor is served as bytes, so nothing that runs on this side ever parses it.
+    ///
+    /// A build, clippy and eighty tests all passed while its script carried a syntax error
+    /// and the page did nothing whatsoever — the cause was a translation string written
+    /// across two lines, which a single-quoted JS string cannot be. That failure is silent
+    /// twice over: the script dies before it can draw its own error, so the page sits on
+    /// "loading…" looking exactly like a server that never answered.
+    ///
+    /// This checks the shape those tables are actually written in — one entry, one line —
+    /// rather than trying to be a JavaScript parser. For the real thing during development:
+    /// pull the <script> out and run `node --check` on it.
+    #[test]
+    fn every_translation_entry_is_one_line() {
+        let html = include_str!("editor.html");
+        let mut bad = Vec::new();
+        for (n, line) in html.lines().enumerate() {
+            let t = line.trim_end();
+            let is_entry = t.starts_with("    '")
+                && t.strip_prefix("    '")
+                    .and_then(|r| r.split_once("'"))
+                    .is_some_and(|(k, rest)| {
+                        rest.starts_with(':')
+                            && !k.is_empty()
+                            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+                    });
+            if is_entry && !(t.ends_with(',') || t.ends_with('}')) {
+                bad.push(format!("editor.html:{}: {}", n + 1, &t[..t.len().min(72)]));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "a translation entry runs past its line, which breaks the whole script:\n{}",
+            bad.join("\n")
+        );
+    }
+
     /// Messages must not carry the indentation of the source they were written in.
     ///
     /// A `\` at the end of a line inside a Rust string literal swallows the newline and the
