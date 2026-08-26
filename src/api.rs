@@ -1420,6 +1420,80 @@ fn confirm_flags_lost(before: &Targets, after: &Targets) -> Vec<String> {
         .collect()
 }
 
+/// What to say when a caller names something that is not there.
+///
+/// Listing every name was the obvious answer and it stops scaling: on a 140-button panel it is
+/// 1.4 kB of response for a one-character typo, in a reply the caller has to read on every
+/// mistake. And it does not actually help — the answer is somewhere inside that wall.
+///
+/// A wrong name is nearly always a near miss: a typo, or the wrong word for the right idea
+/// (`MDI_DOT` for `MDI_PERIOD`). So the useful reply is the handful of names that are close,
+/// with a count and where to get the whole list on the rare occasion it is really wanted.
+fn near_names(wanted: &str, all: impl Iterator<Item = String>, list_at: &str) -> Value {
+    let all: Vec<String> = all.collect();
+    let lower = wanted.to_lowercase();
+
+    let mut scored: Vec<(usize, &String)> = all
+        .iter()
+        .map(|n| {
+            let nl = n.to_lowercase();
+            // Case is the cheapest possible mistake, so it wins outright. Next, one name
+            // containing the other beats a mere edit distance — MDI_9 against MDI_90 is a
+            // better guess than any distance says — but only when the two are close in length.
+            // Without that guard a one-letter name matches nearly everything: `Y` is inside
+            // `cYcle_start`, and it kept turning up as a suggestion for it.
+            let (short, long) = if nl.len() < lower.len() { (&nl, &lower) } else { (&lower, &nl) };
+            let comparable = short.chars().count() >= 3 && short.len() * 2 >= long.len();
+            let score = if nl == lower {
+                0
+            } else if comparable && long.contains(short.as_str()) {
+                1
+            } else {
+                2 + edit_distance(&lower, &nl)
+            };
+            (score, n)
+        })
+        .filter(|(score, n)| *score <= 2 + (n.chars().count() / 2).max(2))
+        .collect();
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+
+    let near: Vec<&String> = scored.iter().take(5).map(|(_, n)| *n).collect();
+    let mut out = json!({ "known": all.len(), "all": list_at });
+    if !near.is_empty() {
+        out["did_you_mean"] = json!(near);
+    }
+
+    // Some misses are not typos at all — the right family, the wrong word for the thing
+    // (`MDI_DOT` for `MDI_PERIOD`). No string distance finds that, but the prefix does: saying
+    // how many names share it turns a dead end into one filtered look at the list.
+    if let Some((prefix, _)) = wanted.rsplit_once('_') {
+        let group = format!("{prefix}_");
+        let n = all.iter().filter(|k| k.starts_with(&group)).count();
+        if n > 0 && !near.iter().any(|k| k.eq_ignore_ascii_case(wanted)) {
+            out["same_prefix"] = json!({ "prefix": group, "count": n });
+        }
+    }
+    out
+}
+
+/// Levenshtein distance, one row at a time. These names are short, so the plain version is the
+/// right amount of machinery.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            let next = (row[j] + 1).min(row[j + 1] + 1).min(prev + cost);
+            prev = row[j + 1];
+            row[j + 1] = next;
+        }
+    }
+    row[b.len()]
+}
+
 /// The gate that guards the gate.
 ///
 /// A confirm flag is one person's judgement that pressing this needs a human. An edit endpoint
@@ -1837,6 +1911,14 @@ PRESS SEVERAL BUTTONS IN ORDER - for keypads, where a half-entry is worse than n
       between presses; it defaults to 500ms because a panel that drops input when pressed
       too fast fails silently, which is the failure this endpoint exists to prevent. Lower
       it once you have measured yours.
+    - THE WAIT BEFORE THE CAPTURE IS LONGER FOR A SEQUENCE - 800ms rather than the server's
+      single-press default. The last press of a sequence is nearly always the commit
+      (INSERT, INPUT, CYCLE START) and a commit does more than a keystroke; capture too
+      early and you get the screen from just before it, which still shows the entry sitting
+      in the input line and reads exactly like a sequence that failed. Every reply says the
+      settle_ms it actually used, so check that rather than assuming. If you know the real
+      number for a commit button, put settle_ms on THAT BUTTON in the profile - measured
+      once, right every time after, and better than any default here.
   "buttons" cannot be combined with "button", "rect" or "point". At most 200 per request.
   In the query form (/click.png) it is a comma-separated list: buttons=MDI_G,MDI_9.
 
@@ -1932,7 +2014,11 @@ LOOK AT SOMETHING
     curl -s -o shot.png "{base}/capture.png?region=button:OPT_STOP&pad=25"
     curl -s -X POST -o shot.png "{base}/click.png?button=OPT_STOP&capture=button&pad=25"
   pad grows the rectangle on every side, in the same client pixels as the numbers in the
-  profile, and anything past the window edge is clamped rather than refused. On a click,
+  profile. Where that runs past the window edge the picture is CUT, not slid across: a
+  button 22px from the left with pad=200 gives you the 222px there is room for on that side,
+  not 200px taken from somewhere else. So the button is NOT necessarily in the middle of the
+  image near an edge - read its position from the "rect" in the metadata (the crop's own
+  origin) against the button's rect from GET /buttons, rather than assuming it is centred. On a click,
   `capture=button` with no name means the button you just pressed (the last one, for a
   sequence), so you do not have to write it twice.
 
@@ -2196,6 +2282,10 @@ TRAPS - these fail quietly or confusingly. Read once, save yourself an hour.
                    permission slip - resending is yours to do. It is here so the press
                    cannot happen by accident. Read the button's note first; see BUTTONS
                    MARKED CONFIRM above.
+  404 unknown name A button, region or key name that is not in the profile. The reply does
+                   not list every name - on a big panel that is a wall of text for a typo -
+                   it gives the closest few as "did_you_mean", how many exist, and where the
+                   full list is. Usually the name you meant is right there.
   401 admin code   An /admin call on a server whose operator set an admin_code. Resend
                    with the "X-Admin-Code" header. You cannot obtain that value from
                    here - ask the person who runs that PC.
@@ -2331,7 +2421,7 @@ fn precheck_key(state: &SharedState, t: &Targets, req: &KeyReq) -> Result<(), Ap
             if !t.keys.contains_key(name) {
                 return Err(ApiError::not_found(format!("unknown key '{name}'")).with_detail(
                     json!({
-                        "known_keys": t.keys.keys().cloned().collect::<Vec<_>>(),
+                        "keys": near_names(name, t.keys.keys().cloned(), "GET /profiles"),
                         "note": "'key' takes a name from the profile's keys. An unnamed chord goes in 'chord' instead, which needs allow_raw_keys",
                     }),
                 ));
@@ -2353,6 +2443,24 @@ fn precheck_key(state: &SharedState, t: &Targets, req: &KeyReq) -> Result<(), Ap
 }
 
 fn precheck(t: &Targets, req: &ClickReq) -> Result<(), ApiError> {
+    // One name is checkable without the window, so check it here rather than after binding.
+    // Otherwise a typo answers "no visible window matches", which sends the caller to look at
+    // the window spec when the wrong thing was in their own request.
+    if let Some(name) = &req.button
+        && req.buttons.is_none()
+    {
+        let Some(tg) = t.buttons.get(name) else {
+            return Err(ApiError::not_found(format!("unknown button '{name}'")).with_detail(
+                json!({"buttons": near_names(name, t.buttons.keys().cloned(), "GET /buttons")}),
+            ));
+        };
+        if tg.confirm && !req.confirm {
+            return Err(ApiError::forbidden(format!(
+                "button '{name}' is marked confirm — resend with \"confirm\": true"
+            ))
+            .with_detail(json!({"note": tg.note})));
+        }
+    }
     let Some(names) = &req.buttons else { return Ok(()) };
     if req.button.is_some() || req.rect.is_some() || req.point.is_some() {
         return Err(ApiError::bad_request(
@@ -2376,7 +2484,7 @@ fn precheck(t: &Targets, req: &ClickReq) -> Result<(), ApiError> {
             ApiError::not_found(format!("unknown button '{n}' at index {i} of 'buttons'"))
                 .with_detail(json!({
                     "index": i,
-                    "known_buttons": t.button_names(),
+                    "buttons": near_names(n, t.buttons.keys().cloned(), "GET /buttons"),
                     "note": "nothing was pressed — the whole sequence is checked before any of it runs",
                 }))
         })?;
@@ -2400,7 +2508,7 @@ fn resolve_saved(
 ) -> Result<Press, ApiError> {
     let tg = t.buttons.get(name).ok_or_else(|| {
         ApiError::not_found(format!("unknown button '{name}'"))
-            .with_detail(json!({"known_buttons": t.button_names()}))
+            .with_detail(json!({"buttons": near_names(name, t.buttons.keys().cloned(), "GET /buttons")}))
     })?;
     if tg.confirm && !req.confirm {
         return Err(ApiError::forbidden(format!(
@@ -2426,6 +2534,18 @@ fn resolve_saved(
 /// silently — you get a half-typed block and no error — and this endpoint exists precisely to
 /// stop half-typed blocks. Callers who have measured their panel can lower it.
 const DEFAULT_GAP_MS: u64 = 500;
+
+/// How long a **sequence** waits before its capture, when the request and the last button both
+/// leave it open. Higher than the server's single-press default for the same reason `gap_ms` is
+/// slow: the last press of a sequence is almost always the commit — INSERT, INPUT, CYCLE START
+/// — and a commit does more than a keystroke. Too short and the capture is of the screen just
+/// before it, which shows an entry still sitting in the input line and looks exactly like a
+/// sequence that failed. Silently reading the previous screen is the failure this endpoint
+/// exists to prevent, so the default errs long.
+///
+/// The precise answer is a `settle_ms` on the commit button itself, measured once and recorded
+/// in the profile. This is only the fallback for when nobody has.
+const DEFAULT_SEQUENCE_SETTLE_MS: u64 = 800;
 /// Ceiling on how many presses one request may carry.
 const MAX_SEQUENCE: usize = 200;
 
@@ -2684,9 +2804,11 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
 
         // settle_ms belongs to the whole request, not to each press — the sequence has its own
         // spacing in gap_ms, and what the caller waits for is the state after the last one.
-        let settle = st.config.clamp_settle(
-            req.settle_ms.or_else(|| presses.last().and_then(|p| p.settle_ms)),
-        );
+        let settle = st.config.clamp_settle(Some(
+            req.settle_ms
+                .or_else(|| presses.last().and_then(|p| p.settle_ms))
+                .unwrap_or(if sequence { DEFAULT_SEQUENCE_SETTLE_MS } else { st.config.default_settle_ms }),
+        ));
         std::thread::sleep(std::time::Duration::from_millis(settle));
 
         // ── report ──
@@ -3446,6 +3568,53 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "a lost line-continuation left indentation inside a message:\n{}", bad.join("\n"));
+    }
+
+    /// The reply to a wrong name has to be the near ones, and only the near ones.
+    ///
+    /// Listing all 140 was 1.4 kB per typo and put the answer somewhere inside a wall. The
+    /// trap in replacing it is a suggestion list that is itself noise: containment alone made
+    /// `Y` a candidate for `CYCLE_STAR`, because `cYcle` contains a y.
+    #[test]
+    fn a_wrong_name_is_answered_with_the_near_ones() {
+        let names = [
+            "CYCLE_START", "CYCLE_STOP", "EMERGENCY", "MDI_PERIOD", "MDI_9", "MDI_0",
+            "SOFTKEY_01", "SOFTKEY_10", "X", "Y", "Z",
+        ];
+        let all = || names.iter().map(|s| s.to_string());
+        let of = |v: &Value, k: &str| -> Vec<String> {
+            v.get(k)
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                .unwrap_or_default()
+        };
+
+        // Wrong case is the cheapest miss, so the right name comes first.
+        let v = near_names("mdi_period", all(), "GET /buttons");
+        assert_eq!(of(&v, "did_you_mean").first().map(String::as_str), Some("MDI_PERIOD"));
+
+        // A dropped letter.
+        let v = near_names("CYCLE_STAR", all(), "GET /buttons");
+        let near = of(&v, "did_you_mean");
+        assert_eq!(near.first().map(String::as_str), Some("CYCLE_START"));
+        assert!(!near.iter().any(|n| n == "Y"), "a one-letter name is not a suggestion: {near:?}");
+
+        // Every reply carries the size of the list and where to read it, so a caller who
+        // really does want all of them knows the number and the call.
+        assert_eq!(v["known"], json!(names.len()));
+        assert_eq!(v["all"], json!("GET /buttons"));
+
+        // The right family, the wrong word for the thing — no distance finds DOT -> PERIOD,
+        // so the prefix count is what turns it into one filtered look.
+        let v = near_names("MDI_DOT", all(), "GET /buttons");
+        assert_eq!(v["same_prefix"]["prefix"], json!("MDI_"));
+        assert_eq!(v["same_prefix"]["count"], json!(3));
+
+        // A name that exists needs no prefix hint, and nothing close means no guesses at all
+        // rather than five arbitrary ones.
+        let v = near_names("qqqqqqqq", all(), "GET /buttons");
+        assert!(v.get("did_you_mean").is_none(), "no near names: {v}");
+        assert!(v.get("same_prefix").is_none(), "no underscore, no family: {v}");
     }
 
     /// Losing a confirm flag is detected whether the flag was cleared or the whole button

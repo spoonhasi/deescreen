@@ -165,7 +165,7 @@ the **button editor** in a browser. Right-click menu:
 
 | item | |
 |---|---|
-| `deescreen v0.1.1` / `http://127.0.0.1:8090` | display only |
+| `deescreen v0.2.0` / `http://127.0.0.1:8090` | display only |
 | **Open button editor** | same as double-click |
 | **Status (/health)** | is it in a state where it can act |
 | **Open settings folder** | the home directory — where `config.json`, `profiles/` and `logs/` actually are |
@@ -733,6 +733,12 @@ shapes the design:
   as an unfinished entry — look at the screen before doing anything else.
 - **A `confirm` button inside the array follows the same rule as a single press** — refused
   unless the request carries `"confirm": true`. An array is not a way around it.
+- **The wait before the capture is longer for a sequence** — 800 ms, not the server's
+  single-press default. The last press is nearly always the commit (INSERT, INPUT, CYCLE
+  START), which does more than a keystroke; capture too early and you photograph the screen
+  from just before it — the entry still in the input line, indistinguishable from a sequence
+  that failed. Same reasoning as `gap_ms`. The reply always states the `settle_ms` it used,
+  and the real fix is a measured `settle_ms` on the commit button in the profile.
 - **`capture`, `ignore` and `settle_ms` apply once, after the last press.** `gap_ms` is the
   spacing between presses.
 
@@ -1008,7 +1014,7 @@ that can press a button.
 ## Development
 
 ```bash
-cargo test          # 82 — coordinate math, crop/scale, overlays, key parsing, ACL classification, example schemas
+cargo test          # 84 — coordinate math, crop/scale, overlays, key parsing, ACL classification, example schemas
 cargo build --release
 ```
 

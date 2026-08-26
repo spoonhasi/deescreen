@@ -154,6 +154,14 @@ pub fn frame(shot: &Shot, rect: Rect, scale: Option<f64>, max_width: Option<u32>
 
     // Clamp anything that runs past the client area. A region defined slightly larger than
     // the window is no reason for the whole capture to fail.
+    //
+    // **Both edges are cut, not slid.** The right and bottom edges were always cut; the left
+    // and top used to move to 0 while keeping their width, which slides the rectangle sideways
+    // and returns a region the caller did not ask for. With `pad` on a button near an edge
+    // that is the difference between "the button, off to one side of a wide picture" and
+    // "the button, with as much margin as there was room for" — and only the second is what
+    // the numbers say. `source_rect` reports what was actually taken either way, so nothing was
+    // wrong about the coordinates; the picture was just of somewhere else.
     let [rx, ry, rw, rh] = rect;
     let x0 = rx.max(0) as u32;
     let y0 = ry.max(0) as u32;
@@ -163,8 +171,11 @@ pub fn frame(shot: &Shot, rect: Rect, scale: Option<f64>, max_width: Option<u32>
             shot.width, shot.height
         ));
     }
-    let w = (rw.max(0) as u32).min(shot.width - x0);
-    let h = (rh.max(0) as u32).min(shot.height - y0);
+    // Work from the far edge so that whatever fell off the near side is subtracted, not kept.
+    let right = rx.saturating_add(rw.max(0)).max(0) as u32;
+    let bottom = ry.saturating_add(rh.max(0)).max(0) as u32;
+    let w = right.min(shot.width).saturating_sub(x0);
+    let h = bottom.min(shot.height).saturating_sub(y0);
     if w == 0 || h == 0 {
         return Err(format!("region [{rx},{ry},{rw},{rh}] is empty after clamping to the client area"));
     }
@@ -335,6 +346,39 @@ mod tests {
         let f = frame(&shot(100, 80, 200), [10, 20, 30, 40], None, None).expect("frame");
         assert_eq!((f.width(), f.height()), (30, 40));
         assert_eq!(f.source_rect, [10, 20, 30, 40]);
+    }
+
+    /// A crop that starts outside the window loses the part that is outside — it does not
+    /// slide inwards keeping its width.
+    ///
+    /// This is what `pad` does at an edge. Padding a button at x=22 by 200 asks for x=-178
+    /// w=422; sliding that to x=0 w=422 hands back 178 columns from the far side that nobody
+    /// asked for, and leaves the button off to one side of a picture meant to be centred on
+    /// it. The right and bottom edges were always cut this way — the left and top were the
+    /// odd ones out.
+    #[test]
+    fn a_crop_outside_the_window_is_cut_not_slid() {
+        let shot = shot(1000, 800, 200);
+
+        // Off the left: 178 columns are outside, so 178 columns are lost.
+        let f = frame(&shot, [-178, 273, 422, 444], None, None).expect("crops");
+        assert_eq!(f.source_rect, [0, 273, 244, 444], "width shrank by what fell off");
+        assert_eq!(f.width(), 244);
+
+        // Off the top, same rule.
+        let f = frame(&shot, [10, -30, 50, 100], None, None).expect("crops");
+        assert_eq!(f.source_rect, [10, 0, 50, 70]);
+
+        // Off both near edges at once.
+        let f = frame(&shot, [-5, -5, 20, 20], None, None).expect("crops");
+        assert_eq!(f.source_rect, [0, 0, 15, 15]);
+
+        // The far edges behaved this way already, and still do.
+        let f = frame(&shot, [980, 780, 100, 100], None, None).expect("crops");
+        assert_eq!(f.source_rect, [980, 780, 20, 20]);
+
+        // Entirely off the near side is empty, not a silently relocated picture.
+        assert!(frame(&shot, [-50, 10, 40, 40], None, None).is_err());
     }
 
     #[test]
