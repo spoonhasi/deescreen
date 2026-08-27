@@ -165,7 +165,7 @@ the **button editor** in a browser. Right-click menu:
 
 | item | |
 |---|---|
-| `deescreen v0.2.1` / `http://127.0.0.1:8090` | display only |
+| `deescreen v0.3.0` / `http://127.0.0.1:8090` | display only |
 | **Open button editor** | same as double-click |
 | **Status (/health)** | is it in a state where it can act |
 | **Open settings folder** | the home directory — where `config.json`, `profiles/` and `logs/` actually are |
@@ -294,11 +294,22 @@ These files are **strict JSON — no comments.** What each setting means lives h
 | `allow_raw_clicks` | whether unnamed coordinates may be clicked. **This is the boundary in §1 of the design** — default `false` |
 | `allow_raw_keys` | whether unnamed key input (`chord`/`text`) is allowed. Default `false`; a key is as powerful as a click on a panel that maps them |
 | `allow_profile_editing` | whether `/editor` may write profile files. Default `false`; on, the boundary moves from file permissions to HTTP reachability |
-| `default_settle_ms` | default wait between an input and the re-capture. Default 300 |
+| `default_settle_ms` | default wait between an input and the re-capture. Default 500 — a capture taken early returns the previous screen, which reads as a failed operation |
 | `max_settle_ms` | ceiling on the wait a request may ask for, so a connection is not held open. Default 10000 |
+| `default_hold_ms` | how long a press stays down. Default 80 — see below |
+| `max_hold_ms` | ceiling on the hold a request may ask for. Default 2000; the input lock is held for the whole press |
 
 `config.json` is read **at startup only** — restart after changing it. The profile files are the
 part that hot-reloads.
+
+**Upgrading over an old install adds the settings it is missing.** Copy a newer exe over an
+older one and its `config.json` predates whatever settings the new build brought. Those still
+work — they fall back to their defaults — but they are in force without appearing in the file,
+so nobody can see there is anything to tune. At startup any absent setting is written in at the
+value already being used, and the log names what was added. Existing values are never touched,
+and a file that cannot be written is a warning, not a failure. This is safe only because the
+config refuses unknown fields: a file that parsed is fully represented, so writing it back
+cannot drop anything it had.
 
 ### Opening the port on the target PC
 
@@ -737,6 +748,14 @@ shapes the design:
 - **A failed press stops the sequence.** `sequence.failed` carries the index and the button;
   `pressed` lists what did go in, each with its own `hit`. A partial sequence should be read
   as an unfinished entry — look at the screen before doing anything else.
+- **How long the key is held down decides whether a panel notices** — `hold_ms`. A press is
+  down, wait, up; that wait is what a machine key is read by. Something scans the contact on a
+  cycle, and a press that begins and ends between two scans never happened as far as the
+  machine is concerned — nothing moves, no alarm, no error, and the reply looks like a
+  success because the input really was delivered. Measured on NC Trainer2 plus, sending down
+  and up in one batch made CYCLE START do nothing at all; 80 ms made it run the program. Set
+  it in the request while finding the number, then put it on the button or in
+  `default_hold_ms`, since the scan rate belongs to the application rather than to one key.
 - **A `confirm` button inside the array follows the same rule as a single press** — refused
   unless the request carries `"confirm": true`. An array is not a way around it.
 - **The wait before the capture is longer for a sequence** — 800 ms, not the server's
@@ -1020,7 +1039,7 @@ that can press a button.
 ## Development
 
 ```bash
-cargo test          # 84 — coordinate math, crop/scale, overlays, key parsing, ACL classification, example schemas
+cargo test          # 86 — coordinate math, crop/scale, overlays, key parsing, ACL classification, example schemas
 cargo build --release
 ```
 

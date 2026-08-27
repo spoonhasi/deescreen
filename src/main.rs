@@ -86,7 +86,22 @@ async fn main() {
         }
     }
     let config = match Config::load(&config_path) {
-        Ok(c) => Arc::new(c),
+        Ok(c) => {
+            // An install upgraded by copying the exe over has a config file older than the
+            // build. Put the settings it is missing into it, at the values already in force,
+            // so the file describes what the program does rather than a subset of it.
+            match config::fill_missing_keys(&config_path, &c) {
+                Ok(added) if !added.is_empty() => info!(
+                    "config.json was missing {} setting(s) this build knows about — added at their current values: {}",
+                    added.len(),
+                    added.join(", ")
+                ),
+                Ok(_) => {}
+                // Not fatal. The settings are in force either way; only the file is behind.
+                Err(e) => warn!("could not bring config.json up to date ({e}) — running with the defaults for anything it does not mention"),
+            }
+            Arc::new(c)
+        }
         Err(e) => fatal(&e),
     };
 

@@ -26,6 +26,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::captures::{self, Frame};
+use crate::config::Config;
 use crate::draw;
 use crate::state::SharedState;
 use crate::targets::{ButtonDef, Rect, Targets};
@@ -227,6 +228,9 @@ pub struct ClickReq {
     pub click_button: Option<String>,
     #[serde(default)]
     pub double: Option<bool>,
+    /// How long to hold the press (ms), overriding the button's own value and the default.
+    #[serde(default)]
+    pub hold_ms: Option<u64>,
     /// Pressing a `confirm: true` button requires this on the request as well.
     #[serde(default)]
     pub confirm: bool,
@@ -371,6 +375,7 @@ impl ClickReq {
             point,
             click_button: q_get(q, "click_button"),
             double: q_bool(q, "double")?,
+            hold_ms: q_num(q, "hold_ms")?,
             confirm: q_bool(q, "confirm")?.unwrap_or(false),
             settle_ms: q_num(q, "settle_ms")?,
             capture: q_get(q, "capture"),
@@ -990,6 +995,8 @@ pub async fn health(State(state): State<SharedState>) -> Response {
                 "admin_code_required": !st.config.admin_code.is_empty(),
                 "default_settle_ms": st.config.default_settle_ms,
                 "max_settle_ms": st.config.max_settle_ms,
+                "default_hold_ms": st.config.default_hold_ms,
+                "max_hold_ms": st.config.max_hold_ms,
             },
         })
     })
@@ -1880,9 +1887,44 @@ PRESS A SAVED BUTTON - click, wait for it to settle, re-capture, one round trip
     -d '{{"button":"NAME","capture":"REGION","settle_ms":500}}' {base}/click
 
   settle_ms is how long to wait after the press before re-capturing. Left out it uses
-  the server's default; ask for more than the server's ceiling and it is CLAMPED, not
-  refused. Both numbers are in /health under "policy", and every reply reports the
+  the server's default (500ms); ask for more than the server's ceiling and it is CLAMPED,
+  not refused. Both numbers are in /health under "policy", and every reply reports the
   settle_ms actually used - so read that rather than assuming you got what you asked.
+
+  Do not confuse it with hold_ms below. They are different halves of the same press:
+    hold_ms    how long the key stays DOWN. Too short and the machine never sees the press.
+    settle_ms  how long to wait AFTER, before looking. Too short and you photograph the
+               screen from before it caught up, and read a stale screen as the result.
+  Both fail the same way - quietly, returning something that looks like an answer.
+
+  HOW LONG THE KEY IS HELD DOWN - "hold_ms"
+  A press is three things: the button goes down, time passes, the button comes up. hold_ms is
+  that middle part, in milliseconds, and it decides whether a machine panel notices at all.
+
+  An ordinary Win32 button reacts to any press however brief, because it latches on the way
+  down. A simulated machine key does not: something reads that contact on a cycle, and a press
+  that begins and ends between two reads never happened as far as the machine is concerned.
+  Nothing moves. No alarm. No error. The reply looks exactly like a successful press, because
+  from this side it was one - the input really was delivered.
+
+  So when a key does nothing AND "hit" says you reached a real, enabled control, the press
+  length is the first thing to change, not the coordinate:
+    curl -s -X POST -H "Content-Type: application/json" \
+      -d '{{"button":"CYCLE_START","hold_ms":300,"capture":"nc_display"}}' {base}/click
+  Try the default, then 200, then 500. Every reply states the hold_ms it actually used, so
+  compare that against what you asked for rather than assuming.
+
+  Three places set it, nearest wins:
+    "hold_ms" in the request       this one press - what to use while finding the number
+    "hold_ms" on the button        that key alone, in the profile
+    default_hold_ms in config.json the whole application - usually the right home, because
+                                   the scan rate belongs to the program, not to one key
+  /health reports the default and the ceiling under "policy". The ceiling exists because the
+  press holds a lock on that window for its whole length.
+
+  Once you find the number that works, say so - it belongs in the profile or the config, not
+  in every future request. A caller that has to remember a magic number is a caller that will
+  one day forget it.
 
   A LEFT SINGLE CLICK IS THE DEFAULT. "click_button": "right" (or "middle") and
   "double": true change that, on a saved button and on a raw coordinate alike. A button
@@ -2050,6 +2092,13 @@ LOOK AT SOMETHING
 ENDPOINTS
   GET  /  ·  /help     this page. It never changes; /health is what changes
   GET  /health         is it operable right now - check this first when anything fails.
+                       "policy" also carries the timing defaults and ceilings this server
+                       runs with - default_settle_ms, max_settle_ms, default_hold_ms,
+                       max_hold_ms. A setting absent from that PC's config.json is written
+                       into it at startup with the value in force, so the file always lists
+                       everything there is to tune; only allowed_ips_read and
+                       allowed_ips_write have no default, because who may reach and who may
+                       control is not something this program will guess.
                        "home" is where config.json, profiles/, captures/ and logs/ live on
                        that PC, and why that directory was chosen - the answer when a person
                        asks where their settings are. Moving them is theirs to do, not
@@ -2074,7 +2123,7 @@ ENDPOINTS
                        the server-side path and /captures URL, and no image in the body.
                        Use it when you want the picture kept and referred to rather than
                        read right now. Parameters go in the body
-  POST /click          {{button | buttons[] | rect | point, confirm, click_button, double,
+  POST /click          {{button | buttons[] | rect | point, confirm, click_button, double, hold_ms,
                        settle_ms, gap_ms, capture, pad, ignore}} - the reply carries "hit"
                        (what was under the point) and "change" (pixels + bbox). With
                        "buttons" it presses them in order and stops at the first failure
@@ -2308,6 +2357,12 @@ TRAPS - these fail quietly or confusingly. Read once, save yourself an hour.
   409 minimized    POST /window/focus.
   black capture    The console session is locked or RDP is disconnected. Nothing will
                    work until a human unlocks it. /health says so explicitly.
+  press too short   The click reached a real, enabled control - "hit" proves that - and the
+                   application did nothing at all. A panel key is read by a scan, so a press
+                   shorter than one scan interval never happened as far as the machine is
+                   concerned. Resend with a longer "hold_ms" (try 200, then 500). This is not
+                   the same as changed=false below: there the press was seen and ignored,
+                   here it was never seen.
   a person at that PC
                    Input goes into the one real input stream that PC has: the pointer moves,
                    the window is brought to the front, and focus is taken. The press itself
@@ -2409,6 +2464,7 @@ struct Press {
     point: (i32, i32),
     button: Button,
     double: bool,
+    hold_ms: u64,
     settle_ms: Option<u64>,
     /// Whether the saved definition is marked confirm (for the audit log).
     was_confirm: bool,
@@ -2511,6 +2567,7 @@ fn precheck(t: &Targets, req: &ClickReq) -> Result<(), ApiError> {
 
 /// Resolve one saved button. Everything that can refuse, refuses here.
 fn resolve_saved(
+    cfg: &Config,
     t: &Targets,
     name: &str,
     req: &ClickReq,
@@ -2532,6 +2589,7 @@ fn resolve_saved(
         button: Button::parse(req.click_button.as_deref().unwrap_or(&tg.click_button))
             .map_err(ApiError::bad_request)?,
         double: req.double.unwrap_or(tg.double),
+        hold_ms: cfg.clamp_hold(req.hold_ms.or(tg.hold_ms)),
         settle_ms: tg.settle_ms,
         was_confirm: tg.confirm,
         adhoc: false,
@@ -2582,9 +2640,9 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
             // request; this only turns them into coordinates.
             (Some(names), _, _, _) => names
                 .iter()
-                .map(|n| resolve_saved(&t, n, &req, scale))
+                .map(|n| resolve_saved(&st.config, &t, n, &req, scale))
                 .collect::<Result<Vec<_>, _>>()?,
-            (None, Some(name), _, _) => vec![resolve_saved(&t, name, &req, scale)?],
+            (None, Some(name), _, _) => vec![resolve_saved(&st.config, &t, name, &req, scale)?],
 
             // ── a rectangle that was never saved ──
             // Controls that appear only on some screens cannot be on the named list. Read the
@@ -2607,6 +2665,7 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
                     button: Button::parse(req.click_button.as_deref().unwrap_or("left"))
                         .map_err(ApiError::bad_request)?,
                     double: req.double.unwrap_or(false),
+                    hold_ms: st.config.clamp_hold(req.hold_ms),
                     settle_ms: None,
                     was_confirm: false,
                     adhoc: true,
@@ -2626,6 +2685,7 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
                     button: Button::parse(req.click_button.as_deref().unwrap_or("left"))
                         .map_err(ApiError::bad_request)?,
                     double: req.double.unwrap_or(false),
+                    hold_ms: st.config.clamp_hold(req.hold_ms),
                     settle_ms: None,
                     was_confirm: false,
                     adhoc: true,
@@ -2753,7 +2813,7 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
             // rather than what was aimed at.
             let hit = window::control_at(info.handle, pr.point.0, pr.point.1);
 
-            if let Err(e) = input::click(sx, sy, pr.button, pr.double) {
+            if let Err(e) = input::click(sx, sy, pr.button, pr.double, pr.hold_ms) {
                 // Stop here. Carrying on would finish a string nobody asked for, and that is
                 // the worst kind of quietly wrong result.
                 log::error!(
@@ -2772,11 +2832,12 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
             // confirm targets and unnamed coordinates are WARN — the two kinds that have to
             // stand out when skimming. Everything else is INFO.
             let mut line = format!(
-                "CLICK profile={} target={} button={} double={} client=({},{}) screen=({sx},{sy}) window={:?} pid={}",
+                "CLICK profile={} target={} button={} double={} hold={}ms client=({},{}) screen=({sx},{sy}) window={:?} pid={}",
                 prof.name,
                 pr.name,
                 pr.button.as_str(),
                 pr.double,
+                pr.hold_ms,
                 pr.point.0,
                 pr.point.1,
                 info.title,
@@ -2806,6 +2867,9 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
             done.push(json!({
                 "index": i,
                 "button": pr.name,
+                // How long the contact was actually closed. A panel key that needs longer than
+                // this to be scanned does nothing at all, so the number has to be visible.
+                "hold_ms": pr.hold_ms,
                 "point": {"client": [pr.point.0, pr.point.1], "screen": [sx, sy]},
                 // Answers "did the press land on something", independent of pixels.
                 "hit": hit.as_ref().map(hit_json),
@@ -2844,6 +2908,11 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
             result["clicked"] = last["button"].clone();
             result["button"] = json!(presses[0].button.as_str());
             result["double"] = json!(presses[0].double);
+            // Lifted out of the per-press record, which only a sequence publishes. A single
+            // press is the commonest call and the one where a key that needs a longer hold
+            // shows up first, so leaving the number out here made the manual's promise that
+            // "every reply reports the hold that was actually used" false where it mattered.
+            result["hold_ms"] = json!(presses[0].hold_ms);
             result["point"] = last["point"].clone();
             result["hit"] = last["hit"].clone();
         }
@@ -3405,6 +3474,7 @@ mod tests {
                 click_button: "left".into(),
                 double: false,
                 confirm: false,
+                hold_ms: None,
                 settle_ms: None,
                 note: String::new(),
             },
@@ -3477,6 +3547,7 @@ mod tests {
             point: None,
             click_button: "left".into(),
             double: false,
+            hold_ms: None,
             confirm,
             settle_ms: None,
             note: String::new(),

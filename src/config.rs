@@ -96,6 +96,21 @@ pub struct Config {
     /// Ceiling on the wait a request may ask for (ms), so an HTTP connection is not held open.
     #[serde(default = "default_max_settle_ms")]
     pub max_settle_ms: u64,
+
+    /// How long a press stays down (ms).
+    ///
+    /// Zero is not a press at all: down and up in one batch close and open the contact inside
+    /// a single input tick. A Win32 button does not mind, because it latches on the down. A
+    /// simulated machine key does — something scans that contact on a cycle, and a press that
+    /// exists for no measurable time is one no scan ever sees, so nothing happens and nothing
+    /// says why. The default is roughly how long a person leans on a key. Where a panel needs
+    /// longer, this is the place: the scan rate belongs to the application, not to each caller.
+    #[serde(default = "default_hold_ms")]
+    pub default_hold_ms: u64,
+    /// Ceiling on the hold a request may ask for (ms). The input lock is held for the whole
+    /// press, so an unbounded hold would stop everything else on that window for that long.
+    #[serde(default = "default_max_hold_ms")]
+    pub max_hold_ms: u64,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -139,10 +154,20 @@ fn default_max_age_minutes() -> u64 {
     1440 // one day
 }
 fn default_settle_ms() -> u64 {
-    300
+    // Raised from 300 after driving a real panel. A capture taken before the screen has caught
+    // up is not an error — it is the previous screen handed back as the result, which reads
+    // exactly like the operation having failed. Being late costs a fraction of a second;
+    // being early costs a wrong answer that looks right.
+    500
 }
 fn default_max_settle_ms() -> u64 {
     10_000
+}
+fn default_hold_ms() -> u64 {
+    80
+}
+fn default_max_hold_ms() -> u64 {
+    2_000
 }
 
 /// A map that **refuses at parse time** when a key appears twice.
@@ -213,6 +238,8 @@ impl Config {
             allow_profile_editing: false,
             default_settle_ms: default_settle_ms(),
             max_settle_ms: default_max_settle_ms(),
+            default_hold_ms: default_hold_ms(),
+            max_hold_ms: default_max_hold_ms(),
         }
     }
 
@@ -234,6 +261,9 @@ impl Config {
         }
         if self.max_settle_ms < self.default_settle_ms {
             return Err("max_settle_ms must be >= default_settle_ms".into());
+        }
+        if self.max_hold_ms < self.default_hold_ms {
+            return Err("max_hold_ms must be >= default_hold_ms".into());
         }
         // The whitelist is a string comparison against the caller's **numeric address**.
         // Writing "localhost" or a hostname never matches, and the symptom — "I configured it
@@ -298,6 +328,11 @@ impl Config {
     pub fn clamp_settle(&self, requested: Option<u64>) -> u64 {
         requested.unwrap_or(self.default_settle_ms).min(self.max_settle_ms)
     }
+
+    /// Clamp a requested press length into the configured ceiling.
+    pub fn clamp_hold(&self, requested: Option<u64>) -> u64 {
+        requested.unwrap_or(self.default_hold_ms).min(self.max_hold_ms)
+    }
 }
 
 /// Where profile files live — `profiles/` inside the home directory.
@@ -348,6 +383,50 @@ pub fn is_safe_profile_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Settings this build knows about that the file does not mention, filled in with the values
+/// already in force.
+///
+/// `serde(default)` means a missing setting still works — and that is the problem. It works
+/// invisibly: the operator opens config.json, does not see `default_hold_ms`, and has no reason
+/// to think there is a hold to tune. Every release that adds a setting widens that gap for
+/// everyone who upgraded by copying the exe over.
+///
+/// Nothing is overwritten. Only absent keys are added, and only with what the running config
+/// already resolved to, so the file after the write describes exactly the behaviour before it.
+///
+/// This is only safe because `Config` refuses unknown fields: a file that parsed is fully
+/// represented by the struct, so serialising it back cannot lose anything that was in it. Were
+/// that not true, this would quietly delete the settings it did not understand.
+pub fn fill_missing_keys(path: &Path, cfg: &Config) -> Result<Vec<String>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("re-read {}: {e}", path.display()))?;
+    let on_disk: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("re-parse {}: {e}", path.display()))?;
+    let full = serde_json::to_value(cfg).map_err(|e| format!("serialize config: {e}"))?;
+
+    let mut added = Vec::new();
+    missing_keys(&on_disk, &full, "", &mut added);
+    if added.is_empty() {
+        return Ok(added);
+    }
+
+    let pretty = serde_json::to_string_pretty(&full).map_err(|e| format!("serialize config: {e}"))?;
+    std::fs::write(path, pretty + "\n").map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(added)
+}
+
+/// Keys present in `full` and absent from `on_disk`, one level into nested objects so that
+/// `captures.keep` is found rather than only `captures`.
+fn missing_keys(on_disk: &serde_json::Value, full: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+    let (Some(have), Some(want)) = (on_disk.as_object(), full.as_object()) else { return };
+    for (k, v) in want {
+        match have.get(k) {
+            None => out.push(format!("{prefix}{k}")),
+            Some(mine) if v.is_object() => missing_keys(mine, v, &format!("{prefix}{k}."), out),
+            Some(_) => {}
+        }
+    }
 }
 
 /// Why the runtime files ended up where they did.
@@ -521,6 +600,54 @@ mod tests {
         assert!(c.validate().is_err());
     }
 
+    /// Upgrading over an old install adds the settings the file does not mention, keeps
+    /// everything it does, and touches nothing once the file is complete.
+    ///
+    /// The keeping half is the one worth a test. This rewrites a file the operator owns, and
+    /// it is only safe because `deny_unknown_fields` guarantees a parsed config holds
+    /// everything the file held — remove that and this silently deletes whatever this build
+    /// does not recognise.
+    #[test]
+    fn an_old_config_gains_the_settings_it_is_missing() {
+        let dir = std::env::temp_dir().join(format!("deescreen-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("config.json");
+
+        // A file from before default_hold_ms and captures.max_age_minutes existed, with
+        // non-default values that must survive.
+        std::fs::write(
+            &path,
+            r#"{"host":"0.0.0.0","port":9001,"allowed_ips_read":["10.0.0.5"],
+                "allowed_ips_write":["10.0.0.5"],"allow_raw_clicks":true,
+                "captures":{"dir":"shots","keep":7}}"#,
+        )
+        .expect("write");
+
+        let cfg = Config::load(&path).expect("an old file still loads");
+        let added = fill_missing_keys(&path, &cfg).expect("fills");
+        assert!(added.contains(&"default_hold_ms".to_string()), "added: {added:?}");
+        assert!(added.contains(&"max_hold_ms".to_string()), "added: {added:?}");
+        assert!(
+            added.contains(&"captures.max_age_minutes".to_string()),
+            "one level in, so a nested setting is found too: {added:?}"
+        );
+
+        let after = Config::load(&path).expect("and reloads");
+        assert_eq!(after.port, 9001, "an existing value is not overwritten");
+        assert_eq!(after.allowed_ips_read, vec!["10.0.0.5".to_string()]);
+        assert!(after.allow_raw_clicks);
+        assert_eq!(after.captures.dir, "shots");
+        assert_eq!(after.captures.keep, 7);
+        assert_eq!(after.default_hold_ms, cfg.default_hold_ms);
+
+        // Complete already: nothing to add, and nothing written.
+        let before = std::fs::read_to_string(&path).expect("read");
+        assert!(fill_missing_keys(&path, &after).expect("second pass").is_empty());
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), before, "file untouched");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Every branch of the home decision, without a filesystem or a real `cargo install`.
     ///
     /// The rules exist in a fixed order and the order is the whole design: an explicit answer
@@ -609,5 +736,23 @@ mod tests {
         assert_eq!(c.clamp_settle(None), c.default_settle_ms);
         assert_eq!(c.clamp_settle(Some(999_999)), c.max_settle_ms);
         assert_eq!(c.clamp_settle(Some(50)), 50);
+    }
+
+    /// The hold has the same shape as the settle, and one thing the settle does not: it must
+    /// never come back as zero from the default path. Zero is not a short press, it is the
+    /// press-and-release-in-one-tick that a scanned machine key cannot see at all.
+    #[test]
+    fn hold_is_clamped_and_never_defaults_to_nothing() {
+        let c = Config::starter();
+        assert_eq!(c.clamp_hold(None), c.default_hold_ms);
+        assert!(c.default_hold_ms > 0, "a zero default is the bug this exists to prevent");
+        assert_eq!(c.clamp_hold(Some(999_999)), c.max_hold_ms);
+        assert_eq!(c.clamp_hold(Some(250)), 250);
+
+        // A config that asks for a ceiling below its own default is refused rather than
+        // silently clamping every press to the lower number.
+        let mut bad = Config::starter();
+        bad.max_hold_ms = 10;
+        assert!(bad.validate().is_err());
     }
 }

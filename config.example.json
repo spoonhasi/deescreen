@@ -18,6 +18,8 @@
   "allow_raw_clicks": false,
   "allow_raw_keys": false,
   "allow_profile_editing": false,
-  "default_settle_ms": 300,
-  "max_settle_ms": 10000
+  "default_settle_ms": 500,
+  "max_settle_ms": 10000,
+  "default_hold_ms": 80,
+  "max_hold_ms": 2000
 }

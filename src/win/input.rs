@@ -97,7 +97,7 @@ fn send(events: &[INPUT]) -> Result<(), String> {
 }
 
 /// Click at absolute screen coordinates. The target window has to be **brought to the front first**.
-pub fn click(sx: i32, sy: i32, button: Button, double: bool) -> Result<(), String> {
+pub fn click(sx: i32, sy: i32, button: Button, double: bool, hold_ms: u64) -> Result<(), String> {
     let (nx, ny) = normalize(sx, sy);
     let (down, up) = button.down_up();
 
@@ -116,12 +116,31 @@ pub fn click(sx: i32, sy: i32, button: Button, double: bool) -> Result<(), Strin
     // in one call is inserted serially and is never interspersed with the user's own input, so
     // placing and pressing inside one batch closes that window.
     let flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE;
-    let mut events = vec![mouse_event(down | flags, nx, ny), mouse_event(up | flags, nx, ny)];
+
+    // Down and up are sent as SEPARATE calls with a wait between them, so the contact is
+    // closed for a measurable length of time.
+    //
+    // They used to travel in one batch, which the system inserts back to back: the button was
+    // pressed and released inside the same tick. A Win32 button does not mind — it latches on
+    // the down and fires on the up. A simulated machine key does: something scans that contact
+    // on a cycle, and a press that exists for no measurable time is a press no scan ever sees.
+    // On NC Trainer2 plus that made CYCLE START do nothing whatsoever, while the very same
+    // coordinate showed the application reacting to the pointer arriving.
+    //
+    // The move above still shares the down's batch, so a person nudging the physical mouse
+    // during the hover pause cannot drag the press off target. Only the release is separated,
+    // and a release lands wherever the button already went down.
+    let press = |events: &[_]| send(events);
+    press(&[mouse_event(down | flags, nx, ny)])?;
+    std::thread::sleep(Duration::from_millis(hold_ms));
+    press(&[mouse_event(up | flags, nx, ny)])?;
     if double {
-        events.push(mouse_event(down | flags, nx, ny));
-        events.push(mouse_event(up | flags, nx, ny));
+        std::thread::sleep(Duration::from_millis(hold_ms.min(60)));
+        press(&[mouse_event(down | flags, nx, ny)])?;
+        std::thread::sleep(Duration::from_millis(hold_ms));
+        press(&[mouse_event(up | flags, nx, ny)])?;
     }
-    send(&events)
+    Ok(())
 }
 
 /// Modifiers plus one key — the result of parsing a string like `"ctrl+alt+f1"`.

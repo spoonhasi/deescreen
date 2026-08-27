@@ -57,6 +57,13 @@ pub struct ButtonDef {
     /// A settle time for this button alone (ms). Absent, the config default applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settle_ms: Option<u64>,
+    /// How long to hold this key down (ms). Absent, the default applies.
+    ///
+    /// A key that some ladder or poll reads on a cycle has to stay closed long enough to be
+    /// scanned at least once. Where a panel needs longer than the default, the number belongs
+    /// here — measured once, on that key, rather than remembered by every caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_ms: Option<u64>,
     /// A note for people, carried verbatim into the API responses. The AI calling this has to
     /// know what it is pressing, so do not leave it blank.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -402,6 +409,7 @@ mod tests {
                 click_button: default_click_button(),
                 double: false,
                 confirm: false,
+                hold_ms: None,
                 settle_ms: None,
                 note: String::new(),
             },
@@ -416,6 +424,7 @@ mod tests {
                 click_button: "right".into(),
                 double: true,
                 confirm: true,
+                hold_ms: Some(250),
                 settle_ms: Some(1500),
                 note: "undoing this needs a person at the machine".into(),
             },
@@ -555,6 +564,7 @@ mod tests {
                 click_button: "left".into(),
                 double: false,
                 confirm: false,
+                hold_ms: None,
                 settle_ms: None,
                 note: String::new(),
             });
