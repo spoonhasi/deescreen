@@ -165,7 +165,7 @@ the **button editor** in a browser. Right-click menu:
 
 | item | |
 |---|---|
-| `deescreen v0.4.0` / `http://127.0.0.1:8090` | display only |
+| `deescreen v0.4.1` / `http://127.0.0.1:8090` | display only |
 | **Open button editor** | same as double-click |
 | **Status (/health)** | is it in a state where it can act |
 | **Open settings folder** | the home directory — where `config.json`, `profiles/` and `logs/` actually are |

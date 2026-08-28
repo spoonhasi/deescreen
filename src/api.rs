@@ -924,6 +924,7 @@ pub async fn health(State(state): State<SharedState>) -> Response {
                 "reference_client": t.reference_client,
                 "on_size_mismatch": t.on_size_mismatch,
                 "window_spec": t.window,
+                "anchors": t.anchors.len(),
             });
             if size_check_is_inert(&t) {
                 problems.push(format!(
@@ -949,6 +950,36 @@ pub async fn health(State(state): State<SharedState>) -> Response {
                         ));
                     }
                     entry["window"] = window_json(&info);
+                    if !t.anchors.is_empty() {
+                        let found = crate::win::window::enumerate_controls(info.handle);
+                        entry["anchors"] = match t.anchor_offsets(&found.items) {
+                            Ok(offs) => {
+                                let moved: Vec<String> = offs
+                                    .iter()
+                                    .filter(|(_, (dx, dy))| *dx != 0 || *dy != 0)
+                                    .map(|(k, (dx, dy))| format!("{k} {dx:+},{dy:+}"))
+                                    .collect();
+                                if !moved.is_empty() {
+                                    // Not a problem: it is being corrected. But a layout that
+                                    // moves is worth saying out loud, because the same shift
+                                    // is silently wrong for anything NOT anchored.
+                                    log::info!(
+                                        "profile '{name}': layout moved, corrected by anchor — {}",
+                                        moved.join(", ")
+                                    );
+                                }
+                                json!({
+                                    "resolved": true,
+                                    "offsets": offs.iter().map(|(k, (dx, dy))| (k.clone(), json!([dx, dy]))).collect::<serde_json::Map<_, _>>(),
+                                    "moved": moved,
+                                })
+                            }
+                            Err(e) => {
+                                problems.push(format!("profile '{name}': {e}"));
+                                json!({"resolved": false, "error": e})
+                            }
+                        };
+                    }
                     entry["input"] = json!({
                         "our_elevation": our.as_str(),
                         "target_elevation": theirs.as_str(),
@@ -2165,6 +2196,11 @@ ENDPOINTS
                        everything there is to tune; only allowed_ips_read and
                        allowed_ips_write have no default, because who may reach and who may
                        control is not something this program will guess.
+                       For a profile with anchors, "anchors" says whether they resolve on
+                       the window as it is now and how far each has moved - the answer to
+                       "are the coordinates in this profile usable right now", before
+                       anything is pressed. An anchor that cannot be found is listed in
+                       "problems" as well.
                        "home" is where config.json, profiles/, captures/ and logs/ live on
                        that PC, and why that directory was chosen - the answer when a person
                        asks where their settings are. Moving them is theirs to do, not
@@ -2415,6 +2451,34 @@ EDITING A PROFILE FROM A PROGRAM
   refused - only for the elements belonging to that anchor. Using the saved numbers
   uncorrected is exactly what the anchor was added to prevent, so it is not a fallback.
 
+  WRITING ONE. Both numbers come straight from GET /controls - copy the "text" and the
+  "rect" of the container, unchanged. Pick one whose text and size are unique in that list;
+  if the only candidates share both, there is nothing here that can tell them apart and the
+  anchor will be refused as ambiguous rather than guessed at.
+
+    curl -s "{base}/controls?profile=NAME" | ... find the container
+
+  ADDING THEM TO A PROFILE THAT ALREADY HAS BUTTONS. Every element has to answer at once -
+  a save with some of them still blank is refused - so this is one PATCH, not many:
+
+    curl -s -X PATCH -H "Content-Type: application/json" -d '{{
+      "anchors": {{"screen": {{"text": "NC DISPLAY", "rect": [54,92,1104,818]}}}},
+      "buttons": {{"SOFTKEY_01": {{"anchor":"screen"}}, "SOFTKEY_02": {{"anchor":"screen"}}}},
+      "regions": {{"nc_display": {{"anchor":"screen"}}}} }}' \
+      "{base}/admin/profile?profile=NAME"
+
+  Merge patch only touches what it names, so every rect and note stays as it was. Miss one
+  button and the whole patch is refused with a count and the first few names - which is the
+  point: a half-anchored profile is the one that goes wrong quietly.
+
+  CHECK IT WITHOUT PRESSING ANYTHING. The overlay is drawn through the same correction the
+  presses use, so if the boxes sit on the keys, the anchor is working:
+
+    curl -s -o check.png "{base}/capture.png?profile=NAME&buttons=box"
+
+  Do it once, then restart the application so the layout moves, and do it again. Only both
+  together prove anything; one on its own may just be the layout that was measured.
+
   TAKING A CONFIRM FLAG OFF ASKS THE SAME WAY PRESSING WOULD. A save or patch that leaves
   a button without a "confirm" it used to have - flag cleared, or the whole button removed -
   is refused unless the request carries &confirm=true, and the refusal names the buttons.
@@ -2465,8 +2529,8 @@ TRAPS - these fail quietly or confusingly. Read once, save yourself an hour.
                    Nothing else notices this: the size check compares the window, which did
                    not change, and "hit" only asks whether a control is there. Wide keys still
                    take the press, narrow ones give it to a neighbour, so it looks like it
-                   works right up until it does not. Fix it with anchors (below) or by
-                   re-measuring. A profile with no "aim" in its reply has a rectangle that was
+                   works right up until it does not. Fix it with anchors - see
+                   WHEN AN APPLICATION MOVES ITS OWN LAYOUT above - or by re-measuring. A profile with no "aim" in its reply has a rectangle that was
                    drawn by hand rather than copied from a control, so there is nothing to
                    compare and this stays silent.
   press too short   The click reached a real, enabled control - "hit" proves that - and the
