@@ -165,7 +165,7 @@ the **button editor** in a browser. Right-click menu:
 
 | item | |
 |---|---|
-| `deescreen v0.3.0` / `http://127.0.0.1:8090` | display only |
+| `deescreen v0.4.0` / `http://127.0.0.1:8090` | display only |
 | **Open button editor** | same as double-click |
 | **Status (/health)** | is it in a state where it can act |
 | **Open settings folder** | the home directory — where `config.json`, `profiles/` and `logs/` actually are |
@@ -561,7 +561,9 @@ Two things are blocked at save time:
 | `"button:NAME"` | that saved button's own rectangle |
 | any other name | that rectangle from `regions` |
 
-Using `client` **as a region name** is refused (it would become a ghost that can never be
+Using `@client` **as a region name** is refused — and so is any name starting with `@`,
+which is reserved for values the server defines. A region called `@client` would be a ghost
+that can never be
 selected).
 
 **The request decides what to look at.** Buttons do not carry a default capture region — most
@@ -695,7 +697,7 @@ window_x = rect[0] + png_x / scale
 window_y = rect[1] + png_y / scale
 ```
 
-Capturing `client` needs no conversion at all — that image *is* the window's coordinate
+Capturing `@client` needs no conversion at all — that image *is* the window's coordinate
 system.
 
 ### Capturing a button, with a margin — `region=button:NAME` and `pad`
@@ -788,7 +790,7 @@ capture and **send the rectangle itself**; the centre gets pressed. Nothing is s
 curl -s -X POST -H "Content-Type: application/json" \
   -d '{"rect":[820,640,60,40]}' http://192.0.2.73:8090/click
 
-curl -s -X POST -o shot.png ".../click.png?rect=820,640,60,40&capture=client"
+curl -s -X POST -o shot.png ".../click.png?rect=820,640,60,40&capture=@client"
 ```
 
 `{"point":[850,660]}` works when you do not know the size. It follows the **same rule** as a
@@ -823,6 +825,71 @@ Key names: `a`–`z`, `0`–`9`, `f1`–`f24`, `numpad0`–`numpad9`, `enter` `e
 with `+` (`"ctrl+shift+f5"`).
 
 ---
+
+## When the application moves its own layout — anchors
+
+Some programs put their panel in a slightly different place each time they start. Measured on
+NC Trainer2 plus: every container moves **16 px sideways** between runs, in both directions,
+depending on how it was launched. The window is `1920×997` either way and every control keeps
+its size — only the origin differs.
+
+**Nothing else here can see that.** `reference_client` compares the window, which did not
+change. `hit` reports a real, enabled control, because there is one. A 44 px key still takes
+the press; a 32 px softkey hands it to its neighbour. It mostly works, which is what makes it
+worth a mechanism.
+
+Two things address it, and they are independent.
+
+### The reply says when a coordinate has drifted — `aim`
+
+Every press already looks up the control under the point. Comparing that control's rectangle
+with the one in the profile is free, needs nothing written in the file, and works whether or
+not anchors are in use:
+
+```json
+"aim": { "matches": false, "delta": [16, 0], "saved": [58,882,32,18], "found": [74,882,32,18] }
+```
+
+Same size in a different place is a **translation**, which is what a moved layout looks like.
+A *different* size means the rectangle was drawn by hand around a control rather than copied
+from one, so there is nothing to conclude and the field is absent rather than crying wolf.
+
+### The profile can correct it — `anchors`
+
+An anchor names a control that the coordinates around it were measured from:
+
+```json
+"anchors": { "screen": { "text": "NC DISPLAY", "rect": [54, 92, 1104, 818] } },
+"regions": { "nc_display": { "rect": [54,92,1104,818], "anchor": "screen" } },
+"buttons": {
+  "SOFTKEY_01": { "rect": [...], "anchor": "screen" },
+  "HEADER_TAB": { "rect": [...], "anchor": "@fixed" }
+}
+```
+
+Before anything is pressed or captured, that control is found on the window as it is now and
+everything belonging to it moves by the difference. **The file is never rewritten** — only the
+reading of it changes.
+
+**Matched on text and size together.** Not the class: an MFC window carries its module's load
+address in it, so it differs every run (`Afx:00D90000:3:…`, then `Afx:00F20000:8:…`). Not text
+alone: this panel has two containers called `OPERATION PANEL`, and they are told apart by being
+`328×238` and `708×238`. Size is precisely what a translation leaves untouched. And not "the
+one nearest to where it used to be" — that uses the possibly-stale rectangle to find the thing
+that would prove it stale, and fails hardest exactly when the drift is largest.
+
+**Declaring one anchor makes the whole profile answer.** Every button and region must then name
+an anchor or say `"@fixed"`. There is no third state: an element that says nothing stays behind
+while its neighbours move, and the ones that still work hide the one that does not. A profile
+with no anchors is untouched by any of this and needs none of it.
+
+If an anchor cannot be found — or two controls match its text *and* size — the request is
+refused, for the elements belonging to that anchor only. Falling back to the saved numbers is
+what the anchor exists to prevent, so it is not offered.
+
+> **Names never start with `@`.** That prefix is reserved for values the server defines:
+> `@client` is the whole client area, `@fixed` is an element that does not move. Reserving the
+> prefix rather than individual words means the next one costs nobody a rename.
 
 ## Known traps — every one of them fails silently, without an error
 
@@ -901,7 +968,7 @@ If a clock keeps forcing `changed` true, exclude that spot from the comparison:
 
 ```bash
 curl -s -X POST -H "Content-Type: application/json" \
-  -d '{"button":"cycle_start","capture":"client","ignore":[1180,8,90,20]}' .../click
+  -d '{"button":"cycle_start","capture":"@client","ignore":[1180,8,90,20]}' .../click
 ```
 
 `ignore` is accepted by `/click`, `/click.png` and `/key` (as `ignore=x,y,w,h` in a query).
@@ -1039,7 +1106,7 @@ that can press a button.
 ## Development
 
 ```bash
-cargo test          # 86 — coordinate math, crop/scale, overlays, key parsing, ACL classification, example schemas
+cargo test          # 89 — coordinate math, crop/scale, overlays, key parsing, ACL classification, example schemas
 cargo build --release
 ```
 

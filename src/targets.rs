@@ -32,6 +32,92 @@ pub enum SizeMismatch {
     Ignore,
 }
 
+/// Move a rectangle by an offset. Free function so `region` can use it before `impl Targets`.
+fn shift(r: Rect, by: (i32, i32)) -> Rect {
+    [r[0] + by.0, r[1] + by.1, r[2], r[3]]
+}
+
+/// A rectangle to capture, and which anchor its coordinates are measured from.
+///
+/// Accepts either shape on the way in:
+///
+/// ```json
+/// "status_bar": [0, 940, 1280, 60]                        // before anchors existed
+/// "status_bar": {"rect": [0, 940, 1280, 60], "anchor": "@fixed"}
+/// ```
+///
+/// The bare array keeps an existing profile loading. Saving always writes the object, so a
+/// profile that has been through one save can no longer be missing the answer.
+#[derive(Serialize, Clone, Debug)]
+pub struct RegionDef {
+    pub rect: Rect,
+    /// An anchor name, or `"@fixed"`. Empty only in a profile that declares no anchors.
+    #[serde(default)]
+    pub anchor: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+impl<'de> Deserialize<'de> for RegionDef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Full {
+            rect: Rect,
+            #[serde(default)]
+            anchor: String,
+            #[serde(default)]
+            note: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Shape {
+            Bare(Rect),
+            Full(Full),
+        }
+        // The untagged enum only ever sees two shapes here — an array or an object — and serde
+        // reports the object's own field errors when it is one, so the message stays specific.
+        Ok(match Shape::deserialize(d)? {
+            Shape::Bare(rect) => RegionDef { rect, anchor: String::new(), note: String::new() },
+            Shape::Full(f) => RegionDef { rect: f.rect, anchor: f.anchor, note: f.note },
+        })
+    }
+}
+
+/// A control the coordinates around it are measured from.
+///
+/// Some applications move their whole layout between runs without changing their window size.
+/// NC Trainer2 plus shifts every container 16px sideways depending on how it was started; the
+/// window is the same size, the controls are the same size, and only the origin differs. No
+/// check based on the window can see that, and a 44px key still takes the press while a 32px
+/// one hands it to a neighbour — so it mostly works, and occasionally does the wrong thing
+/// without saying so.
+///
+/// An anchor is the fix: find this control now, compare where it is with where it was when the
+/// coordinates were written, and shift everything that belongs to it by the difference.
+///
+/// Matched on **text and size together**, and on neither alone. The class is useless here — an
+/// MFC window carries its module's load address in it, so it differs every run
+/// (`Afx:00D90000:3:…` then `Afx:00F20000:8:…`). Text alone is not enough either: this panel
+/// has two containers called `OPERATION PANEL`. Their sizes differ (328x238 and 708x238), and
+/// size is exactly what a translation leaves alone, so the pair identifies one control.
+///
+/// Deliberately not "the control nearest to where it used to be": that reasoning uses the
+/// possibly-stale rectangle to find the thing that would tell you it is stale, and fails
+/// exactly when the drift is largest.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct AnchorDef {
+    /// The control's window text, as `GET /controls` reports it.
+    pub text: String,
+    /// Where that control was when everything else here was measured — `[x, y, w, h]`. The size
+    /// identifies it among same-named controls; the origin gives the offset to apply.
+    pub rect: Rect,
+    /// A note for people, like a button's.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ButtonDef {
@@ -57,6 +143,15 @@ pub struct ButtonDef {
     /// A settle time for this button alone (ms). Absent, the config default applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settle_ms: Option<u64>,
+    /// Which anchor this button's coordinates are measured from — an anchor name, or
+    /// `"@fixed"` for something that does not move with the rest.
+    ///
+    /// Required once the profile declares any anchor, and empty otherwise. There is no third
+    /// state: a button that has not answered cannot be saved, because the answer that gets
+    /// silently skipped is the one nobody checks afterwards. `"@fixed"` is a statement someone
+    /// made, not an absence.
+    #[serde(default)]
+    pub anchor: String,
     /// How long to hold this key down (ms). Absent, the default applies.
     ///
     /// A key that some ladder or poll reads on a cycle has to stay closed long enough to be
@@ -95,8 +190,16 @@ pub struct Targets {
     pub on_size_mismatch: SizeMismatch,
     /// Named capture regions. Capturing the whole screen every time is expensive, and what is
     /// usually needed is one line of the status bar.
+    /// Controls that the coordinates in this profile are measured from, by name.
+    ///
+    /// Empty is the ordinary case: the application keeps its layout still, every coordinate
+    /// means what it says, and nothing here applies. Declaring even one turns the whole
+    /// profile strict — every button and region must then say which anchor it belongs to, or
+    /// `"@fixed"`. Half-answered is the state that would be quietly wrong, so it is refused.
     #[serde(default, deserialize_with = "crate::config::no_duplicate_keys")]
-    pub regions: BTreeMap<String, Rect>,
+    pub anchors: BTreeMap<String, AnchorDef>,
+    #[serde(default, deserialize_with = "crate::config::no_duplicate_keys")]
+    pub regions: BTreeMap<String, RegionDef>,
     /// Everything that can be pressed. **A coordinate that is not here cannot be pressed.**
     #[serde(default, deserialize_with = "crate::config::no_duplicate_keys")]
     pub buttons: BTreeMap<String, ButtonDef>,
@@ -145,16 +248,91 @@ impl Targets {
             crate::win::input::parse_chord(spec)
                 .map_err(|e| format!("key '{name}': {e}"))?;
         }
+        // Anchors, and who belongs to which.
+        //
+        // A profile with no anchors is the ordinary case and nothing here applies. One anchor
+        // makes the whole profile strict: an element that has not said where its coordinates
+        // come from would be left behind when everything else moves, pressing the place its
+        // neighbours used to be. Half-corrected is worse than uncorrected, because the half
+        // that works hides the half that does not.
+        if !self.anchors.is_empty() {
+            for (name, a) in &self.anchors {
+                check_name("anchor", name)?;
+                if a.text.trim().is_empty() {
+                    return Err(format!(
+                        "anchor '{name}' has no text. An anchor is found by the control's text \
+                         and size together; the class cannot be used because an MFC window puts \
+                         its module load address in it and that changes every run."
+                    ));
+                }
+                if a.rect[2] <= 0 || a.rect[3] <= 0 {
+                    return Err(format!("anchor '{name}': rect must have positive width/height"));
+                }
+            }
+
+            let known = |who: &str, name: &str, anchor: &str| -> Result<(), String> {
+                if anchor.is_empty() {
+                    return Err(format!(
+                        "{who} '{name}' does not say which anchor it belongs to. This profile \
+                         declares anchors ({}), so every button and region must name one or say \
+                         \"@fixed\" for something that does not move. There is no third answer: \
+                         an element left unanswered is one that silently stays put while the \
+                         rest of the panel moves.",
+                        self.anchors.keys().cloned().collect::<Vec<_>>().join(", ")
+                    ));
+                }
+                if anchor != "@fixed" && !self.anchors.contains_key(anchor) {
+                    return Err(format!(
+                        "{who} '{name}' names anchor '{anchor}', which this profile does not \
+                         define. Known anchors: {}. Or \"@fixed\" if it does not move.",
+                        self.anchors.keys().cloned().collect::<Vec<_>>().join(", ")
+                    ));
+                }
+                Ok(())
+            };
+            // Report the count before the first name: on a 140-button panel the useful fact is
+            // how much is left to do, not which one happened to sort first.
+            let missing: Vec<&String> = self
+                .buttons
+                .iter()
+                .filter(|(_, b)| b.anchor.is_empty())
+                .map(|(n, _)| n)
+                .chain(self.regions.iter().filter(|(_, r)| r.anchor.is_empty()).map(|(n, _)| n))
+                .collect();
+            if missing.len() > 1 {
+                let shown: Vec<&str> = missing.iter().take(5).map(|s| s.as_str()).collect();
+                return Err(format!(
+                    "{} buttons and regions do not say which anchor they belong to, starting \
+                     with: {}. This profile declares anchors ({}), so every one of them must \
+                     name an anchor or say \"@fixed\".",
+                    missing.len(),
+                    shown.join(", "),
+                    self.anchors.keys().cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            for (name, b) in &self.buttons {
+                known("button", name, &b.anchor)?;
+            }
+            for (name, r) in &self.regions {
+                known("region", name, &r.anchor)?;
+            }
+        }
+
         for (name, r) in &self.regions {
-            if r[2] <= 0 || r[3] <= 0 {
+            if r.rect[2] <= 0 || r.rect[3] <= 0 {
                 return Err(format!("region '{name}': must have positive width/height"));
             }
-            // `client` (the whole client area) is reserved. A region with that name becomes a
-            // ghost that can never be selected — left alone it turns into "I definitely made
-            // it and it never appears", so it is blocked where the name is made.
+            // A region called `client` was the old spelling of the whole client area, and it
+            // was reserved with nothing to show for it — an ordinary word that happened to be
+            // taken. It is `@client` now, so this name is free; a region using it would only
+            // ever be a ghost under the old rule.
             if name == "client" {
                 return Err(format!(
-                    "region name '{name}' is reserved ('client' means the whole client area). Pick another name."
+                    "region name '{name}' was the old spelling of the whole client area, which is \
+                     now '@client'. The bare word is free to use as a name, but a profile written \
+                     against the old spelling almost certainly means the whole client area - so \
+                     this is refused once, deliberately, rather than silently becoming an \
+                     ordinary region. Rename it, or use '@client' where you meant the whole area."
                 ));
             }
         }
@@ -189,10 +367,88 @@ impl Targets {
         Ok(())
     }
 
-    /// Look up a region by name. `"client"` is built in and means the whole client area.
-    pub fn region(&self, name: &str, client: (i32, i32)) -> Result<Rect, String> {
-        if name.is_empty() || name == "client" {
+    /// Match each declared anchor against the controls on screen and give back how far each
+    /// has moved.
+    ///
+    /// `Err` for an anchor that cannot be resolved. Falling back to the saved coordinates
+    /// would be the worst answer available: the profile said these numbers need correcting,
+    /// and using them uncorrected is precisely the silent mistake the anchor was added to
+    /// prevent. Only the elements belonging to that anchor are affected — an unrelated part of
+    /// the panel keeps working.
+    pub fn anchor_offsets(
+        &self,
+        controls: &[crate::win::window::ControlInfo],
+    ) -> Result<std::collections::HashMap<String, (i32, i32)>, String> {
+        let mut out = std::collections::HashMap::new();
+        for (name, a) in &self.anchors {
+            let want = (a.rect[2], a.rect[3]);
+            let found: Vec<&crate::win::window::ControlInfo> = controls
+                .iter()
+                .filter(|c| c.text.trim() == a.text.trim() && (c.rect[2], c.rect[3]) == want)
+                .collect();
+            match found.as_slice() {
+                [c] => {
+                    out.insert(name.clone(), (c.rect[0] - a.rect[0], c.rect[1] - a.rect[1]));
+                }
+                [] => {
+                    let same_text = controls.iter().filter(|c| c.text.trim() == a.text.trim()).count();
+                    return Err(format!(
+                        "anchor '{name}' was not found: no control with text {:?} and size {}x{}. \
+                         {} control(s) carry that text. Either the application changed, or the \
+                         anchor's own rect is stale — it records the size as well as the place, \
+                         and the size is what identifies it.",
+                        a.text, want.0, want.1, same_text
+                    ));
+                }
+                more => {
+                    // Picking one would be a guess, and a wrong guess moves every coordinate
+                    // that belongs to this anchor. Refuse and say what would have to change.
+                    return Err(format!(
+                        "anchor '{name}' is ambiguous: {} controls have text {:?} AND size {}x{}. \
+                         Text and size together are supposed to identify one control. Anchor a \
+                         different container that is unique, or give this one a size that is.",
+                        more.len(), a.text, want.0, want.1
+                    ));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The offset an element with this anchor value should be shifted by.
+    ///
+    /// `"@fixed"` and an empty value both mean no shift — the first because somebody said so,
+    /// the second because this profile has no anchors at all. Validation is what keeps those
+    /// two from being confused; by the time a profile is in use, an empty value can only mean
+    /// the second.
+    pub fn offset_for(offsets: &std::collections::HashMap<String, (i32, i32)>, anchor: &str) -> (i32, i32) {
+        if anchor.is_empty() || anchor == "@fixed" {
+            return (0, 0);
+        }
+        offsets.get(anchor).copied().unwrap_or((0, 0))
+    }
+
+    /// Look up a region by name, already shifted by its anchor. `"@client"` is built in and
+    /// means the whole client area, which by definition does not move with anything.
+    pub fn region(
+        &self,
+        name: &str,
+        client: (i32, i32),
+        offsets: &std::collections::HashMap<String, (i32, i32)>,
+    ) -> Result<Rect, String> {
+        if name.is_empty() || name == "@client" {
             return Ok([0, 0, client.0, client.1]);
+        }
+        // The old spelling. It was a bare word that happened to be taken, which is exactly what
+        // the `@` prefix exists to stop; a caller still sending it means the whole client area,
+        // so say that rather than "unknown region" and let them fix it in one edit.
+        if name == "client" {
+            return Err(
+                "region 'client' is now '@client'. Reserved values all start with '@' so that a \
+                 name can never collide with one - the bare word is an ordinary name now, and \
+                 this profile has no region called that."
+                    .to_string(),
+            );
         }
         // `button:NAME` captures a saved button's own rectangle.
         //
@@ -205,15 +461,15 @@ impl Targets {
             return self
                 .buttons
                 .get(b)
-                .map(|t| t.rect)
+                .map(|t| shift(t.rect, Self::offset_for(offsets, &t.anchor)))
                 .ok_or_else(|| format!("unknown button '{b}' in capture region 'button:{b}' (known: {})",
                                        self.button_names()));
         }
         self.regions
             .get(name)
-            .copied()
+            .map(|r| shift(r.rect, Self::offset_for(offsets, &r.anchor)))
             .ok_or_else(|| format!(
-                "unknown capture region '{name}' (known: client, {}; or button:NAME for a button's own rect)",
+                "unknown capture region '{name}' (known: @client, {}; or button:NAME for a button's own rect)",
                 self.region_names()
             ))
     }
@@ -263,8 +519,12 @@ impl Targets {
         }
     }
 
-    /// Where a button gets pressed (client coordinates), at the factor `coordinate_scale` gave.
-    pub fn click_point(t: &ButtonDef, scale: (f64, f64)) -> (i32, i32) {
+    /// Where a button gets pressed (client coordinates), at the factor `coordinate_scale`
+    /// gave and shifted by its anchor.
+    ///
+    /// The offset is applied after the scale, in whole pixels, because it is measured on the
+    /// live window — it is already in the coordinates being pressed, not in the saved ones.
+    pub fn click_point(t: &ButtonDef, scale: (f64, f64), by: (i32, i32)) -> (i32, i32) {
         let (x, y) = match t.point {
             Some([px, py]) => (px as f64, py as f64),
             None => {
@@ -272,7 +532,13 @@ impl Targets {
                 (rx as f64 + rw as f64 / 2.0, ry as f64 + rh as f64 / 2.0)
             }
         };
-        ((x * scale.0).round() as i32, (y * scale.1).round() as i32)
+        ((x * scale.0).round() as i32 + by.0, (y * scale.1).round() as i32 + by.1)
+    }
+
+    /// Move a rectangle by an anchor's offset. Sizes never change: the whole reason an
+    /// anchor can be trusted is that what it corrects is a translation.
+    pub fn shift_rect(r: Rect, by: (i32, i32)) -> Rect {
+        [r[0] + by.0, r[1] + by.1, r[2], r[3]]
     }
 
     /// Apply the factor to a rectangle.
@@ -314,9 +580,21 @@ pub fn move_profile_files(from: &Path, to: &Path) -> Result<(), String> {
 /// encode those and **the URL itself breaks, loudly**, rather than quietly becoming something
 /// else. So what is blocked is exactly "characters that silently mean something else", and the
 /// list below is that reason, one entry at a time.
+/// Values that mean something to the server rather than naming something in the profile.
+/// They all begin with `@`, and no name may, so the two can never be confused.
+pub const RESERVED_PREFIX: char = '@';
+
 fn check_name(kind: &str, name: &str) -> Result<(), String> {
     if name.trim().is_empty() {
         return Err(format!("a {kind} name must not be empty or whitespace"));
+    }
+    if name.starts_with(RESERVED_PREFIX) {
+        return Err(format!(
+            "{kind} name '{name}' starts with '{RESERVED_PREFIX}', which is reserved for values \
+             the server defines - '@client' is the whole client area, '@fixed' is an element \
+             that does not move. Reserving the whole prefix rather than individual words means \
+             a name can never collide with one, now or later. Pick a name without it."
+        ));
     }
     if name.chars().count() > 64 {
         return Err(format!("{kind} name '{name}' is longer than 64 characters"));
@@ -397,6 +675,7 @@ mod tests {
             window: WindowSpec { title: "Sample".into(), title_exact: false, class: String::new() },
             reference_client: Some([1280, 1000]),
             on_size_mismatch: SizeMismatch::Reject,
+            anchors: BTreeMap::new(),
             regions: BTreeMap::new(),
             buttons: BTreeMap::new(),
             keys: BTreeMap::new(),
@@ -409,7 +688,8 @@ mod tests {
                 click_button: default_click_button(),
                 double: false,
                 confirm: false,
-                hold_ms: None,
+        anchor: String::new(),
+        hold_ms: None,
                 settle_ms: None,
                 note: String::new(),
             },
@@ -424,12 +704,13 @@ mod tests {
                 click_button: "right".into(),
                 double: true,
                 confirm: true,
-                hold_ms: Some(250),
+        anchor: "@fixed".into(),
+        hold_ms: Some(250),
                 settle_ms: Some(1500),
                 note: "undoing this needs a person at the machine".into(),
             },
         );
-        t.regions.insert("status_bar".into(), [0, 940, 1280, 60]);
+        t.regions.insert("status_bar".into(), RegionDef { rect: [0, 940, 1280, 60], anchor: String::new(), note: String::new() });
         t.keys.insert("reset".into(), "escape".into());
         t
     }
@@ -515,7 +796,7 @@ mod tests {
         assert_eq!(s, (2.0, 2.0));
         let target = &t.buttons["cycle_start"];
         // the centre of rect [820,640,60,40] is (850, 660), doubled
-        assert_eq!(Targets::click_point(target, s), (1700, 1320));
+        assert_eq!(Targets::click_point(target, s, (0, 0)), (1700, 1320));
     }
 
     /// Two identical names have to die **at parse time**. Left alone, the later replaces the
@@ -564,7 +845,8 @@ mod tests {
                 click_button: "left".into(),
                 double: false,
                 confirm: false,
-                hold_ms: None,
+        anchor: String::new(),
+        hold_ms: None,
                 settle_ms: None,
                 note: String::new(),
             });
@@ -661,7 +943,7 @@ mod tests {
     #[test]
     fn click_point_defaults_to_rect_center() {
         let t = sample();
-        assert_eq!(Targets::click_point(&t.buttons["cycle_start"], (1.0, 1.0)), (850, 660));
+        assert_eq!(Targets::click_point(&t.buttons["cycle_start"], (1.0, 1.0), (0, 0)), (850, 660));
     }
 
     #[test]
@@ -692,14 +974,133 @@ mod tests {
         );
     }
 
+    /// Anchors: what identifies one, and what happens when nothing does.
+    ///
+    /// Built from the real thing. NC Trainer2 plus has two containers called
+    /// `OPERATION PANEL`, and the whole layout moves 16px sideways between runs while every
+    /// size stays the same. Text alone cannot tell the two apart; size can, and size is
+    /// exactly what a translation leaves untouched.
+    #[test]
+    fn an_anchor_is_found_by_text_and_size_together() {
+        let ctl = |text: &str, rect: Rect| crate::win::window::ControlInfo {
+            class: "Afx:00F20000:3:00000000:0B100968:0".into(),
+            text: text.into(),
+            id: 0,
+            rect,
+            depth: 2,
+            visible: true,
+        };
+        // State B, 16px left of where the profile was measured.
+        let live = vec![
+            ctl("NC DISPLAY", [38, 92, 1104, 818]),
+            ctl("OPERATION PANEL", [1142, 384, 328, 238]),
+            ctl("OPERATION PANEL", [1142, 622, 708, 238]),
+            ctl("NC KEYBOARD", [1470, 92, 316, 530]),
+        ];
+
+        let mut t = sample();
+        t.anchors.insert(
+            "screen".into(),
+            AnchorDef { text: "NC DISPLAY".into(), rect: [54, 92, 1104, 818], note: String::new() },
+        );
+        // The narrower of the two same-named panels, told apart by its size alone.
+        t.anchors.insert(
+            "sub".into(),
+            AnchorDef {
+                text: "OPERATION PANEL".into(),
+                rect: [1158, 384, 328, 238],
+                note: String::new(),
+            },
+        );
+
+        let off = t.anchor_offsets(&live).expect("both resolve");
+        assert_eq!(off["screen"], (-16, 0));
+        assert_eq!(off["sub"], (-16, 0), "the 328-wide panel, not the 708-wide one");
+
+        // "@fixed" and an unanchored profile both mean stay put.
+        assert_eq!(Targets::offset_for(&off, "@fixed"), (0, 0));
+        assert_eq!(Targets::offset_for(&off, ""), (0, 0));
+        assert_eq!(Targets::offset_for(&off, "screen"), (-16, 0));
+
+        // Gone: the size no longer matches anything with that text.
+        let mut stale = t.clone();
+        stale.anchors.get_mut("screen").expect("there").rect = [54, 92, 999, 818];
+        let e = stale.anchor_offsets(&live).expect_err("not found");
+        assert!(e.contains("not found"), "{e}");
+        assert!(e.contains("1 control"), "says how many carry the text: {e}");
+
+        // Ambiguous: two controls match text AND size, so refuse rather than pick one.
+        let twins = vec![
+            ctl("OPERATION PANEL", [1142, 384, 328, 238]),
+            ctl("OPERATION PANEL", [1142, 900, 328, 238]),
+        ];
+        let mut only_sub = sample();
+        only_sub.anchors.insert(
+            "sub".into(),
+            AnchorDef {
+                text: "OPERATION PANEL".into(),
+                rect: [1158, 384, 328, 238],
+                note: String::new(),
+            },
+        );
+        let e = only_sub.anchor_offsets(&twins).expect_err("ambiguous");
+        assert!(e.contains("ambiguous"), "{e}");
+    }
+
+    /// Declaring one anchor makes the whole profile answer for itself.
+    ///
+    /// The half-answered profile is the one worth refusing: the elements that named an anchor
+    /// move with the panel, the ones that said nothing stay behind, and the ones that still
+    /// work hide the ones that do not.
+    #[test]
+    fn an_anchored_profile_leaves_nothing_unanswered() {
+        let mut t = sample();
+        assert!(t.validate().is_ok(), "no anchors, nothing to answer");
+
+        t.anchors.insert(
+            "screen".into(),
+            AnchorDef { text: "NC DISPLAY".into(), rect: [54, 92, 1104, 818], note: String::new() },
+        );
+        let e = t.validate().expect_err("now everything must say");
+        assert!(e.contains("anchor"), "{e}");
+
+        // Answer everything and it passes; "@fixed" is as valid an answer as a name.
+        for b in t.buttons.values_mut() {
+            b.anchor = "screen".into();
+        }
+        for r in t.regions.values_mut() {
+            r.anchor = "@fixed".into();
+        }
+        t.validate().expect("fully answered");
+
+        // A name that is not defined is refused, and the message lists what is.
+        t.buttons.values_mut().next().expect("one").anchor = "nope".into();
+        let e = t.validate().expect_err("unknown anchor");
+        assert!(e.contains("nope") && e.contains("screen"), "{e}");
+    }
+
     /// A reserved word as a region name makes that region unselectable forever — blocked
     /// where the name is made.
     #[test]
     fn reserved_region_names_are_rejected() {
+        // Anything starting with '@' is the server's to define, so a name can never be one.
+        for name in ["@client", "@fixed", "@anything"] {
+            let mut t = sample();
+            t.regions.insert(name.to_string(), RegionDef { rect: [0, 0, 10, 10], anchor: String::new(), note: String::new() });
+            let err = t.validate().expect_err("a name starting with @ must be rejected");
+            assert!(err.contains("reserved"), "{err}");
+        }
+        // Buttons and keys live in the same namespace rule.
         let mut t = sample();
-        t.regions.insert("client".to_string(), [0, 0, 10, 10]);
-        let err = t.validate().expect_err("reserved name must be rejected");
-        assert!(err.contains("reserved"), "{err}");
+        t.buttons.insert("@fixed".to_string(), t.buttons.values().next().expect("one").clone());
+        assert!(t.validate().is_err(), "a button may not start with @ either");
+
+        // The old bare word is refused once rather than quietly becoming an ordinary region:
+        // a profile using it almost certainly meant the whole client area.
+        let mut t = sample();
+        t.regions.insert("client".to_string(), RegionDef { rect: [0, 0, 10, 10], anchor: String::new(), note: String::new() });
+        let err = t.validate().expect_err("the old spelling is refused");
+        assert!(err.contains("@client"), "and says what to use instead: {err}");
     }
 
     /// `button:NAME` captures a button's own rectangle, and `pad` grows it.
@@ -710,11 +1111,11 @@ mod tests {
     #[test]
     fn a_button_can_be_captured_by_name_with_a_margin() {
         let t = sample();
-        assert_eq!(t.region("button:cycle_start", (1280, 1000)).expect("by name"), [820, 640, 60, 40]);
+        assert_eq!(t.region("button:cycle_start", (1280, 1000), &Default::default()).expect("by name"), [820, 640, 60, 40]);
 
         // pad grows every side, so the width and height gain twice the padding.
         assert_eq!(
-            Targets::pad_rect(t.region("button:cycle_start", (1280, 1000)).unwrap(), 25),
+            Targets::pad_rect(t.region("button:cycle_start", (1280, 1000), &Default::default()).unwrap(), 25),
             [795, 615, 110, 90]
         );
         assert_eq!(Targets::pad_rect([10, 10, 5, 5], 0), [10, 10, 5, 5]);
@@ -723,18 +1124,23 @@ mod tests {
         assert_eq!(Targets::pad_rect([2, 2, 10, 10], 5), [-3, -3, 20, 20]);
 
         // An unknown button says so, and says it is a button it could not find.
-        let e = t.region("button:nope", (1280, 1000)).unwrap_err();
+        let e = t.region("button:nope", (1280, 1000), &Default::default()).unwrap_err();
         assert!(e.contains("unknown button 'nope'"), "{e}");
         // A plain unknown region points at both ways of naming one.
-        let e = t.region("nope", (1280, 1000)).unwrap_err();
+        let e = t.region("nope", (1280, 1000), &Default::default()).unwrap_err();
         assert!(e.contains("button:NAME"), "{e}");
     }
 
     #[test]
     fn client_region_is_built_in() {
         let t = sample();
-        assert_eq!(t.region("client", (800, 600)).expect("client"), [0, 0, 800, 600]);
-        assert_eq!(t.region("", (800, 600)).expect("default"), [0, 0, 800, 600]);
-        assert!(t.region("nope", (800, 600)).is_err());
+        assert_eq!(t.region("@client", (800, 600), &Default::default()).expect("@client"), [0, 0, 800, 600]);
+        assert_eq!(t.region("", (800, 600), &Default::default()).expect("default"), [0, 0, 800, 600]);
+        assert!(t.region("nope", (800, 600), &Default::default()).is_err());
+
+        // The old spelling does not resolve, and the error names the new one rather than
+        // saying "unknown region" to somebody who is asking for exactly the right thing.
+        let err = t.region("client", (800, 600), &Default::default()).expect_err("the old spelling is gone");
+        assert!(err.contains("@client"), "{err}");
     }
 }

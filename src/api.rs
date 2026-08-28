@@ -689,6 +689,7 @@ fn apply_overlay(
     defs: Option<&Targets>,
     coord_scale: (f64, f64),
     client: (i32, i32),
+    offsets: &AnchorOffsets,
 ) -> Value {
     let mut drawn = json!({});
 
@@ -713,7 +714,7 @@ fn apply_overlay(
         let mut labels: Vec<(i32, i32, i32, i32, String, draw::Color)> = Vec::new();
 
         for (name, r) in &t.regions {
-            let s = Targets::scale_rect(*r, coord_scale);
+            let s = Targets::scale_rect(r.rect, coord_scale);
             // Finish the coordinate conversion first — calling `frame.map_len` while holding
             // `&mut frame.image` would borrow the same value mutably and immutably at once.
             let (x, y) = frame.map(s[0], s[1]);
@@ -727,8 +728,9 @@ fn apply_overlay(
         // no legend table has to be sent, and why these two iterations diverging would be
         // quietly wrong.
         for (i, (name, tg)) in t.buttons.iter().enumerate() {
-            let s = Targets::scale_rect(tg.rect, coord_scale);
-            let (px, py) = Targets::click_point(tg, coord_scale);
+            let by = Targets::offset_for(offsets, &tg.anchor);
+            let s = Targets::shift_rect(Targets::scale_rect(tg.rect, coord_scale), by);
+            let (px, py) = Targets::click_point(tg, coord_scale, by);
             // Buttons that fell outside the client area get a loud colour — this is the
             // whole point of checking
             let off = px < 0 || py < 0 || px >= client.0 || py >= client.1;
@@ -1220,8 +1222,9 @@ fn capture_with(
 ) -> Result<(Vec<u8>, Value, Value), ApiError> {
     let defs_for_lookup = defs.unwrap_or(live);
     let (info, coord_scale, size_warning) = bind_window_view(defs_for_lookup)?;
+    let offsets = anchor_offsets(defs_for_lookup, &info)?;
 
-    let region_name = req.region.clone().unwrap_or_else(|| "client".to_string());
+    let region_name = req.region.clone().unwrap_or_else(|| "@client".to_string());
     // `pad` grows the region on every side. A toggle's lamp usually sits just outside its
     // button, so `region=button:NAME&pad=25` is what you actually want to look at — and doing
     // that arithmetic in the caller means doing it against numbers the server already holds.
@@ -1230,7 +1233,7 @@ fn capture_with(
         Some(r) => Targets::pad_rect(r, pad),
         None => Targets::scale_rect(
             Targets::pad_rect(
-                defs_for_lookup.region(&region_name, info.client_size).map_err(|e| {
+                defs_for_lookup.region(&region_name, info.client_size, &offsets).map_err(|e| {
                     ApiError::bad_request(e)
                         .with_detail(json!({"known_regions": defs_for_lookup.region_names()}))
                 })?,
@@ -1251,7 +1254,7 @@ fn capture_with(
     let drawn = if overlay.is_empty() {
         Value::Null
     } else {
-        apply_overlay(&mut frame, &overlay, Some(defs_for_lookup), coord_scale, info.client_size)
+        apply_overlay(&mut frame, &overlay, Some(defs_for_lookup), coord_scale, info.client_size, &offsets)
     };
 
     // ?mark=x,y means "let me check this coordinate before pressing". If so, what sits under
@@ -1425,6 +1428,64 @@ fn confirm_flags_lost(before: &Targets, after: &Targets) -> Vec<String> {
         .filter(|(name, _)| after.buttons.get(*name).is_none_or(|now| !now.confirm))
         .map(|(name, _)| name.clone())
         .collect()
+}
+
+/// Where each anchor's contents have to move, for this window as it is right now.
+///
+/// Enumerating controls costs a few milliseconds, so a profile with no anchors never pays it —
+/// which is every profile that existed before anchors did.
+fn anchor_offsets(t: &Targets, info: &crate::win::window::WindowInfo) -> Result<AnchorOffsets, ApiError> {
+    if t.anchors.is_empty() {
+        return Ok(AnchorOffsets::new());
+    }
+    let found = crate::win::window::enumerate_controls(info.handle);
+    t.anchor_offsets(&found.items).map_err(|e| {
+        ApiError::new(StatusCode::CONFLICT, e).with_detail(json!({
+            "why": "this profile's coordinates are recorded relative to a control, and that \
+                   control could not be identified on the window as it is now. Using the saved \
+                   numbers uncorrected is what the anchor exists to prevent, so nothing was \
+                   pressed or captured.",
+            "hint": "GET /controls lists what is actually there, with text and size. Update the \
+                     anchor's rect if the application changed, or anchor a container whose text \
+                     and size are unique.",
+            "controls_seen": found.items.len(),
+        }))
+    })
+}
+
+type AnchorOffsets = std::collections::HashMap<String, (i32, i32)>;
+
+/// Whether the control under the press sits where the profile says it does.
+///
+/// Only a same-sized control in a different place says anything. That is a translation, which
+/// is what a layout shift looks like: the application moved its panel and the coordinates in
+/// the file are all off by one constant. A different size means the saved rectangle was drawn
+/// around something rather than copied from it — common in a hand-made profile — so there is
+/// no claim to check and this returns nothing rather than crying wolf.
+fn aim_json(saved: Option<Rect>, hit: Option<&crate::win::window::ControlHit>) -> Option<Value> {
+    let (saved, hit) = (saved?, hit?);
+    if hit.is_window_itself {
+        return None;
+    }
+    let live = hit.rect;
+    if live[2] != saved[2] || live[3] != saved[3] {
+        return None;
+    }
+    let (dx, dy) = (live[0] - saved[0], live[1] - saved[1]);
+    if dx == 0 && dy == 0 {
+        return Some(json!({"matches": true}));
+    }
+    Some(json!({
+        "matches": false,
+        "delta": [dx, dy],
+        "saved": saved,
+        "found": live,
+        "note": "the control here is the same size as the saved rectangle but not in the same \
+                 place, so this application has moved its layout without changing its window \
+                 size. Every coordinate in this profile is off by that delta. Wide keys still \
+                 take the press; narrow ones give it to a neighbour, which is why this can look \
+                 like it works.",
+    }))
 }
 
 /// What to say when a caller names something that is not there.
@@ -2012,7 +2073,7 @@ PRESS SOMETHING THAT IS NOT A SAVED BUTTON
 
   curl -s -X POST -H "Content-Type: application/json" \
     -d '{{"rect":[820,640,60,40]}}' {base}/click
-  curl -s -X POST -o shot.png "{base}/click.png?rect=820,640,60,40&capture=client"
+  curl -s -X POST -o shot.png "{base}/click.png?rect=820,640,60,40&capture=@client"
 
   `point` works too when you do not know the size: {{"point":[850,660]}}.
   This needs allow_raw_clicks in config.json - /health reports whether it is on, and
@@ -2069,7 +2130,12 @@ LOOK AT SOMETHING
   `capture=button` with no name means the button you just pressed (the last one, for a
   sequence), so you do not have to write it twice.
 
-  Region names and their absolute rects come from GET /regions (or /profiles). "client" is reserved and means the whole
+  NAMES NEVER START WITH "@". That prefix is reserved for values the server defines, so a
+  name can never collide with one: "@client" is the whole client area, "@fixed" is an element
+  that does not move with an anchor. Reserving the prefix rather than individual words means
+  the next such value costs nobody a rename.
+
+  Region names and their absolute rects come from GET /regions (or /profiles). "@client" is reserved and means the whole
   client area. A capture attached to a click costs two renders (before and after), so
   ask for one when you intend to look.
 
@@ -2086,7 +2152,7 @@ LOOK AT SOMETHING
        window_x = rect[0] + png_x / scale
        window_y = rect[1] + png_y / scale
 
-  Capturing "client" (or omitting the region) needs no conversion at all - that image
+  Capturing "@client" (or omitting the region) needs no conversion at all - that image
   already is the window's coordinate system.
 
 ENDPOINTS
@@ -2314,6 +2380,41 @@ EDITING A PROFILE FROM A PROGRAM
   stop with no confirmation required and answer "saved". Same for the config file, which
   refuses to start rather than run with a setting it did not understand.
 
+  WHEN AN APPLICATION MOVES ITS OWN LAYOUT - ANCHORS
+  Some programs put their panel in a slightly different place each time they start. The
+  window is the same size, every control is the same size, and only the origin differs, so
+  no check based on the window can see it. Measured on NC Trainer2 plus: every container
+  moves 16px sideways between runs. A 44px key still takes the press; a 32px softkey hands
+  it to its neighbour. Mostly it works, which is what makes it dangerous.
+
+  An anchor records a control that the coordinates around it were measured from:
+
+    "anchors": {{
+      "screen": {{"text": "NC DISPLAY", "rect": [54, 92, 1104, 818]}}
+    }},
+    "regions": {{"nc_display": {{"rect": [54,92,1104,818], "anchor": "screen"}}}},
+    "buttons": {{"SOFTKEY_01": {{"rect": [...], "anchor": "screen"}},
+                "HEADER_TAB":  {{"rect": [...], "anchor": "@fixed"}}}}
+
+  Before anything is pressed or captured, that control is found on the window as it is now
+  and everything belonging to it moves by the difference. The file is never rewritten; only
+  the reading of it changes.
+
+  Matched on TEXT AND SIZE TOGETHER. Not the class - an MFC window carries its module's load
+  address in it, so it differs every run. Not text alone - this panel has two containers
+  called "OPERATION PANEL". Their sizes differ, and size is exactly what a translation leaves
+  alone. And not "the nearest one to where it used to be", which uses the stale rectangle to
+  find the thing that would prove it stale, and fails hardest when the drift is largest.
+
+  DECLARING ONE ANCHOR MAKES THE WHOLE PROFILE ANSWER. Every button and region must then name
+  an anchor or say "@fixed". There is no third state: an element that says nothing would stay
+  behind while its neighbours move, and the ones that still work would hide it. A profile
+  with no anchors at all is unaffected and needs none of this.
+
+  If an anchor cannot be found, or two controls match its text and size, the request is
+  refused - only for the elements belonging to that anchor. Using the saved numbers
+  uncorrected is exactly what the anchor was added to prevent, so it is not a fallback.
+
   TAKING A CONFIRM FLAG OFF ASKS THE SAME WAY PRESSING WOULD. A save or patch that leaves
   a button without a "confirm" it used to have - flag cleared, or the whole button removed -
   is refused unless the request carries &confirm=true, and the refusal names the buttons.
@@ -2357,6 +2458,17 @@ TRAPS - these fail quietly or confusingly. Read once, save yourself an hour.
   409 minimized    POST /window/focus.
   black capture    The console session is locked or RDP is disconnected. Nothing will
                    work until a human unlocks it. /health says so explicitly.
+  layout moved      "aim" in the reply says matches:false with a delta. The control at that
+                   point is the same SIZE as the rectangle in the profile but not in the same
+                   PLACE, so the application has moved its layout without changing its window
+                   size - and every coordinate in that profile is off by the same amount.
+                   Nothing else notices this: the size check compares the window, which did
+                   not change, and "hit" only asks whether a control is there. Wide keys still
+                   take the press, narrow ones give it to a neighbour, so it looks like it
+                   works right up until it does not. Fix it with anchors (below) or by
+                   re-measuring. A profile with no "aim" in its reply has a rectangle that was
+                   drawn by hand rather than copied from a control, so there is nothing to
+                   compare and this stays silent.
   press too short   The click reached a real, enabled control - "hit" proves that - and the
                    application did nothing at all. A panel key is read by a scan, so a press
                    shorter than one scan interval never happened as far as the machine is
@@ -2436,7 +2548,7 @@ pub async fn click_png(
 ) -> Result<Response, ApiError> {
     let mut req = ClickReq::from_query(&q)?;
     if req.capture.is_none() {
-        req.capture = Some("client".to_string());
+        req.capture = Some("@client".to_string());
     }
     let (png, result) = do_click(&state, req).await?;
     match png {
@@ -2461,6 +2573,10 @@ fn safe_label(region: &str) -> String {
 /// typo in element eight must not leave seven characters sitting in the machine.
 struct Press {
     name: String,
+    /// The rectangle the profile holds for this button, kept so the control actually found at
+    /// the point can be checked against it. `None` for coordinates sent by the request, where
+    /// there is no saved claim to check.
+    saved_rect: Option<Rect>,
     point: (i32, i32),
     button: Button,
     double: bool,
@@ -2572,6 +2688,7 @@ fn resolve_saved(
     name: &str,
     req: &ClickReq,
     scale: (f64, f64),
+    offsets: &AnchorOffsets,
 ) -> Result<Press, ApiError> {
     let tg = t.buttons.get(name).ok_or_else(|| {
         ApiError::not_found(format!("unknown button '{name}'"))
@@ -2585,7 +2702,9 @@ fn resolve_saved(
     }
     Ok(Press {
         name: name.to_string(),
-        point: Targets::click_point(tg, scale),
+        // Unscaled: the check compares against what the file holds, not a derived number.
+        saved_rect: Some(tg.rect),
+        point: Targets::click_point(tg, scale, Targets::offset_for(offsets, &tg.anchor)),
         button: Button::parse(req.click_button.as_deref().unwrap_or(&tg.click_button))
             .map_err(ApiError::bad_request)?,
         double: req.double.unwrap_or(tg.double),
@@ -2632,6 +2751,9 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
         precheck(&t, &req)?;
 
         let (info, scale) = bind_window(&t)?;
+        // Once per request, before any coordinate is used. An anchor that cannot be found
+        // stops everything here rather than letting some presses land corrected and others not.
+        let offsets = anchor_offsets(&t, &info)?;
 
         // ── work out what to press ── (this is the safety boundary: a name, or a refusal)
         let sequence = req.buttons.is_some();
@@ -2640,9 +2762,9 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
             // request; this only turns them into coordinates.
             (Some(names), _, _, _) => names
                 .iter()
-                .map(|n| resolve_saved(&st.config, &t, n, &req, scale))
+                .map(|n| resolve_saved(&st.config, &t, n, &req, scale, &offsets))
                 .collect::<Result<Vec<_>, _>>()?,
-            (None, Some(name), _, _) => vec![resolve_saved(&st.config, &t, name, &req, scale)?],
+            (None, Some(name), _, _) => vec![resolve_saved(&st.config, &t, name, &req, scale, &offsets)?],
 
             // ── a rectangle that was never saved ──
             // Controls that appear only on some screens cannot be on the named list. Read the
@@ -2661,6 +2783,7 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
                 let [rx, ry, rw, rh] = Targets::scale_rect(r, scale);
                 vec![Press {
                     name: format!("(rect {},{},{},{})", r[0], r[1], r[2], r[3]),
+                    saved_rect: None,
                     point: (rx + rw / 2, ry + rh / 2),
                     button: Button::parse(req.click_button.as_deref().unwrap_or("left"))
                         .map_err(ApiError::bad_request)?,
@@ -2678,6 +2801,7 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
                 }
                 vec![Press {
                     name: format!("(point {x},{y})"),
+                    saved_rect: None,
                     point: (
                         (x as f64 * scale.0).round() as i32,
                         (y as f64 * scale.1).round() as i32,
@@ -2761,7 +2885,7 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
             None => None,
             Some(r) => Some(Targets::scale_rect(
                 Targets::pad_rect(
-                    t.region(r, info.client_size).map_err(|e| {
+                    t.region(r, info.client_size, &offsets).map_err(|e| {
                         ApiError::bad_request(e)
                             .with_detail(json!({"known_regions": t.region_names()}))
                     })?,
@@ -2863,6 +2987,14 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
                 log::info!("{line}");
             }
 
+            if let Some(a) = aim_json(pr.saved_rect, hit.as_ref())
+                && a["matches"] == json!(false)
+            {
+                log::warn!(
+                    "CLICK profile={} target={} LAYOUT DRIFT — saved {:?}, control found at {:?}, delta {}",
+                    prof.name, pr.name, a["saved"], a["found"], a["delta"]
+                );
+            }
             last_hit = hit.clone();
             done.push(json!({
                 "index": i,
@@ -2873,6 +3005,8 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
                 "point": {"client": [pr.point.0, pr.point.1], "screen": [sx, sy]},
                 // Answers "did the press land on something", independent of pixels.
                 "hit": hit.as_ref().map(hit_json),
+                // Answers "is it still where the file says", which the hit alone cannot.
+                "aim": aim_json(pr.saved_rect, hit.as_ref()),
             }));
         }
 
@@ -2913,6 +3047,7 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
             // shows up first, so leaving the number out here made the manual's promise that
             // "every reply reports the hold that was actually used" false where it mattered.
             result["hold_ms"] = json!(presses[0].hold_ms);
+            result["aim"] = last["aim"].clone();
             result["point"] = last["point"].clone();
             result["hit"] = last["hit"].clone();
         }
@@ -2958,6 +3093,9 @@ pub async fn key(State(state): State<SharedState>, body: Bytes) -> Result<Respon
         // key name does not come back as "no visible window matches".
         precheck_key(&st, &t, &req)?;
         let (info, scale) = bind_window(&t)?;
+        // Once per request, before any coordinate is used. An anchor that cannot be found
+        // stops everything here rather than letting some presses land corrected and others not.
+        let offsets = anchor_offsets(&t, &info)?;
 
         enum Action {
             Chord(input::Chord),
@@ -3007,7 +3145,7 @@ pub async fn key(State(state): State<SharedState>, body: Bytes) -> Result<Respon
             None => None,
             Some(r) => Some(Targets::scale_rect(
                 Targets::pad_rect(
-                    t.region(r, info.client_size).map_err(|e| {
+                    t.region(r, info.client_size, &offsets).map_err(|e| {
                         ApiError::bad_request(e)
                             .with_detail(json!({"known_regions": t.region_names()}))
                     })?,
@@ -3462,6 +3600,7 @@ mod tests {
             },
             reference_client: None,
             on_size_mismatch: crate::targets::SizeMismatch::Ignore,
+            anchors: std::collections::BTreeMap::new(),
             regions: std::collections::BTreeMap::new(),
             buttons: std::collections::BTreeMap::new(),
             keys: std::collections::BTreeMap::new(),
@@ -3474,7 +3613,8 @@ mod tests {
                 click_button: "left".into(),
                 double: false,
                 confirm: false,
-                hold_ms: None,
+        anchor: String::new(),
+        hold_ms: None,
                 settle_ms: None,
                 note: String::new(),
             },
@@ -3487,7 +3627,7 @@ mod tests {
         let mut q = HashMap::new();
         q.insert("buttons".to_string(), mode.to_string());
         let ov = Overlay::from_query(&q).expect("overlay");
-        let drawn = apply_overlay(&mut frame, &ov, Some(&t), (1.0, 1.0), (200, 200));
+        let drawn = apply_overlay(&mut frame, &ov, Some(&t), (1.0, 1.0), (200, 200), &AnchorOffsets::new());
         (frame.image, drawn)
     }
 
@@ -3538,6 +3678,7 @@ mod tests {
             },
             reference_client: None,
             on_size_mismatch: crate::targets::SizeMismatch::Ignore,
+            anchors: std::collections::BTreeMap::new(),
             regions: std::collections::BTreeMap::new(),
             buttons: std::collections::BTreeMap::new(),
             keys: std::collections::BTreeMap::new(),
@@ -3547,7 +3688,8 @@ mod tests {
             point: None,
             click_button: "left".into(),
             double: false,
-            hold_ms: None,
+        anchor: String::new(),
+        hold_ms: None,
             confirm,
             settle_ms: None,
             note: String::new(),
@@ -3649,6 +3791,55 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "a lost line-continuation left indentation inside a message:\n{}", bad.join("\n"));
+    }
+
+    /// The layout-drift check: same size elsewhere is drift, a different size says nothing.
+    ///
+    /// Measured on NC Trainer2 plus, which moves its whole panel 16px sideways between
+    /// relaunches without changing its window size. Nothing else in this server notices — the
+    /// size check compares the window, `hit` only asks whether a control is there — so this
+    /// comparison is the only thing standing between a caller and a neighbouring key.
+    ///
+    /// The quiet half matters as much. A rectangle drawn by hand in the editor sits around a
+    /// control rather than on it, so its size differs and no conclusion is available. Reporting
+    /// drift there would be a false alarm on every press of every hand-made profile.
+    #[test]
+    fn a_control_of_the_same_size_somewhere_else_is_drift() {
+        use crate::win::window::ControlHit;
+        let hit = |rect: Rect| ControlHit {
+            rect,
+            class: "Button".into(),
+            text: String::new(),
+            enabled: true,
+            visible: true,
+            is_window_itself: false,
+            hwnd: 1,
+            id: 0,
+            depth: 3,
+        };
+        let saved = [58, 882, 32, 18];
+
+        // Exactly where the file says.
+        let v = aim_json(Some(saved), Some(&hit(saved))).expect("a claim to check");
+        assert_eq!(v["matches"], json!(true));
+
+        // The 16px shift this exists for.
+        let v = aim_json(Some(saved), Some(&hit([74, 882, 32, 18]))).expect("a claim to check");
+        assert_eq!(v["matches"], json!(false));
+        assert_eq!(v["delta"], json!([16, 0]));
+        assert_eq!(v["saved"], json!(saved));
+        assert_eq!(v["found"], json!([74, 882, 32, 18]));
+
+        // A different size is a hand-drawn rectangle, not a moved control: say nothing.
+        assert!(aim_json(Some(saved), Some(&hit([58, 882, 40, 24]))).is_none());
+        assert!(aim_json(Some(saved), Some(&hit([74, 882, 40, 24]))).is_none());
+
+        // Nothing to compare: coordinates the request supplied, or background.
+        assert!(aim_json(None, Some(&hit(saved))).is_none());
+        assert!(aim_json(Some(saved), None).is_none());
+        let mut bg = hit(saved);
+        bg.is_window_itself = true;
+        assert!(aim_json(Some(saved), Some(&bg)).is_none(), "the window itself is not a control");
     }
 
     /// The reply to a wrong name has to be the near ones, and only the near ones.
