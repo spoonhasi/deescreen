@@ -1085,7 +1085,12 @@ pub async fn window_info(
 /// One profile's definition as JSON. Shared by `/profiles`, `/buttons` and `/regions` — build
 /// the same thing in three places and one day the three disagree.
 fn profile_view(prof: &crate::state::Profile) -> Value {
-    let t = prof.targets();
+    defs_view(&prof.targets())
+}
+
+/// The definition itself, split out from the profile that holds it so the shape can be
+/// asserted without a live profile — it is the shape, not the lookup, that consumers depend on.
+fn defs_view(t: &Targets) -> Value {
     let buttons: Vec<Value> = t
         .buttons
         .iter()
@@ -1098,6 +1103,8 @@ fn profile_view(prof: &crate::state::Profile) -> Value {
                 "double": b.double,
                 "confirm": b.confirm,
                 "settle_ms": b.settle_ms,
+                "hold_ms": b.hold_ms,
+                "anchor": b.anchor,
                 "note": b.note,
             })
         })
@@ -1105,7 +1112,10 @@ fn profile_view(prof: &crate::state::Profile) -> Value {
     let regions: Vec<Value> = t
         .regions
         .iter()
-        .map(|(name, r)| json!({"name": name, "rect": r}))
+        // Flat: name, rectangle, and the fields beside it. Writing the struct under "rect"
+        // nests a rect inside a rect, which is what broke every reader when regions stopped
+        // being bare arrays.
+        .map(|(name, r)| json!({"name": name, "rect": r.rect, "anchor": r.anchor, "note": r.note}))
         .collect();
     let keys: Vec<Value> = t
         .keys
@@ -3904,6 +3914,39 @@ mod tests {
         let mut bg = hit(saved);
         bg.is_window_itself = true;
         assert!(aim_json(Some(saved), Some(&bg)).is_none(), "the window itself is not a control");
+    }
+
+    /// `rect` in the reading form is a rectangle, and stays one however the stored form grows.
+    ///
+    /// A region used to BE a rectangle, so this endpoint wrote the stored value straight under
+    /// the key `rect`. When regions gained an anchor and became a struct, that line kept
+    /// working and started returning a rect containing a rect. Nothing failed on this side —
+    /// the break was in every consumer that did `const [x,y,w,h] = r.rect`, which is what the
+    /// editor does, and it took a person opening the page to find out.
+    ///
+    /// So this asserts the shape, not the code path: four numbers, at the top, with the other
+    /// fields beside them rather than wrapped around them.
+    #[test]
+    fn the_reading_form_keeps_rect_a_rectangle() {
+        let t: Targets = serde_json::from_str(
+            r#"{"window":{"title":"x"},
+                "anchors":{"screen":{"text":"PANEL","rect":[0,0,10,10]}},
+                "regions":{"bar":{"rect":[0,940,1280,60],"anchor":"screen","note":"n"}},
+                "buttons":{"A":{"rect":[1,2,3,4],"anchor":"@fixed"}}}"#,
+        )
+        .expect("parses");
+        let v = defs_view(&t);
+
+        let region = &v["regions"][0];
+        assert_eq!(region["rect"], json!([0, 940, 1280, 60]), "four numbers, not an object");
+        assert!(region["rect"].is_array(), "a consumer destructures this: {}", region["rect"]);
+        assert_eq!(region["anchor"], json!("screen"), "beside the rect, not wrapped around it");
+        assert_eq!(region["note"], json!("n"));
+
+        let button = &v["buttons"][0];
+        assert_eq!(button["rect"], json!([1, 2, 3, 4]));
+        assert!(button["rect"].is_array());
+        assert_eq!(button["anchor"], json!("@fixed"), "the flat form shows the anchor too");
     }
 
     /// The reply to a wrong name has to be the near ones, and only the near ones.

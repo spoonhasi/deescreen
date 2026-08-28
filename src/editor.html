@@ -140,6 +140,8 @@
   <h1 data-i18n="app">deescreen button editor</h1>
   <button id="newprof" data-i18n="newprof" data-i18n-title="newprof.t">＋ Profile</button>
   <select id="profpick" data-i18n-title="profpick.t"></select>
+  <button id="renprof" data-i18n="renprof" data-i18n-title="renprof.t">Rename</button>
+  <button id="delprof" class="danger" data-i18n="delprof" data-i18n-title="delprof.t">Delete profile</button>
   <span id="winmeta" data-i18n="loading">loading…</span>
   <button id="restore" data-i18n="restore">Restore window</button>
   <button id="refresh" data-i18n="refresh">Refresh capture</button>
@@ -265,6 +267,14 @@ const STRINGS = {
   en: {
     'app': 'deescreen button editor',
     'newprof': '＋ Profile',
+    'renprof': 'Rename', 'renprof.t': 'Move this profile to a new name. Saving under a new name would copy it instead, leaving two profiles aimed at one window.',
+    'delprof': 'Delete profile', 'delprof.t': 'Remove this profile. The file is set aside on that PC, not erased — but nothing here can bring it back.',
+    'prompt.rename': 'New name for $1 — letters, digits, - and _',
+    'confirm.delprofile': 'Delete the profile $1?\n\n$2 and $3 go with it. The file is set aside on that PC so a person there can put it back — from here it cannot be undone.',
+    'ok.delprofile': 'Deleted $1. The file was set aside as $2',
+    'err.delprofile': 'Could not delete ($1). $2',
+    'ok.renprofile': 'Renamed $1 to $2.',
+    'err.renprofile': 'Could not rename ($1). $2',
     'newprof.t': 'Create a profile. A file profiles/deescreen.<name>.json appears and is picked up immediately.',
     'profpick.t': "Which window's coordinate universe. Every profile has its own window, buttons, regions and reference size.",
     'loading': 'loading…',
@@ -383,6 +393,14 @@ const STRINGS = {
   ko: {
     'app': 'deescreen 버튼 편집기',
     'newprof': '＋ 프로파일',
+    'renprof': '이름 변경', 'renprof.t': '이 프로파일을 새 이름으로 옮깁니다. 새 이름으로 저장하면 복사가 되어 한 창을 가리키는 프로파일이 둘이 됩니다.',
+    'delprof': '프로파일 삭제', 'delprof.t': '이 프로파일을 지웁니다. 파일은 그 PC 에 치워둘 뿐 지우지는 않지만, 여기서는 되돌릴 수 없습니다.',
+    'prompt.rename': '$1 의 새 이름 — 영문/숫자/-/_',
+    'confirm.delprofile': '프로파일 $1 을 삭제할까요?\n\n$2 와 $3 이 함께 사라집니다. 파일은 그 PC 에 치워두므로 거기 있는 사람은 되돌릴 수 있지만, 여기서는 못 되돌립니다.',
+    'ok.delprofile': '$1 삭제됨. 파일은 $2 로 치워졌습니다',
+    'err.delprofile': '삭제하지 못했습니다 ($1). $2',
+    'ok.renprofile': '$1 을 $2 로 바꿨습니다.',
+    'err.renprofile': '이름을 바꾸지 못했습니다 ($1). $2',
     'newprof.t': '새 프로파일을 만듭니다. profiles/deescreen.<이름>.json 파일이 생기고 즉시 잡힙니다.',
     'profpick.t': '어느 창의 좌표 우주인지. 프로파일마다 창·버튼·영역·기준 크기가 따로입니다.',
     'loading': '불러오는 중…',
@@ -779,7 +797,14 @@ function toDoc(t) {
     on_size_mismatch: t.on_size_mismatch,
     regions: {}, buttons: {}, keys: {}
   };
-  for (const r of t.regions) d.regions[r.name] = r.rect;
+  // A region is an object now, not a bare rectangle. Keep the fields this editor has no
+  // control for — dropping an anchor somebody set is not an edit anyone asked for.
+  for (const r of t.regions) {
+    const o = { rect: r.rect };
+    if (r.anchor) o.anchor = r.anchor;
+    if (r.note) o.note = r.note;
+    d.regions[r.name] = o;
+  }
   for (const g of t.buttons) {
     const o = { rect: g.rect };
     if (g.point) o.point = g.point;
@@ -787,6 +812,8 @@ function toDoc(t) {
     if (g.double) o.double = true;
     if (g.confirm) o.confirm = true;
     if (g.settle_ms != null) o.settle_ms = g.settle_ms;
+    if (g.hold_ms != null) o.hold_ms = g.hold_ms;
+    if (g.anchor) o.anchor = g.anchor;
     if (g.note) o.note = g.note;
     d.buttons[g.name] = o;
   }
@@ -796,7 +823,9 @@ function toDoc(t) {
 
 function rebuildItems() {
   items = [];
-  for (const [name, rect] of Object.entries(doc.regions)) items.push({ kind: 'region', name, rect: [...rect] });
+  for (const [name, r] of Object.entries(doc.regions)) {
+    items.push({ kind: 'region', name, ...structuredClone(r), rect: [...r.rect] });
+  }
   for (const [name, b] of Object.entries(doc.buttons)) items.push({ kind: 'target', name, ...structuredClone(b) });
   renderList(); renderRef(); paint();
 }
@@ -805,13 +834,21 @@ function toDocFromItems() {
   const d = structuredClone(doc);
   d.regions = {}; d.buttons = {};
   for (const it of items) {
-    if (it.kind === 'region') { d.regions[it.name] = it.rect; continue; }
+    if (it.kind === 'region') {
+      const r = { rect: it.rect };
+      if (it.anchor) r.anchor = it.anchor;
+      if (it.note) r.note = it.note;
+      d.regions[it.name] = r;
+      continue;
+    }
     const o = { rect: it.rect };
     if (it.point) o.point = it.point;
     if (it.click_button && it.click_button !== 'left') o.click_button = it.click_button;
     if (it.double) o.double = true;
     if (it.confirm) o.confirm = true;
     if (it.settle_ms != null && it.settle_ms !== '') o.settle_ms = Number(it.settle_ms);
+    if (it.hold_ms != null && it.hold_ms !== '') o.hold_ms = Number(it.hold_ms);
+    if (it.anchor) o.anchor = it.anchor;
     if (it.note) o.note = it.note;
     d.buttons[it.name] = o;
   }
@@ -1396,6 +1433,59 @@ $('#refresh').onclick = () => refreshShot().then(() => say('', ''));
 $('#restore').onclick = restoreWindow;
 $('#profpick').onchange = () => switchProfile($('#profpick').value);
 $('#newprof').onclick = newProfile;
+
+// Removing a profile is not the same act as removing a button, so it does not get the same
+// treatment. A button comes back by drawing it again; a profile is a window, its reference
+// size and every rectangle in it, and from here it cannot be brought back at all — only a
+// person on that PC can, out of the file the server sets aside. So this one asks, and says
+// what is about to be lost as a number rather than as a name.
+$('#delprof').onclick = async () => {
+  if (!profile) return;
+  if (adminRequired && !$('#code').value) { say(t('err.needcode.save'), 'err'); return; }
+  const targets = items.filter(i => i.kind === 'target').length;
+  const regions = items.length - targets;
+  if (!confirm(t('confirm.delprofile', profile,
+                 tn('count.buttons', targets), tn('count.regions', regions)))) return;
+  try {
+    const res = await fetch('/admin/profile?confirm=true' + pq(), {
+      method: 'DELETE',
+      headers: { 'X-Admin-Code': $('#code').value }
+    });
+    const b = await res.json().catch(() => ({}));
+    // The server refuses to delete the profile config.json names as the default, because
+    // undoing that needs a config edit and a restart. Show its sentence rather than
+    // keeping a second copy of the rule here.
+    if (!res.ok) { say(t('err.delprofile', res.status, b.error || ''), 'err'); return; }
+    say(t('ok.delprofile', profile, b.archived || ''), 'ok');
+    profile = '';
+    const u = new URL(location.href);
+    u.searchParams.delete('profile');
+    history.replaceState(null, '', u);
+    await loadAll();
+  } catch (e) { say(t('err.delprofile', '', e), 'err'); }
+};
+
+// Rename moves the file. Saving under a new name would COPY it, leaving two profiles aimed
+// at one window — at which point omitting ?profile= stops working for everyone. That is why
+// this is its own endpoint and not something the save button can express.
+$('#renprof').onclick = async () => {
+  if (!profile) return;
+  const to = (prompt(t('prompt.rename', profile), profile) || '').trim();
+  if (!to || to === profile) return;
+  if (!/^[A-Za-z0-9_-]+$/.test(to)) { say(t('err.badname'), 'err'); return; }
+  if (profiles.includes(to)) { say(t('err.nameexists', to), 'err'); return; }
+  if (adminRequired && !$('#code').value) { say(t('err.needcode.save'), 'err'); return; }
+  try {
+    const res = await fetch('/admin/profile/rename?to=' + encodeURIComponent(to) + pq(), {
+      method: 'POST',
+      headers: { 'X-Admin-Code': $('#code').value }
+    });
+    const b = await res.json().catch(() => ({}));
+    if (!res.ok) { say(t('err.renprofile', res.status, b.error || ''), 'err'); return; }
+    say(t('ok.renprofile', profile, to), 'ok');
+    await switchProfile(to);
+  } catch (e) { say(t('err.renprofile', '', e), 'err'); }
+};
 $('#setref').onclick = () => {
   if (!client[0] || !client[1]) { say(t('err.nosize'), 'err'); return; }
   doc.reference_client = [client[0], client[1]];

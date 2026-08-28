@@ -165,7 +165,7 @@ the **button editor** in a browser. Right-click menu:
 
 | item | |
 |---|---|
-| `deescreen v0.4.1` / `http://127.0.0.1:8090` | display only |
+| `deescreen v0.5.0` / `http://127.0.0.1:8090` | display only |
 | **Open button editor** | same as double-click |
 | **Status (/health)** | is it in a state where it can act |
 | **Open settings folder** | the home directory — where `config.json`, `profiles/` and `logs/` actually are |
@@ -361,6 +361,11 @@ Work down the sidebar in order:
 2. **Reference size** — `[Fit to current window]` records the current client size. Skip it and
    the rectangles you draw are saved against a stale reference, so every one of them is
    refused from the moment you save.
+The header also carries **Rename** and **Delete profile** for the profile in the picker. Both
+call the same endpoints an agent would, so the same rules apply — a delete sets the file aside
+under a timestamped name rather than erasing it, and neither will touch the profile
+`config.json` names as `default_profile`, since undoing that needs a config edit and a restart.
+
 3. Drag rectangles on the live capture. Fill in name, note and `confirm` beside it, and nudge
    with `←↑→↓` (1px, Shift for 10px). `Delete` removes the selected one and **selects the
    next**, so you can work through a list without re-picking each time (it does nothing while
@@ -1106,7 +1111,7 @@ that can press a button.
 ## Development
 
 ```bash
-cargo test          # 89 — coordinate math, crop/scale, overlays, key parsing, ACL classification, example schemas
+cargo test          # 90 — coordinate math, crop/scale, overlays, key parsing, ACL classification, example schemas
 cargo build --release
 ```
 
