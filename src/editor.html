@@ -1,10 +1,11 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>deescreen · button editor</title>
+<title>deescreen · editor</title>
+<link rel="icon" href="/favicon.ico" type="image/png">
 <style>
   :root {
     --bg: #14171c; --panel: #1c2027; --line: #2c323c; --fg: #e6e9ef; --dim: #98a1b0;
-    --target: #00c8ff; --danger: #ff3c3c; --region: #ffd200; --warn: #ff00dc; --ok: #38d39f;
+    --target: #00c8ff; --danger: #ff3c3c; --region: #ffd200; --ok: #38d39f;
     --header-h: 49px; --footer-h: 128px;
   }
   * { box-sizing: border-box; }
@@ -137,7 +138,7 @@
 </style>
 
 <header>
-  <h1 data-i18n="app">deescreen button editor</h1>
+  <h1 data-i18n="app">deescreen editor</h1>
   <button id="newprof" data-i18n="newprof" data-i18n-title="newprof.t">＋ Profile</button>
   <select id="profpick" data-i18n-title="profpick.t"></select>
   <button id="renprof" data-i18n="renprof" data-i18n-title="renprof.t">Rename</button>
@@ -265,16 +266,16 @@ const $ = s => document.querySelector(s);
 // making no external request. `{0}` placeholders are filled positionally by `t()`.
 const STRINGS = {
   en: {
-    'app': 'deescreen button editor',
+    'app': 'deescreen editor', 'app.tab': 'editor',
     'newprof': '＋ Profile',
     'renprof': 'Rename', 'renprof.t': 'Move this profile to a new name. Saving under a new name would copy it instead, leaving two profiles aimed at one window.',
     'delprof': 'Delete profile', 'delprof.t': 'Remove this profile. The file is set aside on that PC, not erased — but nothing here can bring it back.',
-    'prompt.rename': 'New name for $1 — letters, digits, - and _',
-    'confirm.delprofile': 'Delete the profile $1?\n\n$2 and $3 go with it. The file is set aside on that PC so a person there can put it back — from here it cannot be undone.',
-    'ok.delprofile': 'Deleted $1. The file was set aside as $2',
-    'err.delprofile': 'Could not delete ($1). $2',
-    'ok.renprofile': 'Renamed $1 to $2.',
-    'err.renprofile': 'Could not rename ($1). $2',
+    'prompt.rename': 'New name for {0} — letters, digits, - and _',
+    'confirm.delprofile': 'Delete the profile {0}?\n\n{1} and {2} go with it. The file is set aside on that PC so a person there can put it back — from here it cannot be undone.',
+    'ok.delprofile': 'Deleted {0}. The file was set aside as {1}',
+    'err.delprofile': 'Could not delete ({0}). {1}',
+    'ok.renprofile': 'Renamed {0} to {1}.',
+    'err.renprofile': 'Could not rename ({0}). {1}',
     'newprof.t': 'Create a profile. A file profiles/deescreen.<name>.json appears and is picked up immediately.',
     'profpick.t': "Which window's coordinate universe. Every profile has its own window, buttons, regions and reference size.",
     'loading': 'loading…',
@@ -297,7 +298,7 @@ const STRINGS = {
     'selhint.region': '— region',
     'f.name': 'Name', 'f.kind': 'Kind', 'f.mouse': 'Mouse', 'f.double': 'double',
     'f.confirm': 'confirm', 'f.settle': 'Settle ms', 'f.settle.ph': 'default',
-    'confirm.unprotect': 'This save takes the confirm flag off: $1\n\nThose buttons will stop asking before they are pressed - by you, and by any agent using this server. Save anyway?',
+    'confirm.unprotect': 'This save takes the confirm flag off: {0}\n\nThose buttons will stop asking before they are pressed - by you, and by any agent using this server. Save anyway?',
     'ok.unprotect.no': 'Not saved. The confirm flags are as they were.',
     'f.note': 'Note', 'tryit': 'Try it',
     'f.confirm.t': 'Tick this for anything a person would have to undo by hand. Then the request must carry confirm as well.',
@@ -354,7 +355,7 @@ const STRINGS = {
     'stage.capwinfail': '<h3>Could not capture that window</h3>{0}',
 
     'err.restore': 'Could not restore the window: {0}',
-    'err.anchor': 'The saved coordinates cannot be placed on this window, so no boxes are drawn. $1',
+    'err.anchor': 'The saved coordinates cannot be placed on this window, so no boxes are drawn. {0}',
     'err.sizemismatch': '{0}\n\nPress [Fit to current window] under Reference size and save to resolve it.',
     'err.winchanged': 'The window changed from {1}×{2} to {3}×{4}.\nThe {0} rectangles already drawn are relative to the old one — check them again.',
     'err.winchanged.one': 'The window changed from {1}×{2} to {3}×{4}.\nThe one rectangle already drawn is relative to the old one — check it again.',
@@ -392,16 +393,16 @@ const STRINGS = {
     'ok.deleted': "  ·  deleted '{0}'",
   },
   ko: {
-    'app': 'deescreen 버튼 편집기',
+    'app': 'deescreen 편집기', 'app.tab': '편집기',
     'newprof': '＋ 프로파일',
     'renprof': '이름 변경', 'renprof.t': '이 프로파일을 새 이름으로 옮깁니다. 새 이름으로 저장하면 복사가 되어 한 창을 가리키는 프로파일이 둘이 됩니다.',
     'delprof': '프로파일 삭제', 'delprof.t': '이 프로파일을 지웁니다. 파일은 그 PC 에 치워둘 뿐 지우지는 않지만, 여기서는 되돌릴 수 없습니다.',
-    'prompt.rename': '$1 의 새 이름 — 영문/숫자/-/_',
-    'confirm.delprofile': '프로파일 $1 을 삭제할까요?\n\n$2 와 $3 이 함께 사라집니다. 파일은 그 PC 에 치워두므로 거기 있는 사람은 되돌릴 수 있지만, 여기서는 못 되돌립니다.',
-    'ok.delprofile': '$1 삭제됨. 파일은 $2 로 치워졌습니다',
-    'err.delprofile': '삭제하지 못했습니다 ($1). $2',
-    'ok.renprofile': '$1 을 $2 로 바꿨습니다.',
-    'err.renprofile': '이름을 바꾸지 못했습니다 ($1). $2',
+    'prompt.rename': '{0} 의 새 이름 — 영문/숫자/-/_',
+    'confirm.delprofile': '프로파일 {0} 을 삭제할까요?\n\n{1} 와 {2} 이 함께 사라집니다. 파일은 그 PC 에 치워두므로 거기 있는 사람은 되돌릴 수 있지만, 여기서는 못 되돌립니다.',
+    'ok.delprofile': '{0} 삭제됨. 파일은 {1} 로 치워졌습니다',
+    'err.delprofile': '삭제하지 못했습니다 ({0}). {1}',
+    'ok.renprofile': '{0} 을 {1} 로 바꿨습니다.',
+    'err.renprofile': '이름을 바꾸지 못했습니다 ({0}). {1}',
     'newprof.t': '새 프로파일을 만듭니다. profiles/deescreen.<이름>.json 파일이 생기고 즉시 잡힙니다.',
     'profpick.t': '어느 창의 좌표 우주인지. 프로파일마다 창·버튼·영역·기준 크기가 따로입니다.',
     'loading': '불러오는 중…',
@@ -424,7 +425,7 @@ const STRINGS = {
     'selhint.region': '— 영역',
     'f.name': '이름', 'f.kind': '종류', 'f.mouse': '마우스', 'f.double': '더블',
     'f.confirm': '확인 필요', 'f.settle': '정착 ms', 'f.settle.ph': '기본값',
-    'confirm.unprotect': '이 저장은 다음 버튼에서 확인 요구를 없앱니다: $1\n\n앞으로 그 버튼들은 눌리기 전에 묻지 않습니다 — 당신이 누를 때도, 이 서버를 쓰는 에이전트가 누를 때도. 그래도 저장할까요?',
+    'confirm.unprotect': '이 저장은 다음 버튼에서 확인 요구를 없앱니다: {0}\n\n앞으로 그 버튼들은 눌리기 전에 묻지 않습니다 — 당신이 누를 때도, 이 서버를 쓰는 에이전트가 누를 때도. 그래도 저장할까요?',
     'ok.unprotect.no': '저장하지 않았습니다. 확인 요구는 그대로입니다.',
     'f.note': '메모', 'tryit': '눌러보기',
     'f.confirm.t': '되돌리는 데 사람 손이 필요한 것에 체크. 체크하면 요청에도 confirm 이 있어야 눌립니다.',
@@ -480,7 +481,7 @@ const STRINGS = {
     'stage.capwinfail': '<h3>그 창을 찍지 못했습니다</h3>{0}',
 
     'err.restore': '창 복원 실패: {0}',
-    'err.anchor': '저장된 좌표를 이 창에 놓을 수 없어 상자를 그리지 않았습니다. $1',
+    'err.anchor': '저장된 좌표를 이 창에 놓을 수 없어 상자를 그리지 않았습니다. {0}',
     'err.sizemismatch': '{0}\n\n기준 크기의 [현재 창에 맞춤] 을 누르고 저장하면 해결됩니다.',
     'err.winchanged': '창이 {1}×{2} → {3}×{4} 로 바뀌었습니다.\n이미 그려둔 {0}개의 좌표는 옛 창 기준이니 다시 확인하세요.',
     'ok.switched': '화면을 "{0}" 로 바꿨습니다. 저장해야 그대로 남습니다.',
@@ -557,8 +558,16 @@ function stagePanel(key, ...args) {
   showStage(false, t(key, ...args));
 }
 
+// The tab is the only place a profile name can be seen without switching to the window, and
+// with several open it is the only thing telling them apart. Falls back to the plain name when
+// no profile is loaded, which is also when there is nothing to distinguish.
+function renderTitle() {
+  document.title = `deescreen · ${profile || t('app.tab')}`;
+}
+
 function applyLang() {
   document.documentElement.lang = lang;
+  renderTitle();
   for (const el of document.querySelectorAll('[data-i18n]')) {
     // Only the element's own text — a child <span> carrying its own key must survive.
     const own = [...el.childNodes].find(n => n.nodeType === 3 && n.textContent.trim());
@@ -609,7 +618,10 @@ let view = 1;            // display scale (image pixels → screen pixels)
 let mode = null;         // 'target' | 'region' | null (waiting to draw a new one)
 let drag = null;
 
-const COLOR = { target: '#00c8ff', danger: '#ff3c3c', region: '#ffd200', warn: '#ff00dc' };
+// Identity only. Whether something can be reached is answered by filled-vs-hollow, so there
+// is no colour here for "wrong" — a warning that replaced the identity took away the one thing
+// worth knowing about the thing being warned over.
+const COLOR = { target: '#00c8ff', danger: '#ff3c3c', region: '#ffd200' };
 
 // With no capture, show what to do about it in that spot. A lone broken-image icon gives
 // a first-time visitor no way to tell "broken" from "not set up yet".
@@ -696,6 +708,7 @@ async function loadAll() {
       try { profiles = Object.keys((await getJson('/profiles')).profiles); } catch (_) {}
     }
     renderProfiles(all.default_profile);
+    renderTitle();
     doc = toDoc(all.profiles[profile]);
     $('#p_desc').value = doc.description || '';
     windowChanged = false;
@@ -724,6 +737,9 @@ async function loadAll() {
   try {
     const w = await getJson('/window?x=1' + pq());
     client = w.window.client;
+    // The list was coloured before this was known, and out-of-bounds is decided against it.
+    // Draw it again now that the answer exists.
+    renderList();
     $('#winmeta').textContent =
       t('winmeta.ok', w.window.title, client[0], client[1], w.window.dpi) +
       (w.size_mismatch ? t('winmeta.mismatch') : '');
@@ -782,6 +798,7 @@ function noProfiles() {
   $('#winmeta').textContent = t('winmeta.noprof');
   $('#profpick').innerHTML = `<option>${escapeHtml(t('opt.none'))}</option>`;
   $('#list').innerHTML = '';
+  renderTitle();
   stagePanel('stage.noprofiles');
   say('', '');
   paint();
@@ -994,11 +1011,25 @@ shot.addEventListener('load', () => scheduleFit());
 new ResizeObserver(() => { if (!drag) fitView(); }).observe($('#stagewrap'));
 
 // ── drawing ──────────────────────────────────────────────────────────
+// What this thing IS. A region, a button, a button somebody marked as needing a human.
+// Nothing about whether it can be reached right now - that is a different question and it gets
+// its own answer, because a warning that overwrites the identity hides exactly what you want to
+// know about the thing being warned over.
 function colorOf(it) {
   if (it.kind === 'region') return COLOR.region;
-  const [px, py] = clickPoint(it);
-  if (px < 0 || py < 0 || px >= client[0] || py >= client[1]) return COLOR.warn;
   return it.confirm ? COLOR.danger : COLOR.target;
+}
+
+// Whether this rectangle's press point still lands on the window.
+//
+// False only when there is something to measure against: with no window found, or before the
+// lookup returns, `client` is [0, 0] and every point on earth is outside it. Unknown is not a
+// verdict, and treating it as one turned whole lists into warnings about nothing.
+function reachable(it) {
+  if (it.kind === 'region') return true;
+  if (!(client[0] > 0 && client[1] > 0)) return true;
+  const [px, py] = clickPoint(it);
+  return px >= 0 && py >= 0 && px < client[0] && py < client[1];
 }
 function clickPoint(it) {
   if (it.point) return it.point;
@@ -1038,8 +1069,10 @@ function paint() {
     ctx.strokeStyle = c;
     // The selection gets a **lighter** fill, not a heavier one — punching a hole and then
     // painting colour over it would hide the very control you have to press.
-    ctx.fillStyle = c + (on ? '18' : '20');
-    ctx.fillRect(x, y, w, h);
+    if (reachable(it)) {
+      ctx.fillStyle = c + (on ? '18' : '20');
+      ctx.fillRect(x, y, w, h);
+    }
     ctx.strokeRect(x, y, w, h);
 
     if (on) {
@@ -1185,7 +1218,11 @@ function renderList() {
   items.forEach((it, i) => {
     const li = document.createElement('li');
     if (i === sel) li.className = 'sel';
-    li.innerHTML = `<span class="swatch" style="background:${colorOf(it)}"></span>` +
+    const c = colorOf(it);
+    // Hollow = the press point is off the window. Keeping the colour keeps the answer to
+    // "what is this", which is the half a single magenta swatch used to throw away.
+    const fill = reachable(it) ? `background:${c}` : `border:2px solid ${c}`;
+    li.innerHTML = `<span class="swatch" style="${fill}"></span>` +
       `<span class="nm">${escapeHtml(it.name)}</span>` +
       `<span class="xy">${it.rect.join(',')}</span>`;
     li.onclick = () => select(i);

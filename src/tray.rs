@@ -145,7 +145,10 @@ fn open_url(url: &str) {
 }
 
 /// Draw the 32x32 RGBA icon — a mouse cursor over a dark screen.
-fn icon_rgba() -> Vec<u8> {
+///
+/// Public because the web side serves the same drawing as the page's favicon: the tray and the
+/// browser tab should not be two different pictures of the same tool.
+pub fn icon_rgba() -> Vec<u8> {
     const N: usize = 32;
     let mut px = vec![0u8; N * N * 4];
     let mut set = |x: usize, y: usize, c: [u8; 4]| {

@@ -731,22 +731,22 @@ fn apply_overlay(
             let by = Targets::offset_for(offsets, &tg.anchor);
             let s = Targets::shift_rect(Targets::scale_rect(tg.rect, coord_scale), by);
             let (px, py) = Targets::click_point(tg, coord_scale, by);
-            // Buttons that fell outside the client area get a loud colour — this is the
-            // whole point of checking
             let off = px < 0 || py < 0 || px >= client.0 || py >= client.1;
             if off {
                 outside.push(name.clone());
             }
-            let color = if off {
-                draw::WARN
-            } else if tg.confirm {
-                draw::DANGER
-            } else {
-                draw::TARGET
-            };
+            // Colour is what this is. Whether it can be reached is the fill: a rectangle whose
+            // press point is off the window is drawn hollow. One channel each, so a confirm
+            // button that has drifted off the window still reads as a confirm button — which
+            // is the thing a single "something is wrong" colour used to take away.
+            let color = if tg.confirm { draw::DANGER } else { draw::TARGET };
             let (x, y) = frame.map(s[0], s[1]);
             let (w, h) = (frame.map_len(s[2]), frame.map_len(s[3]));
-            draw::marked_rect(&mut frame.image, x, y, w, h, color);
+            if off {
+                draw::rect_outline(&mut frame.image, x, y, w, h, 2, color);
+            } else {
+                draw::marked_rect(&mut frame.image, x, y, w, h, color);
+            }
             if mode == ButtonMode::Full {
                 // Where the press actually lands — not necessarily the rectangle's centre (an
                 // explicit `point`). Not drawn in box/num: this crosshair sits exactly on the
@@ -2632,6 +2632,30 @@ HOW TO VERIFY WHAT YOU DID
 }
 
 /// The button editor — drag rectangles onto a live capture.
+/// The tray icon, encoded as a PNG, as the page's favicon.
+///
+/// Encoded per request rather than at build time: it is a 32x32 image, the encode is
+/// microseconds, and keeping one copy of the drawing beats keeping a copy and a cache of it.
+pub async fn favicon() -> Response {
+    use image::ImageEncoder;
+    let rgba = crate::tray::icon_rgba();
+    let mut png = Vec::new();
+    if image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(&rgba, 32, 32, image::ExtendedColorType::Rgba8)
+        .is_err()
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "could not encode the icon").into_response();
+    }
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("image/png"));
+    // It changes only when the exe does, and a browser asks for it on every visit.
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("public, max-age=86400"),
+    );
+    (StatusCode::OK, headers, png).into_response()
+}
+
 pub async fn editor() -> Response {
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(
@@ -3822,6 +3846,71 @@ mod tests {
         let two = (2.0, 2.0);
         assert!(confirm_button_at(&t, (260, 260), two).is_some(), "inside, after scaling");
         assert!(confirm_button_at(&t, (130, 130), two).is_none(), "outside, after scaling");
+    }
+
+    /// Translation strings interpolate with {0}, and both languages agree on how many.
+    ///
+    /// `t()` substitutes {0}, {1}, {2}; it has never looked at anything else. Sixteen strings
+    /// written with $1 printed it literally - the anchor message ended with a visible "$1"
+    /// where the reason should have been, so the explanation was fetched, formatted into the
+    /// sentence, and then left out of it. Nothing failed; it just said less than it meant to.
+    ///
+    /// The second half catches the subtler one: if English takes two values and Korean takes
+    /// one, the Korean reader loses a number and nobody notices until they switch language.
+    #[test]
+    fn translations_interpolate_the_way_the_page_substitutes() {
+        let html = include_str!("editor.html");
+
+        let mut wrong_form = Vec::new();
+        let mut slots: std::collections::BTreeMap<String, Vec<std::collections::BTreeSet<u32>>> =
+            std::collections::BTreeMap::new();
+
+        for line in html.lines() {
+            let t = line.trim_end();
+            let Some(rest) = t.strip_prefix("    '") else { continue };
+            let Some((key, after)) = rest.split_once('\'') else { continue };
+            if !after.starts_with(':') || key.is_empty() {
+                continue;
+            }
+            if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_') {
+                continue;
+            }
+            if after.contains('$') && after.chars().any(|c| c.is_ascii_digit()) {
+                // Only flag a digit immediately after the sigil - a lone $ is just text.
+                let bytes: Vec<char> = after.chars().collect();
+                for w in bytes.windows(2) {
+                    if w[0] == '$' && w[1].is_ascii_digit() {
+                        wrong_form.push(format!("{key}: {}", &after[..after.len().min(60)]));
+                        break;
+                    }
+                }
+            }
+            let mut found = std::collections::BTreeSet::new();
+            let chars: Vec<char> = after.chars().collect();
+            for (i, c) in chars.iter().enumerate() {
+                if *c == '{' && i + 2 < chars.len() && chars[i + 1].is_ascii_digit() && chars[i + 2] == '}' {
+                    found.insert(chars[i + 1].to_digit(10).unwrap_or(0));
+                }
+            }
+            slots.entry(key.to_string()).or_default().push(found);
+        }
+
+        assert!(
+            wrong_form.is_empty(),
+            "t() substitutes {{0}}, not the other kind. These print the placeholder:\n{}",
+            wrong_form.join("\n")
+        );
+
+        let disagree: Vec<String> = slots
+            .iter()
+            .filter(|(_, uses)| uses.len() == 2 && uses[0] != uses[1])
+            .map(|(k, uses)| format!("{k}: en{:?} ko{:?}", uses[0], uses[1]))
+            .collect();
+        assert!(
+            disagree.is_empty(),
+            "one language would drop a value the other shows:\n{}",
+            disagree.join("\n")
+        );
     }
 
     /// The editor is served as bytes, so nothing that runs on this side ever parses it.

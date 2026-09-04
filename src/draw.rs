@@ -24,8 +24,6 @@ pub const TARGET: Color = [0, 200, 255, 255];
 pub const DANGER: Color = [255, 60, 60, 255];
 /// A capture region — yellow.
 pub const REGION: Color = [255, 210, 0, 255];
-/// Something wrong (outside the client area) — magenta.
-pub const WARN: Color = [255, 0, 220, 255];
 /// The two grid colours. **Alternated to make a dashed line** — a single translucent colour
 /// disappears entirely against one background or the other. Operator panels are often close to
 /// black, so a black-only grid vanishes on exactly the screens that need it (the same reason
