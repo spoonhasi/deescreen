@@ -2638,7 +2638,7 @@ HOW TO VERIFY WHAT YOU DID
 /// microseconds, and keeping one copy of the drawing beats keeping a copy and a cache of it.
 pub async fn favicon() -> Response {
     use image::ImageEncoder;
-    let rgba = crate::tray::icon_rgba();
+    let rgba = crate::icon::icon_rgba();
     let mut png = Vec::new();
     if image::codecs::png::PngEncoder::new(&mut png)
         .write_image(&rgba, 32, 32, image::ExtendedColorType::Rgba8)

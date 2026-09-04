@@ -165,7 +165,7 @@ the **button editor** in a browser. Right-click menu:
 
 | item | |
 |---|---|
-| `deescreen v0.6.3` / `http://127.0.0.1:8090` | display only |
+| `deescreen v0.6.4` / `http://127.0.0.1:8090` | display only |
 | **Open button editor** | same as double-click |
 | **Status (/health)** | is it in a state where it can act |
 | **Open settings folder** | the home directory — where `config.json`, `profiles/` and `logs/` actually are |
@@ -1119,6 +1119,20 @@ that can press a button.
 cargo test          # 93 — coordinate math, crop/scale, overlays, key parsing, ACL classification, example schemas
 cargo build --release
 ```
+
+### One drawing, three places
+
+The icon is **drawn in code** (`src/icon.rs`) rather than loaded from a file, and three things
+read it: the tray, the page's favicon, and `build.rs`, which turns it into the icon on the exe
+itself. A build script cannot call into the crate it is building, so it `include!`s that file —
+unusual, and the reason there is one drawing rather than copies that agree until they do not.
+That is also why the file carries no `//!` doc comment and depends on nothing but `std`.
+
+Embedding it needs the Windows SDK's `rc.exe`, driven by the `winresource` **build**-dependency
+(it does not ship in the binary). Anything linking `windows-sys` already needs that SDK, so this
+adds no requirement — and if the resource compiler is missing the build prints a warning and
+carries on with the default icon, because failing a build over a picture would be the worse
+trade.
 
 Nothing on the Rust side parses `src/editor.html` — it is `include_str!`'d and served as
 bytes, so a syntax error in its script passes every check above while the page does nothing at

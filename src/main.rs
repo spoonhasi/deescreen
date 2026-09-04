@@ -26,6 +26,14 @@ mod logging;
 mod router;
 mod state;
 mod targets;
+/// The 32x32 icon, as raw RGBA.
+///
+/// Its own file because two things read it: this program, which hands it to the tray and
+/// serves it as the page's favicon, and `build.rs`, which turns it into the icon on the exe.
+/// A build script cannot call into the crate it is building, so it `include!`s the file —
+/// unusual, and the reason there is one drawing rather than a copy that drifts. That is also
+/// why the file carries no `//!` doc comment and depends on nothing but `std`.
+mod icon;
 mod tray;
 mod web;
 mod win;

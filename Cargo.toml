@@ -1,6 +1,6 @@
 [package]
 name = "deescreen"
-version = "0.6.3"
+version = "0.6.4"
 edition = "2024"
 authors = ["spoonhasi <spoonhasi@gmail.com>"]
 description = "Drive a Windows GUI application over HTTP — named click targets, cropped screen captures, key input. Built for AI agents operating a remote simulator."
@@ -11,6 +11,11 @@ repository = "https://github.com/spoonhasi/deescreen"
 # and having people read the source and build it themselves suits this tool (see the
 # distribution section of the README).
 publish = false
+
+[build-dependencies]
+# Embeds the icon into the exe. On MSVC it drives the Windows SDK's rc.exe, which anything
+# linking windows-sys already needs.
+winresource = "0.1"
 
 [dependencies]
 # Hot-reloading the definitions: reads dominate and the only writes come from
