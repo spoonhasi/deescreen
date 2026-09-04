@@ -18,8 +18,24 @@ use crate::win::capture::Shot;
 
 /// Magnification ceiling. Past this you are looking at blocks of pixels, not glyphs.
 const MAX_MAGNIFY: f64 = 8.0;
-/// Output pixel ceiling, so the response cannot explode regardless of the scale.
-const MAX_OUTPUT_PIXELS: u64 = 4_000_000;
+/// Output ceiling while **magnifying**. This is the one that has to be tight: a 1000x1000
+/// crop at 8x is 64 megapixels conjured out of a megapixel, and nothing about the request
+/// says so.
+const MAX_MAGNIFIED_PIXELS: u64 = 4_000_000;
+
+/// Backstop for an image that is **not** magnified.
+///
+/// At 1:1 or smaller the output cannot exceed the window it came from, so it is already
+/// bounded by somebody's screen — and by the time this runs the whole client area has been
+/// read into memory and cloned, so refusing here saves nothing. It only declines to hand over
+/// what is already in hand.
+///
+/// Sharing the magnification ceiling meant a maximized window on a display larger than about
+/// 2750x1450 could not be captured at all: fine at 1920x1080 (1.9 MP), refused over a 4K
+/// session (8 MP), which from the editor looks like a screen that simply never appears. This
+/// is set where no real window reaches it, so the promise that a response cannot explode still
+/// holds without a monitor size deciding whether the tool works.
+const MAX_OUTPUT_PIXELS: u64 = 64_000_000;
 
 /// The finished image — cropped and scaled.
 pub struct Frame {
@@ -218,11 +234,25 @@ pub fn frame(shot: &Shot, rect: Rect, scale: Option<f64>, max_width: Option<u32>
 
     let nw = ((w as f64 * factor).round() as u32).max(1);
     let nh = ((h as f64 * factor).round() as u32).max(1);
-    if (nw as u64) * (nh as u64) > MAX_OUTPUT_PIXELS {
+    let out_px = (nw as u64) * (nh as u64);
+    if factor > 1.0 {
+        if out_px > MAX_MAGNIFIED_PIXELS {
+            return Err(format!(
+                "scale {factor} would produce a {nw}x{nh} image ({} megapixels); the cap while \
+                 magnifying is {} megapixels. Crop tighter, lower the scale, or set max_width.",
+                out_px / 1_000_000,
+                MAX_MAGNIFIED_PIXELS / 1_000_000
+            ));
+        }
+    } else if out_px > MAX_OUTPUT_PIXELS {
+        // Not reachable from any real window; here so the ceiling exists rather than being
+        // assumed. The advice differs because nobody asked for a scale — the picture is this
+        // big because the window is.
         return Err(format!(
-            "scale {factor} would produce a {nw}x{nh} image ({} megapixels); the cap is {} \
-             megapixels. Crop tighter, lower the scale, or set max_width.",
-            (nw as u64 * nh as u64) / 1_000_000,
+            "this is a {nw}x{nh} image ({} megapixels) at 1:1, past the {} megapixel ceiling. \
+             Nothing was magnified - the window itself is that large. Ask for part of it with \
+             region=NAME or rect=x,y,w,h, or set max_width.",
+            out_px / 1_000_000,
             MAX_OUTPUT_PIXELS / 1_000_000
         ));
     }
@@ -346,6 +376,36 @@ mod tests {
         let f = frame(&shot(100, 80, 200), [10, 20, 30, 40], None, None).expect("frame");
         assert_eq!((f.width(), f.height()), (30, 40));
         assert_eq!(f.source_rect, [10, 20, 30, 40]);
+    }
+
+    /// A window is capturable at 1:1 however big the screen it is on; magnifying still is not.
+    ///
+    /// One ceiling used to do both jobs, and the size of somebody's monitor decided whether the
+    /// tool worked: a maximized window is 1.9 MP on 1920x1080 and 8 MP over a 4K session, and
+    /// the second was refused outright. From the editor that looks like a screen that never
+    /// appears - no drawing, no error anyone connects to a display size.
+    #[test]
+    fn a_big_window_captures_at_one_to_one_but_not_magnified() {
+        // 4K, maximized: past the old 4 MP ceiling, and the case that was broken.
+        let big = shot(3840, 2077, 200);
+        let f = frame(&big, [0, 0, 3840, 2077], None, None).expect("1:1 is bounded by the window");
+        assert_eq!((f.width(), f.height()), (3840, 2077));
+
+        // Shrinking is safe for the same reason, and stays allowed.
+        let f = frame(&big, [0, 0, 3840, 2077], Some(0.5), None).expect("smaller than the source");
+        assert_eq!(f.width(), 1920);
+
+        // Magnifying is where a request can conjure pixels out of nothing, so that ceiling
+        // stays where it was: a 1000x1000 crop at 8x would be 64 MP.
+        // Frame has no Debug, so unwrap the error by hand rather than derive one for a test.
+        let Err(e) = frame(&big, [0, 0, 1000, 1000], Some(8.0), None) else {
+            panic!("magnifying a 1000x1000 crop 8x is 64 megapixels and must be refused");
+        };
+        assert!(e.contains("magnifying"), "says which ceiling was hit: {e}");
+        assert!(e.contains("4 megapixels"), "and where it is: {e}");
+
+        // Under that ceiling a magnified crop still works.
+        assert!(frame(&big, [0, 0, 700, 700], Some(2.0), None).is_ok());
     }
 
     /// A crop that starts outside the window loses the part that is outside — it does not

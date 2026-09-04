@@ -744,6 +744,39 @@ mod tests {
         assert!(!text.contains("null"), "an unset option must be absent, not null: {text}");
     }
 
+    /// The whole client area is placed without consulting an anchor; a named region is not.
+    ///
+    /// This is what lets a capture of the screen through when a profile's anchors cannot be
+    /// found on the window in front of it. Refusing that too meant you could not look at the
+    /// screen to discover that a different build of the application was running - which is the
+    /// one thing that would have told you immediately.
+    #[test]
+    fn the_client_area_needs_no_anchor_but_a_named_region_does() {
+        let t: Targets = serde_json::from_str(
+            r#"{"window":{"title":"x"},
+                "anchors":{"screen":{"text":"CNC","rect":[0,0,100,100]}},
+                "regions":{"bar":{"rect":[10,20,30,40],"anchor":"screen"}},
+                "buttons":{}}"#,
+        )
+        .expect("parses");
+
+        // Nothing resolved: the state when an anchor could not be found at all.
+        let none = std::collections::HashMap::new();
+        assert_eq!(
+            t.region("@client", (1920, 997), &none).expect("the window is the window"),
+            [0, 0, 1920, 997]
+        );
+        // ...and it does not move when an anchor *is* resolved either, since it is not placed
+        // by one.
+        let mut resolved = std::collections::HashMap::new();
+        resolved.insert("screen".to_string(), (16, 0));
+        assert_eq!(t.region("@client", (1920, 997), &resolved).expect("still the window"), [0, 0, 1920, 997]);
+
+        // A named region is placed by its anchor, so the offset is the whole point.
+        assert_eq!(t.region("bar", (1920, 997), &none).expect("no offset"), [10, 20, 30, 40]);
+        assert_eq!(t.region("bar", (1920, 997), &resolved).expect("shifted"), [26, 20, 30, 40]);
+    }
+
     /// A field name this build does not know must stop the document, not be dropped from it.
     /// `POST /admin/profile` replaces the whole file, so a dropped field is a *saved* loss —
     /// and the field most worth mistyping is `confirm`. Typing `confrim` on the emergency stop

@@ -107,7 +107,7 @@ impl Dib {
         let n = (self.w as usize) * (self.h as usize) * 4;
         let src = unsafe { std::slice::from_raw_parts(self.bits as *const u8, n) };
         let mut out = vec![0u8; n];
-        for (d, s) in out.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        for (d, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<4>().0) {
             d[0] = s[2]; // R
             d[1] = s[1]; // G
             d[2] = s[0]; // B
@@ -123,7 +123,9 @@ impl Dib {
         let src = unsafe { std::slice::from_raw_parts(self.bits as *const u8, n) };
         // Sample every 64th pixel — at 1920x1080 that is 30k samples, plenty, and costs
         // essentially nothing.
-        src.chunks_exact(4)
+        src.as_chunks::<4>()
+            .0
+            .iter()
             .step_by(64)
             .all(|p| p[0] == 0 && p[1] == 0 && p[2] == 0)
     }

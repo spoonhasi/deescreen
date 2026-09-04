@@ -9,7 +9,9 @@ use serde_json::{Value, json};
 /// `detail` carries **what to do next**. The caller here is usually an AI rather than a
 /// person, and given only "unknown target" it starts inventing names and retrying. Hand it
 /// the list of names that do exist and it corrects itself on the spot.
-#[derive(Debug)]
+// Clone so one failure can be reported by whichever part of a request actually needed it —
+// an anchor is resolved once and may be demanded in two places, or in neither.
+#[derive(Debug, Clone)]
 pub struct ApiError {
     pub status: StatusCode,
     pub message: String,

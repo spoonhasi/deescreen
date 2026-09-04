@@ -1079,6 +1079,12 @@ pub async fn window_info(
     if let Some(w) = warning {
         body["size_mismatch"] = json!(w);
     }
+    // Whether this profile's coordinates can be placed on the window as it stands. The editor
+    // asks here before it draws, because it draws its boxes from its own copy of the document
+    // and would otherwise put them at uncorrected places over a perfectly real screenshot.
+    if let Err(e) = anchor_offsets(&prof.targets(), &info) {
+        body["anchor_unresolved"] = json!({"error": e.message, "detail": e.detail});
+    }
     Ok(json_ok(body))
 }
 
@@ -1263,7 +1269,10 @@ fn capture_with(
 ) -> Result<(Vec<u8>, Value, Value), ApiError> {
     let defs_for_lookup = defs.unwrap_or(live);
     let (info, coord_scale, size_warning) = bind_window_view(defs_for_lookup)?;
-    let offsets = anchor_offsets(defs_for_lookup, &info)?;
+    // Resolved, but not insisted on yet. Which of the two things below actually needs it
+    // decides whether a failure here is fatal to this request.
+    let resolved = anchor_offsets(defs_for_lookup, &info);
+    let no_offsets = AnchorOffsets::new();
 
     let region_name = req.region.clone().unwrap_or_else(|| "@client".to_string());
     // `pad` grows the region on every side. A toggle's lamp usually sits just outside its
@@ -1272,16 +1281,25 @@ fn capture_with(
     let pad = req.pad.unwrap_or(0).max(0);
     let rect = match req.rect {
         Some(r) => Targets::pad_rect(r, pad),
-        None => Targets::scale_rect(
-            Targets::pad_rect(
-                defs_for_lookup.region(&region_name, info.client_size, &offsets).map_err(|e| {
-                    ApiError::bad_request(e)
-                        .with_detail(json!({"known_regions": defs_for_lookup.region_names()}))
-                })?,
-                pad,
-            ),
-            coord_scale,
-        ),
+        None => {
+            // A named region is placed by its anchor, so without one its rectangle is a guess.
+            // `@client` is the window itself and needs nothing.
+            let offsets = if region_name == "@client" {
+                &no_offsets
+            } else {
+                resolved.as_ref().map_err(Clone::clone)?
+            };
+            Targets::scale_rect(
+                Targets::pad_rect(
+                    defs_for_lookup.region(&region_name, info.client_size, offsets).map_err(|e| {
+                        ApiError::bad_request(e)
+                            .with_detail(json!({"known_regions": defs_for_lookup.region_names()}))
+                    })?,
+                    pad,
+                ),
+                coord_scale,
+            )
+        }
     };
 
     let (mut frame, method, black) = shoot(&info, rect, req.scale, req.max_width)?;
@@ -1295,7 +1313,10 @@ fn capture_with(
     let drawn = if overlay.is_empty() {
         Value::Null
     } else {
-        apply_overlay(&mut frame, &overlay, Some(defs_for_lookup), coord_scale, info.client_size, &offsets)
+        // Boxes drawn at uncorrected coordinates would sit on the wrong keys and look
+        // authoritative doing it, so this is the half that still refuses.
+        let offsets = resolved.as_ref().map_err(Clone::clone)?;
+        apply_overlay(&mut frame, &overlay, Some(defs_for_lookup), coord_scale, info.client_size, offsets)
     };
 
     // ?mark=x,y means "let me check this coordinate before pressing". If so, what sits under
@@ -1322,6 +1343,20 @@ fn capture_with(
     }
     if let Some(w) = size_warning {
         meta["size_mismatch"] = json!(w);
+    }
+    // The picture was allowed through without it, so the picture has to carry the fact. A
+    // capture that looks identical to a healthy one, while every saved coordinate for this
+    // profile is unusable, is the quiet wrongness anchors exist to remove.
+    if let Err(e) = &resolved {
+        meta["anchor_unresolved"] = json!({
+            "error": e.message,
+            "detail": e.detail,
+            "note": "the screen is real, but nothing placed by an anchor is. Saved regions and \
+                     button rectangles cannot be located on this window, so do not press by \
+                     name and do not trust an overlay drawn from these coordinates. Often this \
+                     means a different build of the application is running than the one this \
+                     profile was measured against.",
+        });
     }
     Ok((png, meta, window_json(&info)))
 }
