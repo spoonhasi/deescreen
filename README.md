@@ -165,7 +165,7 @@ the **button editor** in a browser. Right-click menu:
 
 | item | |
 |---|---|
-| `deescreen v0.6.2` / `http://127.0.0.1:8090` | display only |
+| `deescreen v0.6.3` / `http://127.0.0.1:8090` | display only |
 | **Open button editor** | same as double-click |
 | **Status (/health)** | is it in a state where it can act |
 | **Open settings folder** | the home directory — where `config.json`, `profiles/` and `logs/` actually are |
@@ -636,7 +636,7 @@ and a `/captures/<name>` URL instead.
 | GET | `/regions` | read | one profile's region list (coordinates absolute to the window) |
 | GET | `/controls` | read | enumerate child controls. **An empty list is an answer** (see below) |
 | GET | `/editor` | read | the button editor (HTML) |
-| GET | `/favicon.ico` | read | the tray icon as a PNG — the browser asks for it on its own, and the tab should not be a different picture from the tray |
+| GET | `/favicon.ico` · `/favicon.png` | read | the tray icon as a PNG — the tab should not be a different picture from the tray. Two names: the page links the `.png`, a browser asks for the `.ico` on its own |
 | GET | `/capture.png` | read | capture as PNG bytes. `?region= &rect=x,y,w,h &pad= &scale= &max_width= &save=`; `region=button:NAME` is that button's own rect <br>overlays: `&grid=50 &mark=x,y &inset=4 &inset_radius=40 &buttons=1\|box\|num` |
 | POST | `/capture` | read | same, JSON response (includes the server-side path) |
 | POST | `/preview.png` | read | draw a **candidate** definition from the body over the live screen. Saves nothing |

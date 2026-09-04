@@ -35,9 +35,12 @@ pub fn build(state: SharedState) -> Router {
         // page itself holds no secret, and the actual saving is what /admin/profile guards
         // three ways.
         .route("/editor", get(api::editor))
-        // The browser asks for this by itself, on the same page load. A static drawing that
-        // carries nothing about the machine, so it sits with the other read-only assets.
+        // Two names for one drawing. The page links the .png, which is what it actually is;
+        // the .ico is what a browser asks for on its own, without reading the link, for the
+        // root document and for bookmarks. A static drawing that carries nothing about the
+        // machine, so it sits with the other read-only assets.
         .route("/favicon.ico", get(api::favicon))
+        .route("/favicon.png", get(api::favicon))
         // ── control ──
         .route("/click", post(api::click_json))
         .route("/click.png", post(api::click_png))
