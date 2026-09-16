@@ -72,7 +72,52 @@
       "confirm": true,
       "settle_ms": 1000,
       "note": "emergency stop. confirm required. Releasing it may need a person at the machine"
+    },
+    "mdi_g": {
+      "rect": [
+        600,
+        780,
+        44,
+        44
+      ],
+      "types": "G",
+      "note": "MDI keypad: G. 'types' is the legend printed on the key"
+    },
+    "mdi_9": {
+      "rect": [
+        650,
+        780,
+        44,
+        44
+      ],
+      "types": "9",
+      "note": "MDI keypad: 9"
+    },
+    "mdi_f": {
+      "rect": [
+        700,
+        780,
+        44,
+        44
+      ],
+      "types": "F",
+      "shift_types": "E",
+      "note": "two legends on one key: F, and E above it. 'shift_types' is what the shift key reaches"
+    },
+    "mdi_shift": {
+      "rect": [
+        750,
+        780,
+        44,
+        44
+      ],
+      "note": "reaches the second legend on the keypad"
     }
+  },
+  "shift": {
+    "button": "mdi_shift",
+    "mode": "oneshot",
+    "note": "one-shot on this panel: it reaches the second legend for one key, then falls back. A latching panel would say \"toggle\" — the two are not interchangeable and the wrong one types a different string with no error"
   },
   "keys": {
     "cycle_start_key": "f5",

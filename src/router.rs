@@ -34,6 +34,9 @@ pub fn build(state: SharedState) -> Router {
         // One cropped picture per button, with its name under it — the way to check that
         // a name belongs to the key it is on. Both read a query string and neither reads a
         // body, so there is one place to put a parameter.
+        // Which keys a string would press. Presses nothing, which is what makes it worth
+        // having separately from POST /click {"spell": ...}.
+        .route("/spell", get(api::spell))
         .route("/sheet", get(api::sheet_json))
         .route("/sheet.png", get(api::sheet_png))
         // The button editor (HTML). A static asset, so it is exempt from admin_code — the

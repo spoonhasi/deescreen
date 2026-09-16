@@ -670,6 +670,7 @@ and a `/captures/<name>` URL instead.
 | GET | `/buttons` | read | one profile's button list (a subset of `/profiles`) |
 | GET | `/regions` | read | one profile's region list (coordinates absolute to the window) |
 | GET | `/controls` | read | enumerate child controls. **An empty list is an answer** (see below) |
+| GET | `/spell` | read | `?text=G91X0` — which keys that string would press on this keypad. Presses **nothing**; `POST /click {"spell": "…"}` presses it |
 | GET | `/editor` | read | the button editor (HTML) |
 | GET | `/favicon.ico` · `/favicon.png` | read | the tray icon as a PNG — the tab should not be a different picture from the tray. Two names: the page links the `.png`, a browser asks for the `.ico` on its own |
 | GET | `/capture.png` | read | capture as PNG bytes. `?region= &rect=x,y,w,h &pad= &scale= &max_width= &save=`; `region=button:NAME` is that button's own rect <br>overlays: `&grid=50 &mark=x,y &inset=4 &inset_radius=40 &buttons=1\|box\|num` |
@@ -678,7 +679,7 @@ and a `/captures/<name>` URL instead.
 | GET | `/sheet` | read | the same sheet as JSON: its shape, where it was saved, and which buttons had no picture to show |
 | POST | `/preview.png` | read | draw a **candidate** definition from the body over the live screen. Saves nothing |
 | GET | `/captures/{name}` | read | fetch a stored capture |
-| POST | `/click` | **control** | `{button\|buttons[]\|rect\|point, confirm, click_button, double, settle_ms, measure, quiet_ms, per_press, gap_ms, capture, pad, ignore, scale, max_width}`. No `capture` means **no picture is taken**. `buttons` presses in order and stops at the first failure |
+| POST | `/click` | **control** | `{button\|buttons[]\|rect\|point, confirm, click_button, double, spell, settle_ms, measure, quiet_ms, per_press, gap_ms, capture, pad, ignore, scale, max_width}`. No `capture` means **no picture is taken**. `buttons` presses in order and stops at the first failure |
 | POST | `/click.png` | **control** | same, PNG bytes back. Parameters go in the query. No `capture` captures the whole client area (an image has to come back) |
 | POST | `/key` | **control** | `{key\|chord\|text, settle_ms, measure, quiet_ms, capture, pad, ignore, …}` |
 | POST | `/window/focus` | **control** | bring the window forward (restore if minimised) |
@@ -905,6 +906,60 @@ length is the next thing to change (`hold_ms`).
 One capture per press, added to the sequence's own time, which is why it is asked for. With no
 capture region named it watches the whole client area; `ignore=x,y,w,h` applies here too, since
 a blinking cursor would otherwise make every press look like it did something.
+
+### Spelling a string instead of naming every key — `spell`
+
+Working out that `G91X0` is `MDI_G, MDI_9, MDI_1, MDI_X, MDI_0` is work the server can do. The
+one fact it needs — which key carries which character — belongs in the profile:
+
+```json
+"MDI_F": { "rect": [1200, 500, 44, 44], "anchor": "keypad",
+           "types": "F", "shift_types": "E" }
+```
+
+`types` is the legend printed on the key; `shift_types` is the **second** legend, the small one
+above it, reached through the shift key. That *E is on the F key* used to live in an English
+sentence in `note`, where nothing could read it and nobody could check it.
+
+```bash
+curl -s ".../spell?profile=NAME&text=G91X0"          # resolves, presses nothing
+curl -s -X POST -H "Content-Type: application/json" \
+  -d '{"spell":"G91X0","capture":"hmi_display"}' .../click
+```
+
+**It becomes an ordinary sequence**, so everything that governs `buttons` applies unchanged:
+every key resolved before anything is pressed, a failed press stopping the rest, `gap_ms`
+between them, `per_press` naming the one that did nothing, and a `confirm` button inside still
+requiring `"confirm": true`. The reply's `spelled` says what the string turned into — including
+the shift presses, which enter nothing and would otherwise look like stray keys.
+
+A character with no key **refuses the whole string**, and names every such character rather than
+the first: fixing them one per round trip means pressing keys in between. Nothing is entered,
+because a partial entry is worse than none.
+
+#### Shift is declared, never assumed
+
+```json
+"shift": { "button": "MDI_SHIFT", "mode": "oneshot" }
+```
+
+| mode | |
+|---|---|
+| `oneshot` | reaches the second legend for **one** key, then falls back by itself |
+| `toggle` | stays on until pressed again |
+
+They are not interchangeable, and the wrong one types a different string with no error — on a
+one-shot panel a latch model spells `EE` as `E` then `f`. So a profile that records a shifted
+legend without declaring this **does not load**. With `toggle`, spelling always turns it back
+off before it finishes: a sequence that ended with the latch on would change what the *next*
+caller's presses mean, which is the kind of state nobody thinks to check.
+
+Lower case is spelled on the upper-case key — a keypad is upper case, so `g91` works — and the
+reply lists what was folded, because what reached the machine is then the key's character rather
+than the one you sent.
+
+`GET /buttons` carries `types` and `shift_types`, and `GET /profiles` carries `shift`, so a
+caller that would rather build the sequence itself has everything it needs.
 
 ### Pressing something that was never saved — `rect` / `point`
 

@@ -169,8 +169,52 @@ pub struct ButtonDef {
     /// here — measured once, on that key, rather than remembered by every caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_ms: Option<u64>,
+    /// **What this key enters**, as printed on it — `"G"`, `"7"`, `";"` for END OF BLOCK.
+    ///
+    /// Empty for a key that enters nothing (MONITOR, CYCLE START, a mode selector). Only keys
+    /// that put characters into an input line have this.
+    ///
+    /// More than one character is allowed, for a key that enters several at once. Spelling
+    /// tries the longest legend first, so a key legended `"G0"` is used for `G0` and the plain
+    /// `G` key for anything else.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub types: String,
+    /// **What it enters after the shift key** — the second legend, the small one printed above.
+    ///
+    /// This is the fact that used to live in an English sentence in `note`, where nothing could
+    /// read it and nobody could check it. Setting it requires the profile to declare `shift`,
+    /// because which key reaches it and how that key behaves is not derivable from here.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub shift_types: String,
     /// A note for people, carried verbatim into the API responses. The AI calling this has to
     /// know what it is pressing, so do not leave it blank.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+/// How the keypad's shift key behaves — **declared, never assumed**.
+///
+/// The two are not interchangeable and guessing wrong types a different string than the one
+/// asked for, without erroring: on a one-shot panel a latch model presses shift once for `EE`
+/// and gets `Ef`, and on a latching panel a one-shot model leaves it on.
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum ShiftMode {
+    /// Reaches the second legend for **one** key, then falls back on its own.
+    Oneshot,
+    /// Stays on until pressed again. Spelling turns it off before it finishes, so a sequence
+    /// never leaves the panel in a state the next caller did not ask for.
+    Toggle,
+}
+
+/// The key that reaches the second legend, and how it behaves.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ShiftDef {
+    /// The name of the button in this profile that acts as shift.
+    pub button: String,
+    /// Required. There is no default because the wrong one is silently wrong — see [`ShiftMode`].
+    pub mode: ShiftMode,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
 }
@@ -213,6 +257,13 @@ pub struct Targets {
     /// Everything that can be pressed. **A coordinate that is not here cannot be pressed.**
     #[serde(default, deserialize_with = "crate::config::no_duplicate_keys")]
     pub buttons: BTreeMap<String, ButtonDef>,
+    /// The keypad's shift key, for profiles whose keys carry a second legend.
+    ///
+    /// Absent is the ordinary case. It is required as soon as any button sets `shift_types`,
+    /// because a shifted legend that nothing can reach is a fact recorded and then not usable,
+    /// which is the same as not recording it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shift: Option<ShiftDef>,
     /// Named key input. On an application that maps panel keys to the PC keyboard, a key is
     /// often more reliable than a click. Values look like `"f5"` or `"ctrl+alt+r"`.
     #[serde(default, deserialize_with = "crate::config::no_duplicate_keys")]
@@ -258,6 +309,7 @@ impl Targets {
             crate::win::input::parse_chord(spec)
                 .map_err(|e| format!("key '{name}': {e}"))?;
         }
+        self.validate_legends()?;
         // Anchors, and who belongs to which.
         //
         // A profile with no anchors is the ordinary case and nothing here applies. One anchor
@@ -438,6 +490,69 @@ impl Targets {
         offsets.get(anchor).copied().unwrap_or((0, 0))
     }
 
+    /// The keypad legends: reachable, and each one belonging to exactly one key.
+    ///
+    /// Both checks exist because their failures are silent. A shifted legend with no shift key
+    /// declared is a fact recorded and then unusable; two keys claiming `7` means a string
+    /// containing `7` is spelled with whichever key sorted first, which is not a decision
+    /// anybody made.
+    fn validate_legends(&self) -> Result<(), String> {
+        let shifted: Vec<&str> =
+            self.buttons.iter().filter(|(_, b)| !b.shift_types.is_empty()).map(|(n, _)| n.as_str()).collect();
+        match &self.shift {
+            None if !shifted.is_empty() => {
+                return Err(format!(
+                    "{} button(s) carry a shifted legend ({}) but this profile does not declare \
+                     'shift'. Which key reaches the second legend, and whether it is one-shot or \
+                     a latch, cannot be worked out from the buttons - and guessing wrong types a \
+                     different string with no error. Add \"shift\": {{\"button\": \"NAME\", \
+                     \"mode\": \"oneshot\" | \"toggle\"}}.",
+                    shifted.len(),
+                    shifted.join(", ")
+                ));
+            }
+            Some(s) => {
+                if !self.buttons.contains_key(&s.button) {
+                    return Err(format!(
+                        "shift.button '{}' is not a button in this profile. It has to be a key \
+                         that can actually be pressed, because spelling presses it.",
+                        s.button
+                    ));
+                }
+                if let Some(b) = self.buttons.get(&s.button)
+                    && !b.shift_types.is_empty()
+                {
+                    return Err(format!(
+                        "shift.button '{}' carries a shifted legend of its own. Reaching it would \
+                         mean pressing shift to press shift, so spelling could never produce it.",
+                        s.button
+                    ));
+                }
+            }
+            None => {}
+        }
+
+        // One legend, one key. Checked at load, so an ambiguous keypad is refused where it is
+        // written rather than surfacing later as a string spelled with the wrong key.
+        for field in ["types", "shift_types"] {
+            let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
+            for (name, b) in &self.buttons {
+                let v = if field == "types" { &b.types } else { &b.shift_types };
+                if v.is_empty() {
+                    continue;
+                }
+                if let Some(first) = seen.insert(v.as_str(), name.as_str()) {
+                    return Err(format!(
+                        "buttons '{first}' and '{name}' both say {field} {v:?}. A legend has to \
+                         identify one key, or a string containing it would be spelled with \
+                         whichever key happened to sort first."
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Look up a region by name, already shifted by its anchor. `"@client"` is built in and
     /// means the whole client area, which by definition does not move with anything.
     pub fn region(
@@ -596,6 +711,126 @@ impl Targets {
 }
 
 
+/// One step of a spelled string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Spelled {
+    /// The button to press.
+    pub button: String,
+    /// The characters this press enters. Empty for a shift press, which enters nothing.
+    pub enters: String,
+    /// True when this press is the shift key rather than a legend.
+    pub is_shift: bool,
+    /// The legend was matched ignoring case — `"g"` spelled with the `G` key. Reported so a
+    /// caller can see that the string it gets is not character-for-character what it sent.
+    pub case_folded: bool,
+}
+
+/// What could not be spelled, and why.
+#[derive(Debug)]
+pub struct Unspellable {
+    /// Where in the string, counted in characters.
+    pub at: usize,
+    pub character: String,
+}
+
+impl Targets {
+    /// Every legend this profile can enter, longest first.
+    ///
+    /// Longest first is what lets one key be legended `";"` and another `"G0"` without the
+    /// shorter one shadowing the longer: at each position the longest legend that fits is the
+    /// one taken. Ties cannot happen — `validate_legends` refuses two keys with one legend.
+    fn legends(&self) -> Vec<(&str, &str, bool)> {
+        let mut v: Vec<(&str, &str, bool)> = Vec::new();
+        for (name, b) in &self.buttons {
+            if !b.types.is_empty() {
+                v.push((b.types.as_str(), name.as_str(), false));
+            }
+            if !b.shift_types.is_empty() {
+                v.push((b.shift_types.as_str(), name.as_str(), true));
+            }
+        }
+        v.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()).then(a.0.cmp(b.0)));
+        v
+    }
+
+    /// **Spell a string as key presses.**
+    ///
+    /// Returns the whole sequence, or every character that has no key — every one of them,
+    /// not the first, so a caller fixes the string once rather than a character per round trip.
+    ///
+    /// Shift is inserted according to the profile's declared mode, and a `toggle` panel is
+    /// always left off: a sequence that ends with shift latched would change what the *next*
+    /// caller's presses mean, which is the kind of state nobody thinks to check.
+    pub fn spell(&self, text: &str) -> Result<Vec<Spelled>, Vec<Unspellable>> {
+        let legends = self.legends();
+        let chars: Vec<char> = text.chars().collect();
+        let mut out: Vec<Spelled> = Vec::new();
+        let mut bad: Vec<Unspellable> = Vec::new();
+        let mut shift_on = false;
+        let mut i = 0usize;
+
+        while i < chars.len() {
+            let rest: String = chars[i..].iter().collect();
+            // Exact before case-folded, so a keypad that really does carry both cases is
+            // spelled with the key that says so.
+            let hit = legends
+                .iter()
+                .find(|(lit, _, _)| rest.starts_with(lit))
+                .map(|m| (m, false))
+                .or_else(|| {
+                    let lower = rest.to_lowercase();
+                    legends
+                        .iter()
+                        .find(|(lit, _, _)| lower.starts_with(&lit.to_lowercase()))
+                        .map(|m| (m, true))
+                });
+
+            let Some(((lit, name, needs_shift), folded)) = hit else {
+                bad.push(Unspellable { at: i, character: chars[i].to_string() });
+                i += 1;
+                continue;
+            };
+            let n = lit.chars().count();
+
+            if let Some(s) = &self.shift {
+                let want = *needs_shift;
+                match s.mode {
+                    // Falls back by itself, so it is pressed before each shifted key and never
+                    // pressed to turn off.
+                    ShiftMode::Oneshot if want => out.push(shift_press(&s.button)),
+                    ShiftMode::Oneshot => {}
+                    // A latch is only touched when the state has to change.
+                    ShiftMode::Toggle if want != shift_on => {
+                        out.push(shift_press(&s.button));
+                        shift_on = want;
+                    }
+                    ShiftMode::Toggle => {}
+                }
+            }
+            out.push(Spelled {
+                button: (*name).to_string(),
+                enters: chars[i..i + n].iter().collect(),
+                is_shift: false,
+                case_folded: folded,
+            });
+            i += n;
+        }
+
+        if !bad.is_empty() {
+            return Err(bad);
+        }
+        // Leave the panel as it was found.
+        if shift_on && let Some(s) = &self.shift {
+            out.push(shift_press(&s.button));
+        }
+        Ok(out)
+    }
+}
+
+fn shift_press(button: &str) -> Spelled {
+    Spelled { button: button.to_string(), enters: String::new(), is_shift: true, case_folded: false }
+}
+
 /// Move a profile's files to a new name. The save backup follows — left behind it is an orphan
 /// with no way to tell which profile it belonged to.
 pub fn move_profile_files(from: &Path, to: &Path) -> Result<(), String> {
@@ -720,6 +955,7 @@ mod tests {
             anchors: BTreeMap::new(),
             regions: BTreeMap::new(),
             buttons: BTreeMap::new(),
+            shift: None,
             keys: BTreeMap::new(),
         };
         t.buttons.insert(
@@ -730,8 +966,10 @@ mod tests {
                 click_button: default_click_button(),
                 double: false,
                 confirm: false,
-        anchor: String::new(),
-        hold_ms: None,
+                anchor: String::new(),
+                hold_ms: None,
+                types: String::new(),
+                shift_types: String::new(),
                 settle_ms: None,
                 note: String::new(),
             },
@@ -746,8 +984,10 @@ mod tests {
                 click_button: "right".into(),
                 double: true,
                 confirm: true,
-        anchor: "@fixed".into(),
-        hold_ms: Some(250),
+                anchor: "@fixed".into(),
+                hold_ms: Some(250),
+                types: String::new(),
+                shift_types: String::new(),
                 settle_ms: Some(1500),
                 note: "undoing this needs a person at the machine".into(),
             },
@@ -928,6 +1168,135 @@ mod tests {
         assert_eq!(r, [12, 14, 10, 10]);
     }
 
+    fn keypad(shift_mode: &str) -> Targets {
+        let shift = if shift_mode.is_empty() {
+            String::new()
+        } else {
+            format!(r#","shift":{{"button":"SHIFT","mode":"{shift_mode}"}}"#)
+        };
+        let doc = format!(
+            r#"{{"window":{{"title":"x"}},"buttons":{{
+                "MDI_G":{{"rect":[0,0,10,10],"types":"G"}},
+                "MDI_9":{{"rect":[10,0,10,10],"types":"9"}},
+                "MDI_1":{{"rect":[20,0,10,10],"types":"1"}},
+                "MDI_F":{{"rect":[30,0,10,10],"types":"F","shift_types":"E"}},
+                "MDI_X":{{"rect":[40,0,10,10],"types":"X","shift_types":"U"}},
+                "MDI_EOB":{{"rect":[50,0,10,10],"types":";"}},
+                "SHIFT":{{"rect":[60,0,10,10]}},
+                "CYCLE_START":{{"rect":[70,0,10,10]}}
+            }}{shift}}}"#
+        );
+        serde_json::from_str(&doc).expect("parses")
+    }
+
+    fn spelt(t: &Targets, text: &str) -> Vec<String> {
+        t.spell(text).expect("spellable").into_iter().map(|s| s.button).collect()
+    }
+
+    /// The fact that used to live in an English sentence: E is on the F key, behind shift.
+    #[test]
+    fn a_shifted_legend_is_reached_through_the_declared_shift_key() {
+        let t = keypad("oneshot");
+        assert_eq!(spelt(&t, "G91"), ["MDI_G", "MDI_9", "MDI_1"]);
+        assert_eq!(spelt(&t, "E"), ["SHIFT", "MDI_F"]);
+        // One-shot falls back by itself, so each shifted key gets its own press.
+        assert_eq!(spelt(&t, "EE"), ["SHIFT", "MDI_F", "SHIFT", "MDI_F"]);
+        assert_eq!(spelt(&t, "EF"), ["SHIFT", "MDI_F", "MDI_F"]);
+    }
+
+    /// A latch is pressed only when the state has to change — and is always turned off at the
+    /// end. Left on, it would change what the NEXT caller's presses mean, which is exactly the
+    /// kind of state nobody thinks to check.
+    #[test]
+    fn a_latching_shift_is_toggled_only_when_needed_and_never_left_on() {
+        let t = keypad("toggle");
+        assert_eq!(spelt(&t, "EE"), ["SHIFT", "MDI_F", "MDI_F", "SHIFT"]);
+        assert_eq!(spelt(&t, "EU"), ["SHIFT", "MDI_F", "MDI_X", "SHIFT"]);
+        assert_eq!(spelt(&t, "EFE"), ["SHIFT", "MDI_F", "SHIFT", "MDI_F", "SHIFT", "MDI_F", "SHIFT"]);
+        // Nothing shifted, nothing pressed.
+        assert_eq!(spelt(&t, "G91"), ["MDI_G", "MDI_9", "MDI_1"]);
+
+        // A string that ENDS on a shifted character is where leaving it on would happen.
+        let seq = t.spell("FE").expect("spellable");
+        assert!(seq.last().expect("nonempty").is_shift, "the latch has to come back off");
+        assert_eq!(spelt(&t, "FE"), ["MDI_F", "SHIFT", "MDI_F", "SHIFT"]);
+    }
+
+    /// Every character that cannot be entered comes back, not the first one. A caller fixing a
+    /// string one character per round trip is a caller pressing keys in between.
+    #[test]
+    fn an_unspellable_string_names_every_character_that_failed() {
+        let t = keypad("oneshot");
+        let bad = t.spell("G@1#").expect_err("has no key for @ or #");
+        let got: Vec<&str> = bad.iter().map(|u| u.character.as_str()).collect();
+        assert_eq!(got, ["@", "#"]);
+        assert_eq!(bad[0].at, 1);
+        assert_eq!(bad[1].at, 3);
+    }
+
+    /// Case is folded rather than refused, because a keypad is upper case and a caller writing
+    /// `g91` means `G91` — but the fold is reported, so nobody has to assume the string that
+    /// went in is character-for-character the string they sent.
+    #[test]
+    fn lower_case_is_spelled_on_the_upper_case_key_and_said_so() {
+        let t = keypad("oneshot");
+        let seq = t.spell("g9").expect("spellable");
+        assert_eq!(seq[0].button, "MDI_G");
+        assert!(seq[0].case_folded, "the fold has to be visible");
+        assert!(!seq[1].case_folded, "a digit was not folded");
+    }
+
+    /// A shifted legend nothing can reach is a fact written down and then unusable, which is
+    /// the same as not writing it down. Refused where it is written.
+    #[test]
+    fn a_shifted_legend_without_a_declared_shift_key_does_not_load() {
+        let doc = r#"{"window":{"title":"x"},"buttons":{
+            "MDI_F":{"rect":[0,0,10,10],"types":"F","shift_types":"E"}}}"#;
+        let e = serde_json::from_str::<Targets>(doc)
+            .expect("parses")
+            .validate()
+            .expect_err("no shift declared");
+        assert!(e.contains("shift"), "{e}");
+
+        // And the shift key has to be a button that exists, since spelling presses it.
+        let doc = r#"{"window":{"title":"x"},"buttons":{
+            "MDI_F":{"rect":[0,0,10,10],"types":"F","shift_types":"E"}},
+            "shift":{"button":"NOPE","mode":"oneshot"}}"#;
+        let e = serde_json::from_str::<Targets>(doc)
+            .expect("parses")
+            .validate()
+            .expect_err("no such button");
+        assert!(e.contains("NOPE"), "{e}");
+    }
+
+    /// Two keys claiming one legend would spell a string with whichever sorted first, which is
+    /// not a decision anybody made.
+    #[test]
+    fn two_keys_cannot_claim_the_same_legend() {
+        let doc = r#"{"window":{"title":"x"},"buttons":{
+            "A":{"rect":[0,0,10,10],"types":"7"},
+            "B":{"rect":[10,0,10,10],"types":"7"}}}"#;
+        let e = serde_json::from_str::<Targets>(doc)
+            .expect("parses")
+            .validate()
+            .expect_err("ambiguous legend");
+        assert!(e.contains("'A'") && e.contains("'B'"), "{e}");
+    }
+
+    /// A key legended with several characters is taken before the single-character keys that
+    /// would otherwise shadow it.
+    #[test]
+    fn the_longest_legend_wins_at_each_position() {
+        let doc = r#"{"window":{"title":"x"},"buttons":{
+            "G":{"rect":[0,0,10,10],"types":"G"},
+            "ZERO":{"rect":[10,0,10,10],"types":"0"},
+            "G0":{"rect":[20,0,10,10],"types":"G0"}}}"#;
+        let t: Targets = serde_json::from_str(doc).expect("parses");
+        t.validate().expect("valid");
+        assert_eq!(spelt(&t, "G0"), ["G0"]);
+        assert_eq!(spelt(&t, "0G"), ["ZERO", "G"]);
+    }
+
     #[test]
     fn scale_policy_scales_coordinates() {
         let mut t = sample();
@@ -985,8 +1354,10 @@ mod tests {
                 click_button: "left".into(),
                 double: false,
                 confirm: false,
-        anchor: String::new(),
-        hold_ms: None,
+                anchor: String::new(),
+                hold_ms: None,
+                types: String::new(),
+                shift_types: String::new(),
                 settle_ms: None,
                 note: String::new(),
             });

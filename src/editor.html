@@ -371,6 +371,7 @@ const STRINGS = {
     'ok.created': "Created '{0}'. Pick the program to drive from [Programs] — its screen appears the moment you do.",
     'ok.toregion': 'Changed to a region. A region is only a rectangle, so {0} was dropped.',
     'drop.confirm': 'confirm', 'drop.settle': 'settle ms', 'drop.note': 'note',
+    'drop.legend': 'the key legends',
     'confirm.delall': 'This deletes all {0} entries. Nothing reaches the file until you save.',
     'confirm.delall.one': 'This deletes the one entry in the list. Nothing reaches the file until you save.',
     'ok.cleared': 'List cleared. Save to write it to the file.',
@@ -496,6 +497,7 @@ const STRINGS = {
     'ok.created': "'{0}' 을 만들었습니다. [프로그램 목록] 에서 조작할 프로그램을 고르세요 — 고르는 순간 그 화면이 뜹니다.",
     'ok.toregion': '영역으로 바꿨습니다. 영역은 사각형만 가지므로 {0} 은(는) 버렸습니다.',
     'drop.confirm': '확인 필요', 'drop.settle': '정착 ms', 'drop.note': '메모',
+    'drop.legend': '키 표기',
     'confirm.delall': '목록의 {0}개를 모두 지웁니다. 저장하기 전까지는 파일에 반영되지 않습니다.',
     'ok.cleared': '목록을 비웠습니다. 저장해야 파일에 반영됩니다.',
     'err.nosize': '창 크기를 아직 못 읽었습니다.',
@@ -842,6 +844,10 @@ function toDoc(t) {
     if (g.confirm) o.confirm = true;
     if (g.settle_ms != null) o.settle_ms = g.settle_ms;
     if (g.hold_ms != null) o.hold_ms = g.hold_ms;
+    // The keypad legends. This page cannot edit them, which is exactly why it has to carry
+    // them: a save that silently dropped them would take the whole spelling map with it.
+    if (g.types) o.types = g.types;
+    if (g.shift_types) o.shift_types = g.shift_types;
     if (g.anchor) o.anchor = g.anchor;
     if (g.note) o.note = g.note;
     d.buttons[g.name] = o;
@@ -877,6 +883,8 @@ function toDocFromItems() {
     if (it.confirm) o.confirm = true;
     if (it.settle_ms != null && it.settle_ms !== '') o.settle_ms = Number(it.settle_ms);
     if (it.hold_ms != null && it.hold_ms !== '') o.hold_ms = Number(it.hold_ms);
+    if (it.types) o.types = it.types;
+    if (it.shift_types) o.shift_types = it.shift_types;
     if (it.anchor) o.anchor = it.anchor;
     if (it.note) o.note = it.note;
     d.buttons[it.name] = o;
@@ -1440,7 +1448,8 @@ function changeKind(to) {
     if (it.confirm) dropped.push(t('drop.confirm'));
     if (it.settle_ms != null && it.settle_ms !== '') dropped.push(t('drop.settle'));
     if (it.note) dropped.push(t('drop.note'));
-    ['point', 'click_button', 'double', 'confirm', 'settle_ms', 'note']
+    if (it.types || it.shift_types) dropped.push(t('drop.legend'));
+    ['point', 'click_button', 'double', 'confirm', 'settle_ms', 'hold_ms', 'types', 'shift_types', 'note']
       .forEach(k => delete it[k]);
     it.kind = 'region';
     if (dropped.length) {

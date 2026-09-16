@@ -245,6 +245,14 @@ pub struct ClickReq {
     pub confirm: bool,
     #[serde(default)]
     pub settle_ms: Option<u64>,
+    /// **Spell a string on the keypad** — expanded into `buttons` before anything is
+    /// pressed, using the keys' own `types`/`shift_types` legends.
+    ///
+    /// Not called `text`: `POST /key` has a `text` that types on the **PC keyboard**, and one
+    /// word for two different routes into the machine is exactly the confusion that made
+    /// `keys` and `chord` separate names.
+    #[serde(default)]
+    pub spell: Option<String>,
     /// The region to capture after the press. Absent, nothing is captured.
     #[serde(default)]
     pub capture: Option<String>,
@@ -418,6 +426,7 @@ impl ClickReq {
             hold_ms: q_num(q, "hold_ms")?,
             confirm: q_bool(q, "confirm")?.unwrap_or(false),
             settle_ms: q_num(q, "settle_ms")?,
+            spell: q_get(q, "spell"),
             per_press: q_bool(q, "per_press")?,
             measure: q_bool(q, "measure")?,
             quiet_ms: q_num(q, "quiet_ms")?,
@@ -1362,6 +1371,8 @@ fn defs_view(t: &Targets) -> Value {
                 "settle_ms": b.settle_ms,
                 "hold_ms": b.hold_ms,
                 "anchor": b.anchor,
+                "types": b.types,
+                "shift_types": b.shift_types,
                 "note": b.note,
             })
         })
@@ -1387,6 +1398,9 @@ fn defs_view(t: &Targets) -> Value {
         "on_size_mismatch": t.on_size_mismatch,
         "buttons": buttons,
         "regions": regions,
+        // Which key reaches a button's second legend, and whether it latches. A caller that
+        // wants to spell a string itself needs this as much as it needs the legends.
+        "shift": t.shift,
         "keys": keys,
     })
 }
@@ -1654,6 +1668,106 @@ pub async fn preview_png(
     .await
     .map_err(|e| ApiError::internal(format!("preview task failed: {e}")))??;
     Ok(png_response(png, &meta))
+}
+
+/// Turn a spelled sequence into the shape the reply carries.
+fn spelled_json(t: &Targets, seq: &[crate::targets::Spelled], text: &str) -> Value {
+    let folded: Vec<&str> =
+        seq.iter().filter(|s| s.case_folded).map(|s| s.enters.as_str()).collect();
+    let mut v = json!({
+        "text": text,
+        "buttons": seq.iter().map(|s| s.button.clone()).collect::<Vec<_>>(),
+        "presses": seq.len(),
+        "steps": seq.iter().map(|s| json!({
+            "button": s.button,
+            "enters": s.enters,
+            "shift": s.is_shift,
+        })).collect::<Vec<_>>(),
+    });
+    if let Some(s) = &t.shift {
+        v["shift"] = json!({
+            "button": s.button,
+            "mode": match s.mode {
+                crate::targets::ShiftMode::Oneshot => "oneshot",
+                crate::targets::ShiftMode::Toggle => "toggle",
+            },
+            "presses": seq.iter().filter(|p| p.is_shift).count(),
+        });
+    }
+    if !folded.is_empty() {
+        // The string that goes in is not character-for-character the string that was sent, and
+        // that is worth one line rather than a surprise in the input display.
+        v["case_folded"] = json!(folded);
+        v["case_folded_note"] = json!(
+            "these characters were matched on a key of the other case — a keypad is upper \
+             case, so 'g91' is spelled with the G key. The characters entered are the key's, \
+             not the ones you sent."
+        );
+    }
+    v
+}
+
+/// Refusal for a string this keypad cannot enter — **every** character, not the first.
+///
+/// One at a time would mean a round trip per character, and the round trips in between are
+/// presses on a machine. It also names what the keypad *can* enter, because the usual cause
+/// is a character that simply is not on this panel.
+fn unspellable(t: &Targets, text: &str, bad: &[crate::targets::Unspellable]) -> ApiError {
+    let mut legends: Vec<String> = t
+        .buttons
+        .values()
+        .flat_map(|b| [b.types.clone(), b.shift_types.clone()])
+        .filter(|s| !s.is_empty())
+        .collect();
+    legends.sort();
+    ApiError::bad_request(format!(
+        "{} character(s) of {text:?} have no key on this keypad",
+        bad.len()
+    ))
+    .with_detail(json!({
+        "text": text,
+        "unspellable": bad.iter().map(|u| json!({"at": u.at, "character": u.character})).collect::<Vec<_>>(),
+        "can_enter": legends,
+        "note": if legends.is_empty() {
+            "this profile records no key legends at all. Put \"types\" on the keys that enter \
+             characters (and \"shift_types\" for the second legend), or press them by name with \
+             \"buttons\": [...]."
+        } else {
+            "nothing was pressed. A partial entry left in the machine is worse than none — \
+             press CYCLE START after one and an unintended block runs — so the whole string is \
+             refused rather than the part of it that could be spelled."
+        },
+    }))
+}
+
+/// **How this keypad would spell a string — pressing nothing.**
+///
+/// The point of it being a separate read is that a string can be checked before a machine
+/// receives it. `POST /click` with `"spell"` presses the same sequence.
+pub async fn spell(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
+    let text = q_get(&q, "text").ok_or_else(|| {
+        ApiError::bad_request("text is required — GET /spell?text=G91X0").with_detail(json!({
+            "note": "this presses nothing; it answers which keys that string would press",
+        }))
+    })?;
+    let t = prof.targets();
+    match t.spell(&text) {
+        Ok(seq) => {
+            let mut v = spelled_json(&t, &seq, &text);
+            v["profile"] = json!(prof.name);
+            v["pressed"] = json!(false);
+            v["note"] = json!(
+                "nothing was pressed. Send the same string as POST /click {\"spell\": \"…\"} to \
+                 press it, or the 'buttons' list above if you want to change it first."
+            );
+            Ok(json_ok(v))
+        }
+        Err(bad) => Err(unspellable(&t, &text, &bad)),
+    }
 }
 
 // ────────────────────────── the contact sheet ──────────────────────────
@@ -2630,6 +2744,47 @@ PRESS SEVERAL BUTTONS IN ORDER - for keypads, where a half-entry is worse than n
   "buttons" cannot be combined with "button", "rect" or "point". At most 200 per request.
   In the query form (/click.png) it is a comma-separated list: buttons=MDI_G,MDI_9.
 
+  SPELL A STRING INSTEAD OF NAMING EVERY KEY - "spell"
+  Working out that G91X0 is MDI_G, MDI_9, MDI_1, MDI_X, MDI_0 is work the server can do,
+  and the one fact it needs - which key carries which character - is in the profile:
+    "MDI_F": {{"rect": [...], "types": "F", "shift_types": "E"}}
+  types is the legend printed on the key. shift_types is the SECOND legend, the small one
+  above it, reached through the shift key. That E is on the F key used to live in an
+  English sentence in "note", where nothing could read it and nobody could check it.
+
+  Look first, pressing nothing:
+    curl -s "{base}/spell?profile=NAME&text=G91X0"
+  Then press it:
+    curl -s -X POST -H "Content-Type: application/json" \
+      -d '{{"spell":"G91X0","capture":"hmi_display"}}' {base}/click
+
+  IT BECOMES AN ORDINARY SEQUENCE, so everything above applies unchanged: every key is
+  resolved before anything is pressed, a failed press stops the rest, gap_ms spaces them,
+  per_press says which one did nothing, and a confirm button inside still needs
+  "confirm": true. The reply's "spelled" says what the string turned into, including the
+  shift presses, which enter nothing and would otherwise look like stray keys.
+
+  A CHARACTER WITH NO KEY REFUSES THE WHOLE STRING, and names EVERY such character rather
+  than the first - fixing them one per round trip means pressing keys in between. Nothing
+  is entered: a partial entry is worse than none.
+
+  SHIFT IS DECLARED, NEVER ASSUMED. In the profile:
+    "shift": {{"button": "MDI_SHIFT", "mode": "oneshot" | "toggle"}}
+    oneshot  reaches the second legend for ONE key, then falls back by itself
+    toggle   stays on until pressed again
+  They are not interchangeable and the wrong one types a different string with no error -
+  on a one-shot panel, a latch model spells "EE" as E then f. A profile that records a
+  shifted legend without declaring this does not load. With toggle, spelling always turns
+  it back off at the end, so a sequence never leaves the panel in a state the next caller
+  did not ask for.
+
+  Lower case is spelled on the upper-case key - a keypad is upper case, so "g91" works -
+  and the reply says which characters were folded, because what went into the machine is
+  then the key's character and not the one you sent.
+
+  GET /buttons carries types and shift_types, and GET /profiles carries "shift", so a
+  caller that would rather build the sequence itself has everything to do it with.
+
   WHICH PRESS WAS IGNORED - "per_press": true
   A sequence reports the screen after the LAST press, so a key the application quietly
   dropped halfway through is invisible: the end screen looks like a working one minus a
@@ -2852,6 +3007,8 @@ ENDPOINTS
                        cannot show for a whole panel. See "the contact sheet" above
   GET  /sheet          the same sheet as JSON - its shape, where it was saved, and which
                        buttons had no picture to show
+  GET  /spell          ?text=G91X0 - which keys that string would press on this keypad.
+                       Presses NOTHING; POST /click {{"spell": "..."}} presses it
   GET  /windows        every visible top-level window (to find a title)
   GET  /controls       every child control inside the target window, with its rectangle
                        in window coordinates and its caption. Rectangles you can read
@@ -2865,8 +3022,8 @@ ENDPOINTS
                        the server-side path and /captures URL, and no image in the body.
                        Use it when you want the picture kept and referred to rather than
                        read right now. Parameters go in the body
-  POST /click          {{button | buttons[] | rect | point, confirm, click_button, double, hold_ms,
-                       measure, quiet_ms, per_press,
+  POST /click          {{button | buttons[] | spell | rect | point, confirm, click_button,
+                       double, hold_ms, measure, quiet_ms, per_press,
                        settle_ms, gap_ms, capture, pad, ignore}} - the reply carries "hit"
                        (what was under the point) and "change" (pixels + bbox). With
                        "buttons" it presses them in order and stops at the first failure
@@ -3506,7 +3663,7 @@ const DEFAULT_SEQUENCE_SETTLE_MS: u64 = 800;
 /// Ceiling on how many presses one request may carry.
 const MAX_SEQUENCE: usize = 200;
 
-async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>, Value), ApiError> {
+async fn do_click(state: &SharedState, mut req: ClickReq) -> Result<(Option<Vec<u8>>, Value), ApiError> {
     let prof = pick(state, req.profile.as_deref(), req.params)?;
     // One input at a time, across every profile. There is one mouse and one foreground on a
     // PC, so driving two windows at once would have them stealing focus from each other.
@@ -3514,6 +3671,38 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
     let st = state.clone();
     tokio::task::spawn_blocking(move || {
         let t = prof.targets();
+
+        // A spelled string becomes an ordinary sequence here, before anything else reads the
+        // request. `buttons` is then the only shape the rest of this function knows about, so
+        // gap_ms, "stop at the first failure", per_press and the confirm rule apply to a
+        // spelled string exactly as they do to a hand-written array — which is the whole
+        // reason this expands rather than being a second way to press things.
+        let spelled = match &req.spell {
+            None => None,
+            Some(text) => {
+                if req.buttons.is_some()
+                    || req.button.is_some()
+                    || req.rect.is_some()
+                    || req.point.is_some()
+                {
+                    return Err(ApiError::bad_request(
+                        "'spell' cannot be combined with 'button', 'buttons', 'rect' or 'point' \
+                         — spelling IS the sequence",
+                    ));
+                }
+                let seq = t.spell(text).map_err(|bad| unspellable(&t, text, &bad))?;
+                if seq.is_empty() {
+                    return Err(ApiError::bad_request("'spell' is empty — nothing to press")
+                        .with_detail(json!({
+                            "note": "a string with no characters presses nothing, which is \
+                                     not something to do quietly",
+                        })));
+                }
+                let v = spelled_json(&t, &seq, text);
+                req.buttons = Some(seq.iter().map(|s| s.button.clone()).collect());
+                Some(v)
+            }
+        };
 
         // Answer request-shape problems BEFORE looking up the window. A typo in a button name
         // does not depend on the window being there, and reporting it as "no visible window
@@ -3854,6 +4043,12 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
         });
         if !measured.is_null() {
             result["settle"] = measured;
+        }
+        // What the string turned into. Without it the reply lists button names and leaves the
+        // caller to work out which character each one was, including the shift presses that
+        // enter nothing.
+        if let Some(v) = spelled {
+            result["spelled"] = v;
         }
         if sequence {
             result["pressed"] = json!(done);
@@ -4806,6 +5001,7 @@ mod tests {
             anchors: std::collections::BTreeMap::new(),
             regions: std::collections::BTreeMap::new(),
             buttons: std::collections::BTreeMap::new(),
+            shift: None,
             keys: std::collections::BTreeMap::new(),
         };
         t.buttons.insert(
@@ -4816,8 +5012,10 @@ mod tests {
                 click_button: "left".into(),
                 double: false,
                 confirm: false,
-        anchor: String::new(),
-        hold_ms: None,
+                anchor: String::new(),
+                hold_ms: None,
+                types: String::new(),
+                shift_types: String::new(),
                 settle_ms: None,
                 note: String::new(),
             },
@@ -4884,6 +5082,7 @@ mod tests {
             anchors: std::collections::BTreeMap::new(),
             regions: std::collections::BTreeMap::new(),
             buttons: std::collections::BTreeMap::new(),
+            shift: None,
             keys: std::collections::BTreeMap::new(),
         };
         let def = |rect, confirm| crate::targets::ButtonDef {
@@ -4891,8 +5090,10 @@ mod tests {
             point: None,
             click_button: "left".into(),
             double: false,
-        anchor: String::new(),
-        hold_ms: None,
+                anchor: String::new(),
+                hold_ms: None,
+                types: String::new(),
+                shift_types: String::new(),
             confirm,
             settle_ms: None,
             note: String::new(),
@@ -5031,29 +5232,39 @@ mod tests {
     /// The manual is a raw string whose columns line up on purpose, so it is skipped.
     #[test]
     fn no_message_carries_its_own_indentation() {
-        let src = include_str!("api.rs");
-        let mut in_manual = false;
+        // Every file that writes messages a caller reads. This keeps happening — a `\` at the
+        // end of a line is invisible in a diff and survives compilation either way, so the
+        // only thing that catches it is looking at every string literal.
+        let files: [(&str, &str); 4] = [
+            ("api.rs", include_str!("api.rs")),
+            ("targets.rs", include_str!("targets.rs")),
+            ("config.rs", include_str!("config.rs")),
+            ("sheet.rs", include_str!("sheet.rs")),
+        ];
         let mut bad = Vec::new();
-        for (n, line) in src.lines().enumerate() {
-            if line.contains("r#\"deescreen v{version}") {
-                in_manual = true;
-            } else if in_manual && line.trim_start().starts_with("\"#") {
-                in_manual = false;
-            }
-            if in_manual {
-                continue;
-            }
-            // Odd-numbered pieces of a split on `"` are the insides of string literals.
-            for body in line.split('"').skip(1).step_by(2) {
-                let squashed = body.trim();
-                if squashed.contains("    ") && squashed.split("    ").count() > 1 {
-                    let joined_words = squashed
-                        .split("    ")
-                        .filter(|p| !p.is_empty())
-                        .count()
-                        > 1;
-                    if joined_words && !squashed.starts_with('-') && !squashed.contains("{:?}") {
-                        bad.push(format!("api.rs:{}: {}", n + 1, &squashed[..squashed.len().min(70)]));
+        for (file, src) in files {
+            let mut in_manual = false;
+            for (n, line) in src.lines().enumerate() {
+                if line.contains("r#\"deescreen v{version}") {
+                    in_manual = true;
+                } else if in_manual && line.trim_start().starts_with("\"#") {
+                    in_manual = false;
+                }
+                if in_manual {
+                    continue;
+                }
+                // Odd-numbered pieces of a split on `"` are the insides of string literals.
+                for body in line.split('"').skip(1).step_by(2) {
+                    let squashed = body.trim();
+                    if squashed.contains("    ") && squashed.split("    ").count() > 1 {
+                        let joined_words = squashed
+                            .split("    ")
+                            .filter(|p| !p.is_empty())
+                            .count()
+                            > 1;
+                        if joined_words && !squashed.starts_with('-') && !squashed.contains("{:?}") {
+                            bad.push(format!("{file}:{}: {}", n + 1, &squashed[..squashed.len().min(70)]));
+                        }
                     }
                 }
             }
