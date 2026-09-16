@@ -2958,9 +2958,9 @@ LOOK AT SOMETHING
   that does not move with an anchor. Reserving the prefix rather than individual words means
   the next such value costs nobody a rename.
 
-  Region names and their absolute rects come from GET /regions (or /profiles). "@client" is reserved and means the whole
-  client area. A capture attached to a click costs two renders (before and after), so
-  ask for one when you intend to look.
+  Region names and their absolute rects come from GET /regions (or /profiles).
+  "@client" is reserved and means the whole client area. A capture attached to a click
+  costs two renders (before and after), so ask for one when you intend to look.
 
   A CROPPED CAPTURE STARTS AT ITS OWN (0,0), NOT THE WINDOW'S.
   If you read a pixel off a region capture and send it back as a click, it is wrong by
@@ -3038,9 +3038,10 @@ ENDPOINTS
                        (NOT in /buttons - that endpoint is buttons only). {{chord}} presses an
                        unnamed combination ("f1", "ctrl+alt+f1") and {{text}} types a string;
                        both need allow_raw_keys.
-                       Takes {{capture, ignore, settle_ms, measure, quiet_ms, scale, max_width}}
-                       too, so one call presses and shows you the result - and "measure": true
-                       times this key's settle the same way it does for a click. There is no "hit" here -
+                       Takes {{capture, ignore, settle_ms, measure, quiet_ms, scale,
+                       max_width}} too, so one call presses and shows you the result -
+                       and "measure": true times this key's settle exactly as it does for
+                       a click. There is no "hit" here -
                        a key has no coordinate, so "did it arrive" has no cheap answer;
                        check /health input.uipi_risk instead.
   POST /window/focus   raise it / un-minimize it
@@ -3139,7 +3140,8 @@ CREATE A PROFILE FROM SCRATCH
 
   6. Verify before you trust it. You can look at a document BEFORE saving it - the same
      overlay, drawn from the body you send, storing nothing and touching no file:
-       curl -s -X POST -H "Content-Type: application/json" --data-binary @p.json          -o check.png "{base}/preview.png?profile=nctrainer&buttons=1"
+       curl -s -X POST -H "Content-Type: application/json" --data-binary @p.json \
+         -o check.png "{base}/preview.png?profile=nctrainer&buttons=1"
      It takes the capture parameters too (region, rect, scale, pad), and it validates the
      document, so a rectangle off the window is refused here rather than saved. After
      saving, the same picture comes from a plain capture:
@@ -3168,7 +3170,9 @@ EDITING A PROFILE FROM A PROGRAM
   is 140 chances to move a coordinate by one digit in a way that validates, saves, and
   answers success. PATCH sends only the difference:
 
-    curl -s -X PATCH -H "Content-Type: application/json"       -d '{{"buttons": {{"NEW_KEY": {{"rect": [820,640,60,40]}}, "OLD_KEY": null}}}}'       "{base}/admin/profile?profile=NAME"
+    curl -s -X PATCH -H "Content-Type: application/json" \
+      -d '{{"buttons": {{"NEW_KEY": {{"rect": [820,640,60,40]}}, "OLD_KEY": null}}}}' \
+      "{base}/admin/profile?profile=NAME"
 
   It is a JSON merge patch (RFC 7386), and there are only three rules:
     - a value REPLACES what is at that key
@@ -3339,7 +3343,8 @@ TRAPS - these fail quietly or confusingly. Read once, save yourself an hour.
                    not change, and "hit" only asks whether a control is there. Wide keys still
                    take the press, narrow ones give it to a neighbour, so it looks like it
                    works right up until it does not. Fix it with anchors - see
-                   WHEN AN APPLICATION MOVES ITS OWN LAYOUT above - or by re-measuring. A profile with no "aim" in its reply has a rectangle that was
+                   WHEN AN APPLICATION MOVES ITS OWN LAYOUT above - or by re-measuring. A
+                   profile with no "aim" in its reply has a rectangle that was
                    drawn by hand rather than copied from a control, so there is nothing to
                    compare and this stays silent.
   press too short   The click reached a real, enabled control - "hit" proves that - and the
