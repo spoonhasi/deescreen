@@ -248,6 +248,17 @@ pub struct ClickReq {
     /// The region to capture after the press. Absent, nothing is captured.
     #[serde(default)]
     pub capture: Option<String>,
+    /// Measure how long the screen takes to settle, instead of waiting a fixed `settle_ms`.
+    ///
+    /// Costs a capture every 50ms until it holds still, so it is opt-in — but it answers
+    /// the question `settle_ms` otherwise leaves to repetition, and the reply carries the
+    /// number to write into the profile.
+    #[serde(default)]
+    pub measure: Option<bool>,
+    /// How long the screen has to hold still before `measure` calls it settled. Raise it for an
+    /// application that repaints in stages.
+    #[serde(default)]
+    pub quiet_ms: Option<u64>,
     /// Rectangle to **exclude** from the change comparison (window client coordinates).
     /// Put a clock in here and it stops making `changed` true on its own.
     #[serde(default)]
@@ -285,6 +296,17 @@ pub struct KeyReq {
     /// Pixels to grow the capture rectangle by on every side.
     #[serde(default)]
     pub pad: Option<i32>,
+    /// Measure how long the screen takes to settle, instead of waiting a fixed `settle_ms`.
+    ///
+    /// Costs a capture every 50ms until it holds still, so it is opt-in — but it answers
+    /// the question `settle_ms` otherwise leaves to repetition, and the reply carries the
+    /// number to write into the profile.
+    #[serde(default)]
+    pub measure: Option<bool>,
+    /// How long the screen has to hold still before `measure` calls it settled. Raise it for an
+    /// application that repaints in stages.
+    #[serde(default)]
+    pub quiet_ms: Option<u64>,
     /// Rectangle to **exclude** from the change comparison (window client coordinates).
     /// Put a clock in here and it stops making `changed` true on its own.
     #[serde(default)]
@@ -389,6 +411,8 @@ impl ClickReq {
             hold_ms: q_num(q, "hold_ms")?,
             confirm: q_bool(q, "confirm")?.unwrap_or(false),
             settle_ms: q_num(q, "settle_ms")?,
+            measure: q_bool(q, "measure")?,
+            quiet_ms: q_num(q, "quiet_ms")?,
             capture: q_get(q, "capture"),
             pad: q_num(q, "pad")?,
             ignore: q_rect_named(q, "ignore")?,
@@ -685,6 +709,158 @@ fn shoot(
     let (method, black) = (shot.method, shot.black);
     let frame = captures::frame(&shot, rect, scale, max_width).map_err(ApiError::bad_request)?;
     Ok((frame, method, black))
+}
+
+/// How often to look while measuring. Fine enough that 50ms of resolution is not the limiting
+/// factor on a number in the hundreds, coarse enough that the looking does not become the
+/// thing being measured.
+const WATCH_POLL_MS: u64 = 50;
+/// How long the screen has to hold still before it counts as settled.
+const DEFAULT_QUIET_MS: u64 = 300;
+
+/// What watching the screen after a press saw.
+///
+/// **"Settled" here means "held still for `quiet_ms`", which is a definition and not an
+/// observation.** An application that pauses longer than that between two repaints is called
+/// settled during the pause, and nothing outside the process can tell the difference. So the
+/// definition is reported alongside the answer, and raising `quiet_ms` is what to do when a
+/// screen is known to arrive in stages.
+struct Watch {
+    /// Milliseconds after the press when the picture last differed from the one before it.
+    /// Zero means it never changed at all — which `changed` reports separately.
+    last_change_ms: u64,
+    first_change_ms: Option<u64>,
+    /// How long it had been still when watching stopped.
+    quiet_for_ms: u64,
+    /// Total time spent watching, which is what the caller actually waited.
+    elapsed_ms: u64,
+    samples: usize,
+    /// The gap actually achieved between shots — the resolution of every number above. A
+    /// capture is not free, so this is larger than the interval asked for, and saying so beats
+    /// implying a precision the method does not have.
+    resolution_ms: u64,
+    /// False when the ceiling arrived first: the screen never held still.
+    settled: bool,
+    /// The last picture taken. Reused as the request's capture, so measuring costs no extra
+    /// shot and the picture is of the moment the screen was declared settled.
+    last: (Frame, &'static str, bool),
+}
+
+/// Watch one region until it stops changing.
+fn watch_until_still(
+    info: &WindowInfo,
+    rect: Rect,
+    scale: Option<f64>,
+    max_width: Option<u32>,
+    ignore: Option<Rect>,
+    quiet_ms: u64,
+    ceiling_ms: u64,
+) -> Result<Watch, ApiError> {
+    let started = std::time::Instant::now();
+    let mut prev = shoot(info, rect, scale, max_width)?;
+    let mut samples = 1usize;
+    // The press itself is a change, at t=0. Starting from "never changed" would let a screen
+    // that has not repainted yet be called settled before it began.
+    let mut last_change_ms = 0u64;
+    let mut first_change_ms: Option<u64> = None;
+    let mut settled = false;
+
+    loop {
+        let now = started.elapsed().as_millis() as u64;
+        if now.saturating_sub(last_change_ms) >= quiet_ms {
+            settled = true;
+            break;
+        }
+        if now >= ceiling_ms {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(WATCH_POLL_MS));
+        let cur = shoot(info, rect, scale, max_width)?;
+        samples += 1;
+        let at = started.elapsed().as_millis() as u64;
+        // A frame that changed size means the window was resized while being watched. That is
+        // a change, and a larger one than any number of pixels.
+        let moved = prev.0.diff(&cur.0, ignore).map(|d| d.pixels > 0).unwrap_or(true);
+        if moved {
+            first_change_ms.get_or_insert(at);
+            last_change_ms = at;
+        }
+        prev = cur;
+    }
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    Ok(Watch {
+        last_change_ms,
+        first_change_ms,
+        quiet_for_ms: elapsed_ms.saturating_sub(last_change_ms),
+        elapsed_ms,
+        samples,
+        resolution_ms: elapsed_ms / (samples.saturating_sub(1).max(1)) as u64,
+        settled,
+        last: prev,
+    })
+}
+
+/// How long to require stillness, and how long to wait for it.
+///
+/// The ceiling is the server's own `max_settle_ms`, because a measurement is a wait and the
+/// operator's limit on waiting does not stop applying because the wait is being measured.
+/// `quiet_ms` is held below half of it: at or above the ceiling nothing could ever be called
+/// settled, and a knob whose extreme setting silently guarantees failure is a trap.
+fn watch_bounds(cfg: &Config, quiet_ms: Option<u64>) -> (u64, u64) {
+    let ceiling = cfg.max_settle_ms.max(WATCH_POLL_MS * 4);
+    let quiet = quiet_ms
+        .unwrap_or(DEFAULT_QUIET_MS)
+        .clamp(WATCH_POLL_MS, (ceiling / 2).max(WATCH_POLL_MS));
+    (quiet, ceiling)
+}
+
+/// The number to write into the profile.
+///
+/// A quarter more than the longest wait seen, rounded up to 50ms, and never shorter than two
+/// sampling intervals. Measured once on a quiet machine, this has to survive a busy one — and
+/// a settle that is too long costs a wait, while one that is too short returns the screen from
+/// before the press and calls it the result.
+fn suggest_settle(last_change_ms: u64, resolution_ms: u64) -> u64 {
+    let n = (last_change_ms + last_change_ms / 4).max(resolution_ms * 2);
+    n.div_ceil(50) * 50
+}
+
+/// The measurement, as the reply carries it.
+fn watch_json(w: &Watch, quiet_ms: u64, ceiling_ms: u64) -> Value {
+    let suggest = suggest_settle(w.last_change_ms, w.resolution_ms);
+    json!({
+        "measured": true,
+        "settled": w.settled,
+        "last_change_ms": w.last_change_ms,
+        "first_change_ms": w.first_change_ms,
+        "quiet_for_ms": w.quiet_for_ms,
+        "waited_ms": w.elapsed_ms,
+        "samples": w.samples,
+        "resolution_ms": w.resolution_ms,
+        "quiet_ms": quiet_ms,
+        "max_settle_ms": ceiling_ms,
+        "suggest_settle_ms": suggest,
+        "note": if w.settled {
+            format!(
+                "the screen last changed {}ms after the press and then held still. Put \
+                 settle_ms: {suggest} on this button in the profile, so the number is measured \
+                 once here rather than guessed by every caller. 'Settled' means 'held still for \
+                 {quiet_ms}ms' - an application that pauses longer than that between repaints \
+                 is called settled during the pause, so raise quiet_ms where a screen is known \
+                 to arrive in stages.",
+                w.last_change_ms
+            )
+        } else {
+            format!(
+                "the screen never held still for {quiet_ms}ms within {ceiling_ms}ms, so this is \
+                 NOT a settle time - something on it is animating. A blinking cursor, a clock or \
+                 a spinner does this; pass ignore=x,y,w,h to drop that rectangle from the \
+                 comparison and measure again. last_change_ms is where watching stopped, not \
+                 where the screen stopped."
+            )
+        },
+    })
 }
 
 /// Encode a frame as PNG and, if asked, keep a file too. Returns the metadata JSON with it.
@@ -2324,6 +2500,39 @@ PRESS A SAVED BUTTON - click, wait for it to settle, re-capture, one round trip
     settle_ms  how long to wait AFTER, before looking. Too short and you photograph the
                screen from before it caught up, and read a stale screen as the result.
   Both fail the same way - quietly, returning something that looks like an answer.
+  HAVE THE SERVER MEASURE settle_ms FOR YOU - "measure": true
+  Finding the right settle_ms by pressing, guessing and looking is slow and the answer you
+  reach is the smallest one that happened to work once. The server is on the same side of
+  the screen and can simply watch it: it photographs the region repeatedly, compares each
+  shot with the one before it, and reports when the changing stopped.
+    curl -s -X POST -H "Content-Type: application/json" \
+      -d '{{"button":"MONITOR","measure":true}}' {base}/click
+  The reply gains a "settle" object. The field to read is suggest_settle_ms - that is the
+  number to put on this button in the profile, so it is measured once here rather than
+  guessed by every caller afterwards:
+    "settle": {{"measured": true, "settled": true, "last_change_ms": 850,
+                "quiet_for_ms": 310, "waited_ms": 1160, "samples": 22,
+                "resolution_ms": 53, "quiet_ms": 300, "suggest_settle_ms": 1100}}
+    PATCH {{"buttons": {{"MONITOR": {{"settle_ms": 1100}}}}}}
+
+  measure REPLACES the fixed wait - it does not happen after one. The request waits exactly
+  as long as the watching took, and "settle_ms" in the reply is that real number. With no
+  capture named it watches the whole client area, since a measurement is a comparison of
+  pictures and needs one to compare.
+
+  "SETTLED" MEANS "HELD STILL FOR quiet_ms" (300 by default). That is a definition, not an
+  observation: an application that pauses longer than that between two repaints is called
+  settled during the pause, and nothing outside the process can tell the difference. Where a
+  screen is known to arrive in stages, raise it - "quiet_ms": 600.
+
+  "settled": false means the screen NEVER held still, and then the numbers are not a settle
+  time at all. Something is animating - a blinking cursor, a clock, a spinner. Pass
+  ignore=x,y,w,h to drop that rectangle from the comparison and measure again. The reply
+  says this outright rather than handing back the ceiling as though it were an answer.
+
+  Measuring costs a capture every 50ms until the screen is still, which is why it is opt-in.
+  Do it once per button that needs it, write the number down, and never do it again.
+
 
   HOW LONG THE KEY IS HELD DOWN - "hold_ms"
   A press is three things: the button goes down, time passes, the button comes up. hold_ms is
@@ -2606,6 +2815,7 @@ ENDPOINTS
                        Use it when you want the picture kept and referred to rather than
                        read right now. Parameters go in the body
   POST /click          {{button | buttons[] | rect | point, confirm, click_button, double, hold_ms,
+                       measure, quiet_ms,
                        settle_ms, gap_ms, capture, pad, ignore}} - the reply carries "hit"
                        (what was under the point) and "change" (pixels + bbox). With
                        "buttons" it presses them in order and stops at the first failure
@@ -2614,8 +2824,9 @@ ENDPOINTS
                        (NOT in /buttons - that endpoint is buttons only). {{chord}} presses an
                        unnamed combination ("f1", "ctrl+alt+f1") and {{text}} types a string;
                        both need allow_raw_keys.
-                       Takes {{capture, ignore, settle_ms, scale, max_width}} too, so one
-                       call presses and shows you the result. There is no "hit" here -
+                       Takes {{capture, ignore, settle_ms, measure, quiet_ms, scale, max_width}}
+                       too, so one call presses and shows you the result - and "measure": true
+                       times this key's settle the same way it does for a click. There is no "hit" here -
                        a key has no coordinate, so "did it arrive" has no cheap answer;
                        check /health input.uipi_risk instead.
   POST /window/focus   raise it / un-minimize it
@@ -3341,13 +3552,22 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
         // `capture=button` with no name means "the button just pressed" — for a sequence, the
         // last one. Pressing and then looking at that same control is the common case, and
         // repeating the name there is noise.
-        let region_name = req.capture.clone().filter(|r| !r.is_empty()).map(|r| {
-            if r == "button" {
-                format!("button:{}", presses.last().map(|p| p.name.as_str()).unwrap_or(""))
-            } else {
-                r
-            }
-        });
+        // Measuring **is** comparing pictures, so `measure` without a region to compare would
+        // be a request with no way to answer it. The whole client area is the honest default:
+        // whatever the press moved is somewhere in it.
+        let measure = req.measure.unwrap_or(false);
+        let region_name = req
+            .capture
+            .clone()
+            .filter(|r| !r.is_empty())
+            .or_else(|| measure.then(|| "@client".to_string()))
+            .map(|r| {
+                if r == "button" {
+                    format!("button:{}", presses.last().map(|p| p.name.as_str()).unwrap_or(""))
+                } else {
+                    r
+                }
+            });
         let pad = req.pad.unwrap_or(0).max(0);
         let crop = match &region_name {
             None => None,
@@ -3485,7 +3705,20 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
                 .or_else(|| presses.last().and_then(|p| p.settle_ms))
                 .unwrap_or(if sequence { DEFAULT_SEQUENCE_SETTLE_MS } else { st.config.default_settle_ms }),
         ));
-        std::thread::sleep(std::time::Duration::from_millis(settle));
+        // Either wait the agreed time, or watch until the screen stops moving and report how
+        // long that took. Never both: the wait and the measurement are two answers to the same
+        // question, and doing the fixed wait first would put it inside the number.
+        let (settle, measured, watched) = match (measure, crop) {
+            (true, Some(rect)) => {
+                let (quiet, ceiling) = watch_bounds(&st.config, req.quiet_ms);
+                let w = watch_until_still(&info, rect, req.scale, req.max_width, req.ignore, quiet, ceiling)?;
+                (w.elapsed_ms, watch_json(&w, quiet, ceiling), Some(w.last))
+            }
+            _ => {
+                std::thread::sleep(std::time::Duration::from_millis(settle));
+                (settle, Value::Null, None)
+            }
+        };
 
         // ── report ──
         let last = done.last().cloned().unwrap_or(Value::Null);
@@ -3494,6 +3727,9 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
             "settle_ms": settle,
             "window": window_json(&info),
         });
+        if !measured.is_null() {
+            result["settle"] = measured;
+        }
         if sequence {
             result["pressed"] = json!(done);
             result["sequence"] = json!({
@@ -3522,7 +3758,12 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
 
         let mut png_out = None;
         if let (Some(rect), Some(region)) = (crop, region_name.clone()) {
-            let (frame, method, black) = shoot(&info, rect, req.scale, req.max_width)?;
+            // Watching already ended on a picture of the settled screen. Taking another here
+            // would be a picture of a slightly later moment than the one that was measured.
+            let (frame, method, black) = match watched {
+                Some(f) => f,
+                None => shoot(&info, rect, req.scale, req.max_width)?,
+            };
             let label = format!("{}_{}", prof.name, safe_label(&region));
             let (png, mut meta) = deliver(&st, &frame, method, black, &label, true)?;
             if let Some(b) = before {
@@ -3607,7 +3848,10 @@ pub async fn key(State(state): State<SharedState>, body: Bytes) -> Result<Respon
             }
         };
 
-        let region_name = req.capture.clone();
+        // Same rule as a click: measuring is comparing pictures, so it needs one to compare.
+        let measure = req.measure.unwrap_or(false);
+        let region_name =
+            req.capture.clone().or_else(|| measure.then(|| "@client".to_string()));
         let pad = req.pad.unwrap_or(0).max(0);
         let crop = match &region_name {
             None => None,
@@ -3635,7 +3879,17 @@ pub async fn key(State(state): State<SharedState>, body: Bytes) -> Result<Respon
         }
 
         let settle = st.config.clamp_settle(req.settle_ms);
-        std::thread::sleep(std::time::Duration::from_millis(settle));
+        let (settle, measured, watched) = match (measure, crop) {
+            (true, Some(rect)) => {
+                let (quiet, ceiling) = watch_bounds(&st.config, req.quiet_ms);
+                let w = watch_until_still(&info, rect, req.scale, req.max_width, req.ignore, quiet, ceiling)?;
+                (w.elapsed_ms, watch_json(&w, quiet, ceiling), Some(w.last))
+            }
+            _ => {
+                std::thread::sleep(std::time::Duration::from_millis(settle));
+                (settle, Value::Null, None)
+            }
+        };
 
         let info = window::describe(info.handle)
             .ok_or_else(|| ApiError::conflict("the target window disappeared"))?;
@@ -3645,8 +3899,14 @@ pub async fn key(State(state): State<SharedState>, body: Bytes) -> Result<Respon
             "settle_ms": settle,
             "window": window_json(&info),
         });
+        if !measured.is_null() {
+            result["settle"] = measured;
+        }
         if let (Some(rect), Some(region)) = (crop, region_name) {
-            let (frame, method, black) = shoot(&info, rect, req.scale, req.max_width)?;
+            let (frame, method, black) = match watched {
+                Some(f) => f,
+                None => shoot(&info, rect, req.scale, req.max_width)?,
+            };
 
             let (_png, mut meta) =
                 deliver(&st, &frame, method, black, &format!("{}_{}", prof.name, safe_label(&region)), true)?;
@@ -4453,6 +4713,46 @@ mod tests {
         let v = near_names("qqqqqqqq", all(), "GET /buttons");
         assert!(v.get("did_you_mean").is_none(), "no near names: {v}");
         assert!(v.get("same_prefix").is_none(), "no underscore, no family: {v}");
+    }
+
+    /// The suggested settle is the number that ends up in a profile, so it errs long. Measured
+    /// once on a quiet machine it has to hold on a busy one, and the two ways of being wrong
+    /// are not symmetric: too long costs a wait, too short returns the screen from before the
+    /// press and calls it the result.
+    #[test]
+    fn the_suggested_settle_leaves_room_and_is_never_finer_than_the_measurement() {
+        // 850ms measured -> a quarter more, rounded up to 50.
+        assert_eq!(suggest_settle(850, 60), 1100);
+        // Rounding is always upwards, never to the nearest.
+        assert_eq!(suggest_settle(800, 60), 1000);
+        assert_eq!(suggest_settle(4, 60), 150);
+
+        // A screen that never moved still gets a floor. Suggesting 0 would read as "no wait
+        // needed", which is a claim about the machine that one quiet measurement cannot make.
+        assert!(suggest_settle(0, 60) >= 120, "{}", suggest_settle(0, 60));
+        for last in [0u64, 1, 250, 900, 5000] {
+            assert!(suggest_settle(last, 60) >= last, "{last} came back shorter than measured");
+        }
+    }
+
+    /// `quiet_ms` at or above the ceiling can never be reached, so the measurement would time
+    /// out every single time while looking like it had been configured. Clamped instead, and
+    /// clamped to half so there is room for an answer rather than just for the wait.
+    #[test]
+    fn a_stillness_longer_than_the_wait_is_clamped_rather_than_guaranteed_to_fail() {
+        let cfg = Config { max_settle_ms: 2000, ..Config::starter() };
+
+        let (quiet, ceiling) = watch_bounds(&cfg, None);
+        assert_eq!(ceiling, 2000);
+        assert_eq!(quiet, DEFAULT_QUIET_MS);
+
+        // Asked for longer than the whole wait.
+        let (quiet, ceiling) = watch_bounds(&cfg, Some(9_000));
+        assert!(quiet <= ceiling / 2, "quiet {quiet} of ceiling {ceiling}");
+
+        // And below one sample, which would call every gap between two shots "still".
+        let (quiet, _) = watch_bounds(&cfg, Some(1));
+        assert_eq!(quiet, WATCH_POLL_MS);
     }
 
     /// The sentence a refusal carries has to name the place the caller is actually standing in.

@@ -678,9 +678,9 @@ and a `/captures/<name>` URL instead.
 | GET | `/sheet` | read | the same sheet as JSON: its shape, where it was saved, and which buttons had no picture to show |
 | POST | `/preview.png` | read | draw a **candidate** definition from the body over the live screen. Saves nothing |
 | GET | `/captures/{name}` | read | fetch a stored capture |
-| POST | `/click` | **control** | `{button\|buttons[]\|rect\|point, confirm, click_button, double, settle_ms, gap_ms, capture, pad, ignore, scale, max_width}`. No `capture` means **no picture is taken**. `buttons` presses in order and stops at the first failure |
+| POST | `/click` | **control** | `{button\|buttons[]\|rect\|point, confirm, click_button, double, settle_ms, measure, quiet_ms, gap_ms, capture, pad, ignore, scale, max_width}`. No `capture` means **no picture is taken**. `buttons` presses in order and stops at the first failure |
 | POST | `/click.png` | **control** | same, PNG bytes back. Parameters go in the query. No `capture` captures the whole client area (an image has to come back) |
-| POST | `/key` | **control** | `{key\|chord\|text, settle_ms, capture, pad, ignore, …}` |
+| POST | `/key` | **control** | `{key\|chord\|text, settle_ms, measure, quiet_ms, capture, pad, ignore, …}` |
 | POST | `/window/focus` | **control** | bring the window forward (restore if minimised) |
 | POST | `/window/fit` | **control** | restore the client area to `reference_client` |
 | POST | `/admin/reload` | read+code | with `?profile=` re-reads that one; without, **rescans the disk** and picks up new files |
@@ -775,6 +775,51 @@ curl -s -X POST -o shot.png ".../click.png?button=OPT_STOP&capture=button&pad=25
 The point is not keystrokes saved. The rect is a number the server already holds, and
 re-deriving it in the caller is arithmetic done in a second place — which is where things go
 quietly wrong.
+
+### Measuring `settle_ms` instead of guessing it — `measure`
+
+`settle_ms` has to be right — too short and you photograph the screen from before the press
+and read it as the result — and until now the only way to learn it was to press the key, guess,
+look, and guess again. One key took repeated attempts to pin between 800 and 1000ms.
+
+The server is on the same side of the screen. `"measure": true` has it watch: photograph the
+region, compare with the shot before it, repeat, and report when the changing stopped.
+
+```bash
+curl -s -X POST -H "Content-Type: application/json" \
+  -d '{"button":"MONITOR","measure":true}' http://192.0.2.73:8090/click
+```
+
+```json
+"settle": { "measured": true, "settled": true, "last_change_ms": 850,
+            "quiet_for_ms": 310, "waited_ms": 1160, "samples": 22,
+            "resolution_ms": 53, "quiet_ms": 300, "suggest_settle_ms": 1100 }
+```
+
+`suggest_settle_ms` is the number to write into the profile — a quarter more than the longest
+wait seen, rounded up — so it is measured once, here, rather than guessed by every caller
+afterwards:
+
+```bash
+curl -s -X PATCH -H "Content-Type: application/json" \
+  -d '{"buttons": {"MONITOR": {"settle_ms": 1100}}}' ".../admin/profile?profile=NAME"
+```
+
+It **replaces** the fixed wait rather than following one, so the request takes exactly as long
+as the watching did and the reply's `settle_ms` is that real number. Naming no capture region
+watches the whole client area, since a measurement is a comparison of pictures and needs one.
+
+**"Settled" means "held still for `quiet_ms`" (300 by default), which is a definition and not an
+observation.** An application that pauses longer than that between repaints is called settled
+during the pause, and nothing outside the process can tell the difference — so raise `quiet_ms`
+where a screen is known to arrive in stages.
+
+`"settled": false` means it never held still, and then the numbers are not a settle time at
+all: something is animating. `ignore=x,y,w,h` drops that rectangle from the comparison. The
+reply says so outright instead of handing back the ceiling as though it were the answer.
+
+Measuring costs a capture every 50ms until the screen is still, which is why it is opt-in. Do
+it once per button that needs it and write the number down.
 
 ### Pressing several buttons in order — `buttons`
 
