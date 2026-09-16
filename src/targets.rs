@@ -7,6 +7,14 @@
 //! kept apart.
 //!
 //! Put the other way round: **whoever can edit this file holds the control authority.**
+//!
+//! ## The one thing outside it
+//!
+//! `POST /menu` presses a menu item, and a menu is read off the window rather than written
+//! here — a menu item has no stable rectangle to write down. So that endpoint reaches whatever
+//! the application's menu reaches, which is why it is off unless `allow_menus` is set, and why
+//! `confirm_menus` below is this file's only say in it. Everything else obeys the paragraph
+//! above without exception.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

@@ -9,6 +9,7 @@
     "192.0.2.20"
   ],
   "admin_code": "",
+  "profiles": {},
   "default_profile": "",
   "captures": {
     "dir": "captures",

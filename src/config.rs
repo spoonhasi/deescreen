@@ -62,9 +62,14 @@ pub struct Config {
 
     /// Whether **unnamed coordinates** may be clicked. Defaults to `false`.
     ///
-    /// This flag is the safety boundary. At `false`, only the names written in the profile
-    /// file can be pressed, which is what makes **whoever can edit that file the one who holds
-    /// control authority**. Turn it on while measuring new coordinates and turn it back off.
+    /// This flag is the safety boundary. At `false`, the only **coordinates** that can be
+    /// pressed are the ones written in the profile file, which is what makes **whoever can
+    /// edit that file the one who holds control authority**. Turn it on while measuring new
+    /// coordinates and turn it back off.
+    ///
+    /// It says coordinates rather than "anything", because [`allow_menus`](Self::allow_menus)
+    /// opens a second door: a menu item is reached by its path and has no coordinate, so this
+    /// flag has nothing to say about it. The two are separate switches for that reason.
     #[serde(default)]
     pub allow_raw_clicks: bool,
     /// Whether unnamed **key input** (`keys`/`text` on `POST /key`) is allowed. Defaults to

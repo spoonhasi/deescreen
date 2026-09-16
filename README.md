@@ -33,9 +33,9 @@ control authority.** Manage file permissions and the IP whitelist on that basis.
 
 **The thing you press is a "button"** — on screen, in the file, and in the API.
 
-A profile holds three collections. A request names **one** thing out of one of them, so the
-plural is the file and the singular is the request — and next to each singular sits the
-unnamed way of saying the same thing, which is the one a policy flag governs:
+Three of a profile's collections are things a request names — a request picks **one** out of
+one of them, so the plural is the file and the singular is the request. Next to each singular
+sits the unnamed way of saying the same thing, which is the one a policy flag governs:
 
 | the profile holds | a request names one | or says it unnamed (gated) |
 |---|---|---|
@@ -47,6 +47,12 @@ The unnamed column is deliberately a **different word** every time, never a vari
 the named one — the gated thing must not be reachable by mistyping the safe thing. `key` looks
 up a definition; `chord` bypasses the definitions entirely. Those are opposite acts and they do
 not get near-identical names.
+
+Two things sit outside this table. `spell` is on the safe side of it — it turns a string into
+a sequence of **named** buttons using the legends in the profile, so it reaches nothing the
+first row does not. A **menu path** is the exception: the menu is read off the window rather
+than written in the profile, so it has no "the profile holds" column at all, and it has its own
+switch (`allow_menus`) for exactly that reason.
 
 `click_button` is the one name in the API that is in no column, because it answers a different
 question — not *what* to press but *which mouse button presses it* (`left`, `right` or
@@ -68,6 +74,11 @@ Coordinates live only in the profile file. Let the caller compute raw pixels and
 **quietly press the wrong thing** — no error, so it takes a long time to notice. A coordinate
 that is not on the list cannot be pressed (until you explicitly open that with
 `allow_raw_clicks: true`). Key input is treated at the same level.
+
+One thing is outside this, and the word *coordinate* should not be read as a way around saying
+so: a **menu item** has no stable rectangle to write down, so `POST /menu` names a path read
+off the window instead. That endpoint reaches whatever the application's menu reaches, which is
+why it is off unless `allow_menus` is set.
 
 ### 2. Coordinates are physical pixels in the window's client area
 
@@ -863,7 +874,8 @@ shapes the design:
   START), which does more than a keystroke; capture too early and you photograph the screen
   from just before it — the entry still in the input line, indistinguishable from a sequence
   that failed. Same reasoning as `gap_ms`. The reply always states the `settle_ms` it used,
-  and the real fix is a measured `settle_ms` on the commit button in the profile.
+  and the real fix is a measured `settle_ms` on the commit button in the profile — which
+  `"measure": true` produces for you rather than leaving you to find it by repetition.
 - **`capture`, `ignore` and `settle_ms` apply once, after the last press.** `gap_ms` is the
   spacing between presses.
 

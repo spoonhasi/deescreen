@@ -1387,6 +1387,14 @@ fn defs_view(t: &Targets) -> Value {
         // being bare arrays.
         .map(|(name, r)| json!({"name": name, "rect": r.rect, "anchor": r.anchor, "note": r.note}))
         .collect();
+    // Flattened like the two above, and present for the same reason: every button and region
+    // here carries an `anchor` NAME, and without the definitions that name refers to nothing a
+    // reader can check. This endpoint says it is the whole definition, so it has to be.
+    let anchors: Vec<Value> = t
+        .anchors
+        .iter()
+        .map(|(name, a)| json!({"name": name, "text": a.text, "rect": a.rect, "note": a.note}))
+        .collect();
     let keys: Vec<Value> = t
         .keys
         .iter()
@@ -1398,11 +1406,15 @@ fn defs_view(t: &Targets) -> Value {
         "window": t.window,
         "reference_client": t.reference_client,
         "on_size_mismatch": t.on_size_mismatch,
+        "anchors": anchors,
         "buttons": buttons,
         "regions": regions,
         // Which key reaches a button's second legend, and whether it latches. A caller that
         // wants to spell a string itself needs this as much as it needs the legends.
         "shift": t.shift,
+        // Which menu paths need confirm. Not a collection this endpoint can be asked for on
+        // its own, and small, so it rides here rather than gaining an endpoint.
+        "confirm_menus": t.confirm_menus,
         "keys": keys,
     })
 }
@@ -2594,8 +2606,8 @@ fn build_help(base: &str) -> String {
 This page is a manual and does not change. For what exists on this server right now,
 call:
   GET {base}/health      which profiles exist, which windows, is it working
-  GET {base}/profiles    every profile's full definition - buttons, regions, keys, window
-                         (?profile=NAME for just one)
+  GET {base}/profiles    every profile's full definition - buttons, regions, anchors,
+                         keys, window (?profile=NAME for just one)
 
 COORDINATES
   Every coordinate is a pixel inside the TARGET WINDOW's client area - not the screen,
@@ -2608,7 +2620,11 @@ COORDINATES
 PROFILES
   One profile = one window plus its own coordinates, buttons, regions and keys. A
   different application is a different coordinate universe, so profiles do not share
-  anything. Every window-facing call takes ?profile=NAME (or "profile" in the body).
+  anything. Every window-facing call names one - and WHERE the name goes depends on the
+  endpoint, not on your preference: a GET or a .png variant reads a query string and no
+  body, a JSON endpoint reads a body and no query string. Neither reads both, so putting
+  it in the wrong one comes back as "no profile given" while you did name it. A refusal
+  says which of the two that endpoint reads.
   GET /health lists them with a human-written description each, and GET /profiles
   gives their full definitions. If a person names an application rather than a
   profile, match what they said against those descriptions and window titles - do
@@ -2740,7 +2756,8 @@ PRESS SEVERAL BUTTONS IN ORDER - for keypads, where a half-entry is worse than n
       in the input line and reads exactly like a sequence that failed. Every reply says the
       settle_ms it actually used, so check that rather than assuming. If you know the real
       number for a commit button, put settle_ms on THAT BUTTON in the profile - measured
-      once, right every time after, and better than any default here.
+      once, right every time after, and better than any default here. "measure": true is
+      how you get that number without guessing; see above.
   "buttons" cannot be combined with "button", "rect" or "point". At most 200 per request.
   In the query form (/click.png) it is a comma-separated list: buttons=MDI_G,MDI_9.
 
@@ -3728,8 +3745,9 @@ const DEFAULT_GAP_MS: u64 = 500;
 /// sequence that failed. Silently reading the previous screen is the failure this endpoint
 /// exists to prevent, so the default errs long.
 ///
-/// The precise answer is a `settle_ms` on the commit button itself, measured once and recorded
-/// in the profile. This is only the fallback for when nobody has.
+/// The precise answer is a `settle_ms` on the commit button itself, and `measure: true` is
+/// what produces the number: press once with it on, read `suggest_settle_ms`, write it down.
+/// This is only the fallback for when nobody has.
 const DEFAULT_SEQUENCE_SETTLE_MS: u64 = 800;
 /// Ceiling on how many presses one request may carry.
 const MAX_SEQUENCE: usize = 200;
@@ -5797,6 +5815,58 @@ mod tests {
         let v = press_change(&a, &b, None);
         assert_eq!(v["changed"], json!(true));
         assert!(v["note"].as_str().unwrap_or_default().contains("resized"), "{v}");
+    }
+
+    /// `/profiles` says it is the whole definition. Anything in the saved document that never
+    /// reaches it is a name a reader cannot resolve — `"anchor": "screen"` on every button,
+    /// with nothing anywhere saying what `screen` is.
+    ///
+    /// Serde knows the document's fields, so the check is a comparison rather than a list
+    /// somebody has to remember to extend.
+    #[test]
+    fn the_reading_form_leaves_nothing_out_of_the_document() {
+        // Every field set to something, because a field that serializes to nothing would be
+        // absent from both sides and prove nothing.
+        let doc = r#"{
+            "description": "a simulator",
+            "window": {"title": "NC", "title_exact": false, "class": ""},
+            "reference_client": [1280, 1000],
+            "on_size_mismatch": "scale",
+            "anchors": {"screen": {"text": "NC DISPLAY", "rect": [10, 10, 100, 100], "note": "n"}},
+            "regions": {"status": {"rect": [0, 0, 10, 10], "anchor": "screen", "note": "n"}},
+            "buttons": {"MDI_F": {"rect": [1, 1, 8, 8], "anchor": "screen", "point": [2, 2],
+                                  "click_button": "right", "double": true, "confirm": true,
+                                  "settle_ms": 900, "hold_ms": 300,
+                                  "types": "F", "shift_types": "E", "note": "n"}},
+            "confirm_menus": ["File"],
+            "shift": {"button": "MDI_F", "mode": "oneshot", "note": "n"},
+            "keys": {"reset": "f1"}
+        }"#;
+        let t: Targets = serde_json::from_str(doc).expect("parses");
+
+        let saved = serde_json::to_value(&t).expect("serializes");
+        let saved = saved.as_object().expect("an object");
+        let view = defs_view(&t);
+        let view = view.as_object().expect("an object");
+
+        let missing: Vec<&String> = saved.keys().filter(|k| !view.contains_key(*k)).collect();
+        assert!(
+            missing.is_empty(),
+            "GET /profiles calls itself the full definition but leaves out: {missing:?}"
+        );
+
+        // And the other direction, so a field renamed on the way out is caught too: a reader
+        // that cannot find "anchors" under that name has the same problem as one where it is
+        // absent.
+        for k in ["anchors", "buttons", "regions", "keys", "shift", "confirm_menus"] {
+            assert!(view.contains_key(k), "'{k}' is not in the reading form");
+        }
+        // The anchor definitions have to carry the text AND the rect — the size is half of
+        // what identifies the control, so a view with only the name explains nothing.
+        let a = &view["anchors"][0];
+        assert_eq!(a["name"], json!("screen"));
+        assert_eq!(a["text"], json!("NC DISPLAY"));
+        assert_eq!(a["rect"], json!([10, 10, 100, 100]));
     }
 
     /// The sentence a refusal carries has to name the place the caller is actually standing in.
