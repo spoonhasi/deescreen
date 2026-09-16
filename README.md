@@ -678,7 +678,7 @@ and a `/captures/<name>` URL instead.
 | GET | `/sheet` | read | the same sheet as JSON: its shape, where it was saved, and which buttons had no picture to show |
 | POST | `/preview.png` | read | draw a **candidate** definition from the body over the live screen. Saves nothing |
 | GET | `/captures/{name}` | read | fetch a stored capture |
-| POST | `/click` | **control** | `{button\|buttons[]\|rect\|point, confirm, click_button, double, settle_ms, measure, quiet_ms, gap_ms, capture, pad, ignore, scale, max_width}`. No `capture` means **no picture is taken**. `buttons` presses in order and stops at the first failure |
+| POST | `/click` | **control** | `{button\|buttons[]\|rect\|point, confirm, click_button, double, settle_ms, measure, quiet_ms, per_press, gap_ms, capture, pad, ignore, scale, max_width}`. No `capture` means **no picture is taken**. `buttons` presses in order and stops at the first failure |
 | POST | `/click.png` | **control** | same, PNG bytes back. Parameters go in the query. No `capture` captures the whole client area (an image has to come back) |
 | POST | `/key` | **control** | `{key\|chord\|text, settle_ms, measure, quiet_ms, capture, pad, ignore, …}` |
 | POST | `/window/focus` | **control** | bring the window forward (restore if minimised) |
@@ -872,6 +872,38 @@ request. In the query form (`/click.png`) it is a comma-separated list:
 > `POST /key` with `{"text": "..."}` is the same idea for real keyboard input. Panel keys are
 > painted buttons rather than keys, so they cannot go through that path — hence the same
 > facility on the click side.
+
+### Which press in a sequence was ignored — `per_press`
+
+A sequence reports the screen after the **last** press, so a key the application quietly
+dropped halfway through leaves no trace: the end screen looks like a working one minus a
+character nobody counted, and sending the input succeeded, so nothing errored. `CURSOR_RIGHT`
+went missing exactly that way.
+
+```bash
+curl -s -X POST -H "Content-Type: application/json" -d '{
+  "buttons": ["MDI_G","MDI_9","CURSOR_RIGHT","MDI_1"], "per_press": true }' .../click
+```
+
+Each entry in `pressed` gains its own `change`, read between that press and the next — so the
+change is attributed to the press that caused it, which the end screen cannot do:
+
+```json
+{ "index": 2, "button": "CURSOR_RIGHT", "hit": { "…": "…" },
+  "change": { "changed": false, "pixels": 0, "bbox": null } }
+```
+
+and `sequence.unchanged` lists those names outright.
+
+**A press that changed nothing is not a failed press.** A toggle already in that state, a key
+with no legend to repaint, a key ignored in the current mode and a key that never arrived are
+the same picture from outside the process — so `change` says what moved and passes no verdict.
+It says *where to look*. If that press's `hit` reports a real, enabled control, the press
+length is the next thing to change (`hold_ms`).
+
+One capture per press, added to the sequence's own time, which is why it is asked for. With no
+capture region named it watches the whole client area; `ignore=x,y,w,h` applies here too, since
+a blinking cursor would otherwise make every press look like it did something.
 
 ### Pressing something that was never saved — `rect` / `point`
 

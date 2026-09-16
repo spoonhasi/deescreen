@@ -248,6 +248,13 @@ pub struct ClickReq {
     /// The region to capture after the press. Absent, nothing is captured.
     #[serde(default)]
     pub capture: Option<String>,
+    /// Photograph between presses, so each press's own change is reported with it.
+    ///
+    /// A sequence otherwise reports only the screen after the last press, and a key silently
+    /// ignored halfway through leaves an end screen that looks like a working one minus a
+    /// character. Costs one capture per press, so it is asked for rather than assumed.
+    #[serde(default)]
+    pub per_press: Option<bool>,
     /// Measure how long the screen takes to settle, instead of waiting a fixed `settle_ms`.
     ///
     /// Costs a capture every 50ms until it holds still, so it is opt-in — but it answers
@@ -411,6 +418,7 @@ impl ClickReq {
             hold_ms: q_num(q, "hold_ms")?,
             confirm: q_bool(q, "confirm")?.unwrap_or(false),
             settle_ms: q_num(q, "settle_ms")?,
+            per_press: q_bool(q, "per_press")?,
             measure: q_bool(q, "measure")?,
             quiet_ms: q_num(q, "quiet_ms")?,
             capture: q_get(q, "capture"),
@@ -799,6 +807,27 @@ fn watch_until_still(
         settled,
         last: prev,
     })
+}
+
+/// What one press changed, for the record of that press.
+///
+/// Deliberately the same shape as the request-level `changed`, and deliberately without a
+/// verdict: **nothing changing is not the same as nothing happening.** A toggle already in
+/// that state, a key with no legend to repaint, a key ignored in this mode and a key that
+/// never arrived all look identical here. What this adds is *which* press it was, which the
+/// screen at the end of a sequence cannot say.
+fn press_change(prev: &Frame, now: &Frame, ignore: Option<Rect>) -> Value {
+    match prev.diff(now, ignore) {
+        None => json!({
+            "changed": true,
+            "note": "the capture changed size between these two presses — the window was resized",
+        }),
+        Some(d) => json!({
+            "changed": d.pixels > 0,
+            "pixels": d.pixels,
+            "bbox": if d.pixels > 0 { json!(d.bbox) } else { Value::Null },
+        }),
+    }
 }
 
 /// How long to require stillness, and how long to wait for it.
@@ -2601,6 +2630,28 @@ PRESS SEVERAL BUTTONS IN ORDER - for keypads, where a half-entry is worse than n
   "buttons" cannot be combined with "button", "rect" or "point". At most 200 per request.
   In the query form (/click.png) it is a comma-separated list: buttons=MDI_G,MDI_9.
 
+  WHICH PRESS WAS IGNORED - "per_press": true
+  A sequence reports the screen after the LAST press, so a key the application quietly
+  dropped halfway through is invisible: the end screen looks like a working one minus a
+  character nobody counted. Sending the input succeeded, so nothing errors.
+    curl -s -X POST -H "Content-Type: application/json" -d '{{
+      "buttons": ["MDI_G","MDI_9","CURSOR_RIGHT","MDI_1"],
+      "per_press": true }}' {base}/click
+  Each entry in "pressed" gains its own "change", read between that press and the next:
+    {{"index": 2, "button": "CURSOR_RIGHT", "hit": {{...}},
+     "change": {{"changed": false, "pixels": 0, "bbox": null}}}}
+  and "sequence.unchanged" lists the names outright, which is the answer you wanted.
+
+  A PRESS THAT CHANGED NOTHING IS NOT A FAILED PRESS. A toggle already in that state, a key
+  with no legend to repaint, a key ignored in the current mode and a key that never arrived
+  all look identical from here, so "change" states what moved and passes no verdict. It
+  tells you WHERE to look. Then: if that press's "hit" says a real, enabled control was
+  reached, the press length is the next thing to change - see hold_ms above.
+
+  It costs one capture per press and adds that time to the sequence, so it is opt-in. With
+  no capture named it watches the whole client area. ignore=x,y,w,h applies here too - a
+  blinking cursor otherwise makes every press look like it did something.
+
 BUTTONS MARKED CONFIRM - the one thing in here that is about judgement
   Some buttons carry "confirm": true. Pressing one needs "confirm": true in the request
   as well, and without it you get 403.
@@ -2815,7 +2866,7 @@ ENDPOINTS
                        Use it when you want the picture kept and referred to rather than
                        read right now. Parameters go in the body
   POST /click          {{button | buttons[] | rect | point, confirm, click_button, double, hold_ms,
-                       measure, quiet_ms,
+                       measure, quiet_ms, per_press,
                        settle_ms, gap_ms, capture, pad, ignore}} - the reply carries "hit"
                        (what was under the point) and "change" (pixels + bbox). With
                        "buttons" it presses them in order and stops at the first failure
@@ -3556,11 +3607,12 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
         // be a request with no way to answer it. The whole client area is the honest default:
         // whatever the press moved is somewhere in it.
         let measure = req.measure.unwrap_or(false);
+        let per_press = req.per_press.unwrap_or(false);
         let region_name = req
             .capture
             .clone()
             .filter(|r| !r.is_empty())
-            .or_else(|| measure.then(|| "@client".to_string()))
+            .or_else(|| (measure || per_press).then(|| "@client".to_string()))
             .map(|r| {
                 if r == "button" {
                     format!("button:{}", presses.last().map(|p| p.name.as_str()).unwrap_or(""))
@@ -3597,6 +3649,15 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
         let mut info = window::describe(info.handle)
             .ok_or_else(|| ApiError::conflict("the target window disappeared while focusing it"))?;
 
+        // The rolling comparison is its own frame. `before` has to stay the shot from before
+        // the first press, because "did this request change anything" is still a question and
+        // is not the sum of the per-press answers. Taken here, after focusing, so that raising
+        // the window is not counted as the first press's doing.
+        let mut prev = match (per_press, crop) {
+            (true, Some(rect)) => shoot(&info, rect, req.scale, req.max_width).ok().map(|(f, _, _)| f),
+            _ => None,
+        };
+
         let gap = st.config.clamp_settle(Some(req.gap_ms.unwrap_or(DEFAULT_GAP_MS)));
         let mut done: Vec<Value> = Vec::with_capacity(presses.len());
         let mut failure: Option<Value> = None;
@@ -3606,6 +3667,17 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
         for (i, pr) in presses.iter().enumerate() {
             if i > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(gap));
+                // The previous press's own change, read after its gap and **before** the next
+                // press can add to it. Attribution is the whole point, so the shot has to sit
+                // between the two.
+                if let (Some(rect), Some(p)) = (crop, prev.as_ref())
+                    && let Ok((f, _, _)) = shoot(&info, rect, req.scale, req.max_width)
+                {
+                    if let Some(entry) = done.last_mut() {
+                        entry["change"] = press_change(p, &f, req.ignore);
+                    }
+                    prev = Some(f);
+                }
                 // The application may have closed or replaced the window mid-sequence.
                 match window::describe(info.handle) {
                     Some(w) => info = w,
@@ -3708,7 +3780,7 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
         // Either wait the agreed time, or watch until the screen stops moving and report how
         // long that took. Never both: the wait and the measurement are two answers to the same
         // question, and doing the fixed wait first would put it inside the number.
-        let (settle, measured, watched) = match (measure, crop) {
+        let (settle, measured, mut watched) = match (measure, crop) {
             (true, Some(rect)) => {
                 let (quiet, ceiling) = watch_bounds(&st.config, req.quiet_ms);
                 let w = watch_until_still(&info, rect, req.scale, req.max_width, req.ignore, quiet, ceiling)?;
@@ -3719,6 +3791,19 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
                 (settle, Value::Null, None)
             }
         };
+
+        // The last press has no gap after it — its change is read from the settled screen,
+        // which is the very picture the capture below returns. One shot, used twice.
+        if let (Some(rect), Some(p)) = (crop, prev.as_ref()) {
+            let f = match watched.take() {
+                Some(f) => f,
+                None => shoot(&info, rect, req.scale, req.max_width)?,
+            };
+            if let Some(entry) = done.last_mut() {
+                entry["change"] = press_change(p, &f.0, req.ignore);
+            }
+            watched = Some(f);
+        }
 
         // ── report ──
         let last = done.last().cloned().unwrap_or(Value::Null);
@@ -3732,10 +3817,29 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
         }
         if sequence {
             result["pressed"] = json!(done);
+            // The list the whole feature exists for: not "something is wrong somewhere in
+            // these twelve presses", but which ones moved nothing.
+            let quiet: Vec<Value> = done
+                .iter()
+                .filter(|e| e["change"]["changed"] == json!(false))
+                .map(|e| e["button"].clone())
+                .collect();
             result["sequence"] = json!({
                 "requested": presses.len(),
                 "pressed": done.len(),
                 "gap_ms": gap,
+                "per_press": per_press,
+                "unchanged": if per_press { json!(quiet) } else { Value::Null },
+                "unchanged_hint": if per_press && !quiet.is_empty() {
+                    json!("these presses moved nothing on the screen. That is not by itself a \
+                           failure - a toggle already in that state, a key with no legend to \
+                           repaint, and a key ignored in the current mode all look the same \
+                           here. It is where to look: check each one's 'hit', and if the hit \
+                           says a real enabled control was reached, the press length is the \
+                           next thing to change (hold_ms).")
+                } else {
+                    Value::Null
+                },
                 "complete": failure.is_none(),
                 "failed": failure.clone(),
                 "note": "presses stop at the first failure. Anything already pressed is in \
@@ -3754,6 +3858,12 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
             result["aim"] = last["aim"].clone();
             result["point"] = last["point"].clone();
             result["hit"] = last["hit"].clone();
+            // per_press is for sequences — with one press there is nothing to attribute. It is
+            // still published rather than discarded: a caller who asked for it and got a reply
+            // with no trace of it has no way to tell "not applicable" from "ignored".
+            if per_press {
+                result["change"] = last["change"].clone();
+            }
         }
 
         let mut png_out = None;
@@ -4753,6 +4863,58 @@ mod tests {
         // And below one sample, which would call every gap between two shots "still".
         let (quiet, _) = watch_bounds(&cfg, Some(1));
         assert_eq!(quiet, WATCH_POLL_MS);
+    }
+
+    /// A flat frame at 1:1, for comparing against another one.
+    fn frame_of(w: u32, h: u32, grey: u8) -> Frame {
+        Frame {
+            image: image::RgbaImage::from_pixel(w, h, image::Rgba([grey, grey, grey, 255])),
+            source_rect: [0, 0, w as i32, h as i32],
+            scale: 1.0,
+        }
+    }
+
+    /// One press's record says what moved and where, and nothing about whether it worked.
+    /// A toggle already in that state, a key with no legend to repaint and a key that never
+    /// arrived are the same picture; claiming otherwise would put a guess in the field a
+    /// caller reads to find the press that failed.
+    #[test]
+    fn a_press_record_reports_the_change_without_judging_it() {
+        let a = frame_of(20, 10, 200);
+        let same = frame_of(20, 10, 200);
+        let mut moved = frame_of(20, 10, 200);
+        moved.image.put_pixel(4, 3, image::Rgba([0, 0, 0, 255]));
+
+        let quiet = press_change(&a, &same, None);
+        assert_eq!(quiet["changed"], json!(false));
+        assert_eq!(quiet["pixels"], json!(0));
+        // No bbox for a change that did not happen — an all-zero rectangle would read as a
+        // change at the origin.
+        assert_eq!(quiet["bbox"], Value::Null);
+        assert!(quiet.get("failed").is_none(), "no verdict: {quiet}");
+        assert!(quiet.get("ok").is_none(), "no verdict: {quiet}");
+
+        let busy = press_change(&a, &moved, None);
+        assert_eq!(busy["changed"], json!(true));
+        assert_eq!(busy["pixels"], json!(1));
+        assert_eq!(busy["bbox"], json!([4, 3, 1, 1]));
+
+        // `ignore` drops a rectangle from the comparison, which is how a blinking cursor
+        // stops making every press look like it did something.
+        let blind = press_change(&a, &moved, Some([4, 3, 1, 1]));
+        assert_eq!(blind["changed"], json!(false));
+    }
+
+    /// A window resized mid-sequence makes the two shots incomparable. That is reported as a
+    /// change with the reason, not as "nothing happened" — the one reading that would send a
+    /// caller looking at the key instead of at the window.
+    #[test]
+    fn a_resize_between_presses_is_not_reported_as_stillness() {
+        let a = frame_of(20, 10, 200);
+        let b = frame_of(30, 10, 200);
+        let v = press_change(&a, &b, None);
+        assert_eq!(v["changed"], json!(true));
+        assert!(v["note"].as_str().unwrap_or_default().contains("resized"), "{v}");
     }
 
     /// The sentence a refusal carries has to name the place the caller is actually standing in.
