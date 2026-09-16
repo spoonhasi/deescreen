@@ -30,7 +30,7 @@ use crate::config::Config;
 use crate::draw;
 use crate::sheet;
 use crate::state::SharedState;
-use crate::targets::{ButtonDef, Rect, Targets};
+use crate::targets::{AnchorDef, ButtonDef, Rect, Targets};
 use crate::web::{ApiError, json_ok, png_response};
 use crate::win::capture::{self as wincap, BLACK_HINT};
 use crate::win::input::{self, Button};
@@ -2889,6 +2889,10 @@ ENDPOINTS
   DEL  /admin/profile  ?profile=NAME&confirm=true - delete it. The file is moved aside,
                        not erased, but only a person on that PC can put it back
   POST /admin/profile/rename ?profile=OLD&to=NEW - rename in place
+  POST /admin/profile/refit  ?profile=NAME - re-seat every coordinate onto the window as
+                       it is now, when a container CHANGED SIZE and an anchor's
+                       translation is no longer enough. A proposal unless apply=true,
+                       and it checks each moved button against a real control first
   POST /admin/reload   re-read the profile files from disk. POST /admin/profile already
                        takes effect immediately; this is for when a PERSON edited a file
                        on that PC or dropped a new one in. Without ?profile= it rescans
@@ -3217,6 +3221,42 @@ TRAPS - these fail quietly or confusingly. Read once, save yourself an hour.
                    Caveat: hit only works where controls are separate windows (Win32,
                    MFC, WinForms). If GET /controls comes back empty, this application
                    draws its own controls and every point reports is_window_itself.
+
+  WHEN THE CONTAINER ITSELF CHANGED SIZE - POST /admin/profile/refit
+  An anchor corrects a TRANSLATION, and that is exactly why it can be trusted. A new build
+  whose operator panel grew from 708x238 to 746x251 is past it: every rectangle inside is
+  wrong by an amount that depends on how far it sits from the container's own origin, and
+  no single offset can say that.
+    curl -s -X POST -H "X-Admin-Code: THECODE" \
+      "{base}/admin/profile/refit?profile=NAME"
+  Nothing is written. The reply is the proposal: where each anchor was and is now, how many
+  buttons and regions would move, and - the part to read - "verify".
+
+  IT CHECKS ITSELF, AND YOU SHOULD READ THE CHECK. Each moved button's new click point is
+  looked up on the live window. "landed" only means a control is there; "worst_offset" is
+  the number that matters, because a point half a key off still lands, on the NEIGHBOUR.
+  More than a few pixels means the layout did not merely scale - it re-flowed - and this
+  endpoint is not the answer for that application.
+
+  Then save it:
+    curl -s -X POST -H "X-Admin-Code: THECODE" \
+      "{base}/admin/profile/refit?profile=NAME&apply=true"
+  A save is REFUSED while any moved button lands on nothing, and says which ones. force=true
+  overrides that, for keys the application genuinely has no control for. The previous file is
+  kept as a backup either way, and reference_client is set to the window as it is now -
+  otherwise on_size_mismatch would refuse every click against coordinates that are correct.
+
+  AN AMBIGUOUS ANCHOR IS REFUSED, NOT GUESSED. Anchors are found by text AND size, and a
+  refit is for when the size changed - so where two controls carry the same text and neither
+  is still the saved size, there is nothing left to tell them apart. The reply lists the
+  candidates; name the right one:
+    -d '{{"anchors": {{"OPERATION PANEL": [1142,384,746,251]}}, "apply": true}}'
+
+  ELEMENTS MARKED "@fixed" ARE NOT MOVED. Somebody stated they do not travel with a
+  container, and a refit does not overrule that. They are listed under "untouched".
+
+  A profile with no anchors is refused - there is no container to re-seat against. For a
+  window that merely changed size, POST /window/fit or reference_client is the answer.
 
 HOW TO VERIFY WHAT YOU DID
   Prefer the application's own API over the screen wherever one exists. Use the screen
@@ -4149,7 +4189,7 @@ fn confirm_button_at(
     })
 }
 
-/// Whether the editing endpoints are open. Three handlers have to refuse with one sentence.
+/// Whether the editing endpoints are open. Several handlers have to refuse with one sentence.
 fn editing_allowed(state: &SharedState) -> Result<(), ApiError> {
     if state.config.allow_profile_editing {
         return Ok(());
@@ -4240,6 +4280,331 @@ pub async fn admin_delete_profile(
                  overwrites the earlier copy. Nothing here deletes archives — a person does.",
         "profiles": remaining,
     })))
+}
+
+// ────────────────────────── refit ──────────────────────────
+
+/// What a refit was asked to do.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RefitReq {
+    /// Where an anchor is **now**, by anchor name — for the anchors this cannot work out for
+    /// itself. See `find_anchor_now`.
+    #[serde(default)]
+    pub anchors: std::collections::BTreeMap<String, Rect>,
+    /// Write the result. Absent or false, nothing is saved and the reply is the proposal.
+    #[serde(default)]
+    pub apply: Option<bool>,
+    /// Save although the check found buttons that land on nothing.
+    #[serde(default)]
+    pub force: Option<bool>,
+}
+
+/// Where an anchor's control is on the window right now.
+///
+/// The ordinary match is text **and** size, and size is what identifies one control among
+/// same-named ones. A refit exists precisely because the size changed, so that identifier is
+/// the one thing not available here — and "the one nearest where it used to be" is the
+/// reasoning anchors were designed to avoid, because it uses the possibly-stale rectangle to
+/// find the thing that would prove it stale.
+///
+/// So: the exact match is preferred when it still exists (that anchor did not change), a
+/// single control carrying the text is accepted, and anything else is **refused with the
+/// candidates listed** so the caller can name the rectangle in `anchors`. Guessing is done
+/// only where there is one answer to guess.
+fn find_anchor_now(
+    name: &str,
+    a: &AnchorDef,
+    controls: &[crate::win::window::ControlInfo],
+    told: Option<&Rect>,
+) -> Result<(Rect, &'static str), ApiError> {
+    if let Some(r) = told {
+        return Ok((*r, "named in the request"));
+    }
+    let same_text: Vec<&crate::win::window::ControlInfo> =
+        controls.iter().filter(|c| c.text.trim() == a.text.trim()).collect();
+
+    if let Some(c) = same_text.iter().find(|c| (c.rect[2], c.rect[3]) == (a.rect[2], a.rect[3])) {
+        return Ok((c.rect, "text and size still match — this anchor did not change"));
+    }
+    match same_text.as_slice() {
+        [c] => Ok((c.rect, "the only control carrying that text")),
+        [] => Err(ApiError::not_found(format!(
+            "anchor '{name}': no control on this window carries the text {:?}",
+            a.text
+        ))
+        .with_detail(json!({
+            "anchor": name,
+            "text": a.text,
+            "note": "the anchor cannot be re-seated because it is not there at all. This is a \
+                     different application or a different build, not a resized one. GET \
+                     /controls lists what is present.",
+        }))),
+        more => Err(ApiError::conflict(format!(
+            "anchor '{name}': {} controls carry the text {:?} and none is still {}x{}, so which \
+             one this anchor means cannot be worked out",
+            more.len(),
+            a.text,
+            a.rect[2],
+            a.rect[3]
+        ))
+        .with_detail(json!({
+            "anchor": name,
+            "was": a.rect,
+            "candidates": more.iter().map(|c| c.rect).collect::<Vec<_>>(),
+            "hint": format!(
+                "name the right one: POST a body of {{\"anchors\": {{\"{name}\": [x,y,w,h]}}}}. \
+                 Picking the nearest one here would use the rectangle that may be stale to \
+                 decide which control proves it stale, and would move every coordinate \
+                 belonging to this anchor if it guessed wrong."
+            ),
+        }))),
+    }
+}
+
+/// **Re-seat a profile onto the window as it is now**, when a container changed size.
+///
+/// `POST /admin/profile/refit?profile=NAME` — a proposal by default, saved only with
+/// `apply=true`, and refused even then if the check found buttons that land on nothing.
+pub async fn admin_refit_profile(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    editing_allowed(&state)?;
+    let req: RefitReq = parse_body(&body)?;
+    let apply = req.apply.unwrap_or(false) || q_bool(&q, "apply")?.unwrap_or(false);
+    let force = req.force.unwrap_or(false) || q_bool(&q, "force")?.unwrap_or(false);
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
+
+    tokio::task::spawn_blocking(move || refit_now(&prof, req, apply, force))
+        .await
+        .map_err(|e| ApiError::internal(format!("refit task failed: {e}")))?
+}
+
+fn refit_now(
+    prof: &crate::state::Profile,
+    req: RefitReq,
+    apply: bool,
+    force: bool,
+) -> Result<Response, ApiError> {
+    let t = prof.targets();
+    if t.anchors.is_empty() {
+        return Err(ApiError::bad_request(
+            "this profile declares no anchors, so there is nothing to re-seat it against",
+        )
+        .with_detail(json!({
+            "note": "a refit moves each element with the container it was measured inside. \
+                     Without anchors there is no container, and the whole-window equivalent is \
+                     already there: POST /window/fit restores the client area, or set \
+                     reference_client to the size the coordinates were drawn at.",
+        })));
+    }
+    // An anchor named in the request that is not in the profile is a typo, and a typo that
+    // silently does nothing here would look exactly like a refit that decided to ignore it.
+    for name in req.anchors.keys() {
+        if !t.anchors.contains_key(name) {
+            return Err(ApiError::not_found(format!("no anchor named '{name}' in this profile"))
+                .with_detail(near_names(
+                    name,
+                    t.anchors.keys().cloned(),
+                    "GET /admin/profile (anchors)",
+                )));
+        }
+    }
+
+    let (info, coord_scale, size_warning) = bind_window_view(&t)?;
+    let list = window::enumerate_controls(info.handle);
+    if list.items.is_empty() {
+        return Err(ApiError::conflict(
+            "this application has no child windows, so its containers cannot be found",
+        )
+        .with_detail(json!({
+            "note": "GET /controls is empty: the application paints its own controls. An anchor \
+                     is a real Win32 control, so neither finding one nor checking a button \
+                     against one is possible here. Re-measure in /editor, and use GET \
+                     /sheet.png to check the result button by button.",
+        })));
+    }
+
+    // ── where each anchor is now ──
+    let mut anchors_json = serde_json::Map::new();
+    let mut moves: std::collections::HashMap<String, (Rect, Rect)> = Default::default();
+    for (name, a) in &t.anchors {
+        // The saved rect is in the profile's own coordinates; the control's is in live pixels.
+        let was = Targets::scale_rect(a.rect, coord_scale);
+        let (now, how) = find_anchor_now(name, a, &list.items, req.anchors.get(name))?;
+        anchors_json.insert(
+            name.clone(),
+            json!({
+                "text": a.text,
+                "was": was,
+                "now": now,
+                "moved": [now[0] - was[0], now[1] - was[1]],
+                "resized": [now[2] - was[2], now[3] - was[3]],
+                "matched_by": how,
+            }),
+        );
+        moves.insert(name.clone(), (was, now));
+    }
+
+    // ── move everything that belongs to one ──
+    let mut fresh = (*t).clone();
+    let mut fixed = Vec::new();
+    let mut moved_regions = 0usize;
+    let mut moved_buttons = 0usize;
+
+    for (name, r) in &mut fresh.regions {
+        let live = Targets::scale_rect(r.rect, coord_scale);
+        match moves.get(&r.anchor) {
+            Some((was, now)) => {
+                r.rect = Targets::refit_rect(live, *was, *now);
+                moved_regions += 1;
+            }
+            // `@fixed` is a statement somebody made — that this does not move with the rest —
+            // so it is rescaled into the new reference and otherwise left exactly alone.
+            None => {
+                r.rect = live;
+                fixed.push(format!("region:{name}"));
+            }
+        }
+    }
+    for (name, b) in &mut fresh.buttons {
+        let live = Targets::scale_rect(b.rect, coord_scale);
+        let live_point = b.point.map(|p| {
+            [(p[0] as f64 * coord_scale.0).round() as i32, (p[1] as f64 * coord_scale.1).round() as i32]
+        });
+        match moves.get(&b.anchor) {
+            Some((was, now)) => {
+                b.rect = Targets::refit_rect(live, *was, *now);
+                b.point = live_point.map(|p| Targets::refit_point(p, *was, *now));
+                moved_buttons += 1;
+            }
+            None => {
+                b.rect = live;
+                b.point = live_point;
+                fixed.push(format!("button:{name}"));
+            }
+        }
+    }
+    for (name, a) in &mut fresh.anchors {
+        if let Some((_, now)) = moves.get(name) {
+            a.rect = *now;
+        }
+    }
+    // Everything above is now in live pixels, so this is the size they were measured at. Left
+    // stale, on_size_mismatch would refuse every click against coordinates that are correct.
+    let was_reference = fresh.reference_client;
+    fresh.reference_client = Some([info.client_size.0, info.client_size.1]);
+
+    // ── check it against the window ──
+    let mut landed = 0usize;
+    let mut failed: Vec<Value> = Vec::new();
+    let mut worst: Option<(String, i32, Value)> = None;
+    for (name, b) in &fresh.buttons {
+        if !moves.contains_key(&b.anchor) {
+            continue; // not moved, so not this call's claim to check
+        }
+        let (px, py) = Targets::click_point(b, (1.0, 1.0), (0, 0));
+        match window::control_at(info.handle, px, py) {
+            Some(h) if !h.is_window_itself => {
+                landed += 1;
+                // How far the new rectangle sits from the control it landed on. A perfect
+                // refit puts them on top of each other; half a key's width means the point is
+                // inside the NEIGHBOUR, which still "lands" and is still wrong.
+                let c = |r: [i32; 4]| (r[0] + r[2] / 2, r[1] + r[3] / 2);
+                let (bx, by) = c(b.rect);
+                let (hx, hy) = c(h.rect);
+                let d = (bx - hx).abs().max((by - hy).abs());
+                if worst.as_ref().is_none_or(|(_, w, _)| d > *w) {
+                    worst = Some((
+                        name.clone(),
+                        d,
+                        json!({"button": name, "off_by": d, "rect": b.rect, "control": h.rect}),
+                    ));
+                }
+            }
+            other => failed.push(json!({
+                "button": name,
+                "point": [px, py],
+                "reason": match other {
+                    Some(_) => "the point landed on the window itself — no control sits there",
+                    None => "nothing at all is at that point",
+                },
+                "rect": b.rect,
+            })),
+        }
+    }
+
+    let checked = landed + failed.len();
+    let mut out = json!({
+        "profile": prof.name,
+        "applied": false,
+        "client": [info.client_size.0, info.client_size.1],
+        "anchors": Value::Object(anchors_json),
+        "moved": {"buttons": moved_buttons, "regions": moved_regions},
+        "reference_client": {"was": was_reference, "now": fresh.reference_client},
+        "verify": {
+            "checked": checked,
+            "landed": landed,
+            "failed": failed,
+            "worst_offset": worst.as_ref().map(|(_, _, v)| v.clone()),
+            "note": "each moved button's new click point was looked up on the live window. \
+                     'landed' only means a control is there — 'worst_offset' is the one to \
+                     read, because a point half a key off still lands, on the NEIGHBOUR. \
+                     Anything more than a few pixels means the layout did not merely scale, \
+                     and the refit is not the answer for this application.",
+        },
+    });
+    if !fixed.is_empty() {
+        out["untouched"] = json!({
+            "elements": fixed,
+            "note": "these are @fixed — somebody stated they do not move with a container, so \
+                     they were rescaled into the new reference_client and otherwise left alone. \
+                     If the window itself changed size, check them by hand: GET /sheet.png.",
+        });
+    }
+    if let Some(w) = size_warning {
+        out["size_mismatch"] = json!(w);
+    }
+
+    if !apply {
+        out["hint"] = json!(
+            "nothing was written. Read 'verify', then repeat with ?apply=true to save. The \
+             previous file is kept as a backup either way."
+        );
+        return Ok(json_ok(out));
+    }
+    if !failed.is_empty() && !force {
+        return Err(ApiError::conflict(format!(
+            "{} of {checked} moved buttons land on nothing, so the refit was NOT saved",
+            failed.len()
+        ))
+        .with_detail(json!({
+            "verify": out["verify"],
+            "anchors": out["anchors"],
+            "hint": "the proportional move is an assumption about the application, and this is \
+                     the assumption failing. Look at the named buttons first. If they are keys \
+                     the application genuinely does not make controls for, and the rest are \
+                     right, repeat with force=true.",
+            "note": "nothing was written — the profile on disk is unchanged",
+        })));
+    }
+
+    fresh.validate().map_err(|e| {
+        ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, format!("the refitted profile is invalid: {e}"))
+    })?;
+    fresh.save(&prof.path).map_err(ApiError::internal)?;
+    prof.targets.store(std::sync::Arc::new(fresh));
+    log::info!(
+        "REFIT profile={} anchors={} buttons={moved_buttons} regions={moved_regions} failed={}",
+        prof.name,
+        t.anchors.len(),
+        failed.len()
+    );
+    out["applied"] = json!(true);
+    out["forced"] = json!(!failed.is_empty());
+    Ok(json_ok(out))
 }
 
 /// **Rename** a profile.

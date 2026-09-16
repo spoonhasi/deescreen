@@ -69,6 +69,10 @@ pub fn build(state: SharedState) -> Router {
                 .delete(api::admin_delete_profile),
         )
         .route("/admin/profile/rename", post(api::admin_rename_profile))
+        // Re-seat every coordinate onto the window as it is now, when a container changed
+        // size and an anchor's translation is no longer enough. Under /admin/profile so
+        // the same ACL prefix guards it — it rewrites the document like POST does.
+        .route("/admin/profile/refit", post(api::admin_refit_profile))
         .layer(middleware::from_fn_with_state(state.clone(), admin_code_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), ip_whitelist_middleware))
         .with_state(state)

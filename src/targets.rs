@@ -37,6 +37,16 @@ fn shift(r: Rect, by: (i32, i32)) -> Rect {
     [r[0] + by.0, r[1] + by.1, r[2], r[3]]
 }
 
+/// How much one anchor box grew, per axis. A zero-width `from` would divide by zero and is a
+/// profile that could never have matched anything, so it scales by 1 rather than producing
+/// infinities that look like coordinates.
+fn refit_factor(from: Rect, to: Rect) -> (f64, f64) {
+    (
+        if from[2] > 0 { to[2] as f64 / from[2] as f64 } else { 1.0 },
+        if from[3] > 0 { to[3] as f64 / from[3] as f64 } else { 1.0 },
+    )
+}
+
 /// A rectangle to capture, and which anchor its coordinates are measured from.
 ///
 /// Accepts either shape on the way in:
@@ -541,6 +551,38 @@ impl Targets {
         [r[0] + by.0, r[1] + by.1, r[2], r[3]]
     }
 
+    /// Move a rectangle from one anchor box to another, keeping its place **within** the box.
+    ///
+    /// This is the one thing an anchor cannot do. An anchor produces a translation, which is
+    /// exactly right while the container keeps its size — and a container that grew from
+    /// 708x238 to 746x251 makes every rectangle inside it wrong by an amount that depends on
+    /// how far it sits from the container's own origin. No single offset can express that,
+    /// which is why the profile had to be rewritten by hand instead.
+    ///
+    /// **The arithmetic is proportional, and that is an assumption, not a measurement.** It
+    /// says the layout was scaled; it does not hold for a panel that re-flowed its keys onto
+    /// different rows. So nothing computed here is saved until each button has been checked
+    /// against a real control on the live window.
+    pub fn refit_rect(r: Rect, from: Rect, to: Rect) -> Rect {
+        let (sx, sy) = refit_factor(from, to);
+        [
+            to[0] + ((r[0] - from[0]) as f64 * sx).round() as i32,
+            to[1] + ((r[1] - from[1]) as f64 * sy).round() as i32,
+            ((r[2] as f64 * sx).round() as i32).max(1),
+            ((r[3] as f64 * sy).round() as i32).max(1),
+        ]
+    }
+
+    /// The same move, for a lone point. A button's explicit `point` is a place inside the
+    /// container, not a size, so only the origin and the factor apply.
+    pub fn refit_point(p: [i32; 2], from: Rect, to: Rect) -> [i32; 2] {
+        let (sx, sy) = refit_factor(from, to);
+        [
+            to[0] + ((p[0] - from[0]) as f64 * sx).round() as i32,
+            to[1] + ((p[1] - from[1]) as f64 * sy).round() as i32,
+        ]
+    }
+
     /// Apply the factor to a rectangle.
     pub fn scale_rect(r: Rect, scale: (f64, f64)) -> Rect {
         [
@@ -819,6 +861,71 @@ mod tests {
         // both sizes have to appear for an operator to know what to restore
         assert!(err.contains("1024x800"), "{err}");
         assert!(err.contains("1280x1000"), "{err}");
+    }
+
+    /// The case that made this necessary: a container that grew. The whole point is that
+    /// elements move by *different* amounts depending on where they sit inside it, which is
+    /// the one thing an anchor's single offset cannot say.
+    #[test]
+    fn a_grown_container_moves_its_far_side_further_than_its_near_side() {
+        // Measured on NC Trainer2 plus: the operator panel between two builds.
+        let was = [1158, 384, 708, 238];
+        let now = [1142, 384, 746, 251];
+
+        // A key at the container's own origin moves exactly as the container did.
+        let near = Targets::refit_rect([1158, 384, 44, 44], was, now);
+        assert_eq!([near[0], near[1]], [1142, 384]);
+
+        // One at the far corner moves further, because the container grew underneath it.
+        let far = Targets::refit_rect([1158 + 708 - 44, 384 + 238 - 44, 44, 44], was, now);
+        assert_eq!(far[0], 1142 + 746 - 46, "the far edge tracks the new width");
+
+        // Which is the whole claim: one offset cannot serve both.
+        assert_ne!(near[0] - 1158, far[0] - (1158 + 708 - 44));
+
+        // A key keeps its proportion of the container, so it grows with it.
+        assert!(far[2] > 44 && far[3] > 44, "{far:?}");
+
+        // And the corners stay inside: a refit must not put a rectangle outside the container
+        // it was measured inside.
+        for r in [near, far] {
+            assert!(r[0] >= now[0] && r[1] >= now[1], "{r:?} starts outside {now:?}");
+            assert!(r[0] + r[2] <= now[0] + now[2] + 1, "{r:?} runs past {now:?}");
+            assert!(r[1] + r[3] <= now[1] + now[3] + 1, "{r:?} runs past {now:?}");
+        }
+    }
+
+    /// A container that only moved is the case anchors already handle, and the refit must
+    /// agree with them exactly — otherwise re-seating a profile that was fine would nudge
+    /// every coordinate by a rounding error.
+    #[test]
+    fn a_container_that_only_moved_is_a_plain_translation() {
+        let was = [1158, 384, 708, 238];
+        let now = [1142, 384, 708, 238];
+        let r = [1200, 400, 44, 44];
+        assert_eq!(Targets::refit_rect(r, was, now), Targets::shift_rect(r, (-16, 0)));
+        assert_eq!(Targets::refit_point([1222, 422], was, now), [1206, 422]);
+    }
+
+    /// An explicit `point` is a place inside the container, not a size — it takes the origin
+    /// and the factor and nothing else. A button with an asymmetric switch would otherwise
+    /// keep a press point that no longer sits on the switch.
+    #[test]
+    fn an_explicit_point_is_carried_across_with_its_rectangle() {
+        let was = [0, 0, 100, 100];
+        let now = [10, 20, 200, 300];
+        assert_eq!(Targets::refit_point([50, 50], was, now), [110, 170]);
+        // The rectangle it belongs to lands consistently with it.
+        let r = Targets::refit_rect([40, 40, 20, 20], was, now);
+        assert_eq!(r, [90, 140, 40, 60]);
+    }
+
+    /// A zero-width container could never have matched a control, and dividing by it would
+    /// produce infinities that serialize as coordinates.
+    #[test]
+    fn a_degenerate_container_scales_by_one_rather_than_by_infinity() {
+        let r = Targets::refit_rect([5, 5, 10, 10], [0, 0, 0, 0], [7, 9, 0, 0]);
+        assert_eq!(r, [12, 14, 10, 10]);
     }
 
     #[test]

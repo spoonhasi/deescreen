@@ -689,6 +689,7 @@ and a `/captures/<name>` URL instead.
 | PATCH | `/admin/profile` | **control**+flag | change part of it — a JSON merge patch (RFC 7386). Only what you name is touched; `null` removes a key. Does **not** create |
 | DELETE | `/admin/profile` | **control**+flag | delete the profile. `&confirm=true` required. The file is **moved aside** under a timestamped name |
 | POST | `/admin/profile/rename` | **control**+flag | `?profile=OLD&to=NEW`. Moves it in place (not a copy) |
+| POST | `/admin/profile/refit` | **control**+flag | re-seat every coordinate onto the window as it is now, for a container that **changed size**. A proposal unless `?apply=true`, and it checks each moved button against a real control first |
 
 Every window-facing endpoint takes **`?profile=NAME`** (or `"profile"` in the body). Omitting
 it uses the default profile. An unknown name is refused with 404 and the known list — nothing
@@ -1014,6 +1015,56 @@ what the anchor exists to prevent, so it is not offered.
 > **Names never start with `@`.** That prefix is reserved for values the server defines:
 > `@client` is the whole client area, `@fixed` is an element that does not move. Reserving the
 > prefix rather than individual words means the next one costs nobody a rename.
+
+### When the container itself changed size — `POST /admin/profile/refit`
+
+An anchor corrects a **translation**, and that is exactly why it can be trusted: sizes never
+change, so the correction cannot be wrong about anything else. A new build whose operator panel
+grew from 708×238 to 746×251 is past that. Every rectangle inside it is wrong by an amount that
+depends on how far it sits from the container's own origin, and no single offset expresses that
+— which is why the alternative was rewriting the profile element by element with a script.
+
+```bash
+curl -s -X POST -H "X-Admin-Code: THECODE" ".../admin/profile/refit?profile=NAME"
+```
+
+Nothing is written. The reply is the proposal: where each anchor was and is now, how many
+buttons and regions would move, and `verify`.
+
+**Read `verify` before applying.** Each moved button's new click point is looked up on the live
+window. `landed` only means *a* control is there; `worst_offset` is the number that matters,
+because a point half a key off still lands — on the neighbour. More than a few pixels means the
+layout did not scale, it re-flowed, and this endpoint is the wrong tool for that application.
+
+```bash
+curl -s -X POST -H "X-Admin-Code: THECODE" ".../admin/profile/refit?profile=NAME&apply=true"
+```
+
+A save is **refused** while any moved button lands on nothing, and names them; `force=true`
+overrides it for keys the application genuinely has no control for. The previous file is kept
+as a backup either way, and `reference_client` is set to the window as it is now — left stale,
+`on_size_mismatch` would refuse every click against coordinates that are correct.
+
+**An ambiguous anchor is refused, not guessed.** Anchors are found by text *and* size, and a
+refit is for when the size changed — so where two controls carry the same text and neither is
+still the saved size, nothing is left to tell them apart. Picking the nearest would use the
+rectangle that may be stale to decide which control proves it stale. The reply lists the
+candidates; name the one you mean:
+
+```bash
+curl -s -X POST -H "Content-Type: application/json" -H "X-Admin-Code: THECODE" \\
+  -d '{"anchors": {"OPERATION PANEL": [1142,384,746,251]}, "apply": true}' \\
+  ".../admin/profile/refit?profile=NAME"
+```
+
+Elements marked `"@fixed"` are **not** moved — somebody stated they do not travel with a
+container, and a refit does not overrule that. They are listed under `untouched`. A profile with
+no anchors is refused: there is no container to re-seat against, and for a window that merely
+changed size `POST /window/fit` or `reference_client` is already the answer.
+
+The arithmetic assumes the layout was *scaled*. That is a guess about the application, not a
+measurement — which is the whole reason the guess is checked against real controls before it can
+be saved, and why `GET /sheet.png` is worth a look afterwards.
 
 ## Known traps — every one of them fails silently, without an error
 
