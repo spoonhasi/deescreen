@@ -43,6 +43,10 @@ use crate::win::window::{self, FindError, WindowInfo};
 // strict.
 #[derive(Deserialize, Default)]
 pub struct CaptureReq {
+    /// Set by `from_query`; a parsed body leaves it at its default. Only the refusal text
+    /// depends on it.
+    #[serde(skip)]
+    pub params: Params,
     /// Which profile, and therefore which window. Omitted, the default profile.
     #[serde(default)]
     pub profile: Option<String>,
@@ -226,6 +230,10 @@ pub struct ClickReq {
     /// Overrides the button definition's own `click_button`.
     #[serde(default)]
     pub click_button: Option<String>,
+    /// Set by `from_query`; a parsed body leaves it at its default. Only the refusal text
+    /// depends on it.
+    #[serde(skip)]
+    pub params: Params,
     #[serde(default)]
     pub double: Option<bool>,
     /// How long to hold the press (ms), overriding the button's own value and the default.
@@ -337,6 +345,7 @@ fn q_rect(q: &HashMap<String, String>) -> Result<Option<Rect>, ApiError> {
 impl CaptureReq {
     fn from_query(q: &HashMap<String, String>) -> Result<CaptureReq, ApiError> {
         Ok(CaptureReq {
+            params: Params::Query,
             profile: q_get(q, "profile"),
             region: q_get(q, "region"),
             rect: q_rect(q)?,
@@ -367,6 +376,7 @@ impl ClickReq {
             v.split(',').map(|b| b.trim().to_string()).filter(|b| !b.is_empty()).collect()
         });
         Ok(ClickReq {
+            params: Params::Query,
             profile: q_get(q, "profile"),
             buttons,
             gap_ms: q_num(q, "gap_ms")?,
@@ -389,15 +399,50 @@ impl ClickReq {
 
 // ────────────────────────── shared work (blocking) ──────────────────────────
 
+/// Where a request carried its parameters.
+///
+/// The only thing that decides whether "put it in the query" or "put it in the body" is true
+/// advice, and endpoints differ: the `.png` variants read a query string, their JSON siblings
+/// read a body, and none of them read both. Saying both was wrong half the time, on the half
+/// the caller was standing in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Params {
+    /// A body parsed as JSON. The default because that is what deserializing produces, and the
+    /// query path sets it explicitly.
+    #[default]
+    Body,
+    /// A query string.
+    Query,
+}
+
+impl Params {
+    /// How to name a profile on this endpoint.
+    fn profile_hint(self) -> &'static str {
+        match self {
+            Params::Query => "pass ?profile=NAME in the query string — this endpoint takes its \
+                              parameters there and does not read a body",
+            Params::Body => "put \"profile\": \"NAME\" in the JSON body — this endpoint takes \
+                             its parameters there and does not read the query string",
+        }
+    }
+}
+
 /// The profile a request selected. An unknown name comes back as 404 with the known list —
 /// **nothing is picked for you.** Clicking while it is unclear which window is being driven is
 /// the class of accident this tool was built to prevent.
-fn pick(state: &SharedState, name: Option<&str>) -> Result<std::sync::Arc<crate::state::Profile>, ApiError> {
+///
+/// `from` is only there so the refusal can say where to put the name, and is the one thing
+/// `pick` cannot work out for itself — see [`Params`].
+fn pick(
+    state: &SharedState,
+    name: Option<&str>,
+    from: Params,
+) -> Result<std::sync::Arc<crate::state::Profile>, ApiError> {
     state.profile(name).map_err(|e| {
         ApiError::not_found(e).with_detail(json!({
             "known_profiles": state.profile_names(),
             "default": state.effective_default(),
-            "hint": "pass ?profile=NAME in the query, or \"profile\": \"NAME\" in the body",
+            "hint": from.profile_hint(),
         }))
     })
 }
@@ -1066,7 +1111,7 @@ pub async fn window_info(
     State(state): State<SharedState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
-    let prof = pick(&state, q_get(&q, "profile").as_deref())?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
     let t = prof.targets();
     let (info, scale, warning) = tokio::task::spawn_blocking(move || bind_window_view(&t))
         .await
@@ -1170,7 +1215,7 @@ pub async fn profiles(
     let mut out = serde_json::Map::new();
     match &wanted {
         Some(name) => {
-            let prof = pick(&state, Some(name))?;
+            let prof = pick(&state, Some(name), Params::Query)?;
             out.insert(prof.name.clone(), profile_view(&prof));
         }
         None => {
@@ -1196,7 +1241,7 @@ pub async fn list_buttons(
     State(state): State<SharedState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
-    let prof = pick(&state, q_get(&q, "profile").as_deref())?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
     let view = profile_view(&prof);
     Ok(json_ok(json!({
         "profile": prof.name,
@@ -1214,7 +1259,7 @@ pub async fn list_regions(
     State(state): State<SharedState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
-    let prof = pick(&state, q_get(&q, "profile").as_deref())?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
     let view = profile_view(&prof);
     Ok(json_ok(json!({
         "profile": prof.name,
@@ -1245,7 +1290,7 @@ pub async fn capture_png(
 }
 
 async fn do_capture(state: &SharedState, req: CaptureReq) -> Result<(Vec<u8>, Value, Value), ApiError> {
-    let prof = pick(state, req.profile.as_deref())?;
+    let prof = pick(state, req.profile.as_deref(), req.params)?;
     let st = state.clone();
     tokio::task::spawn_blocking(move || {
         let t = prof.targets();
@@ -1394,7 +1439,7 @@ pub async fn preview_png(
         req.save = Some(false);
     }
 
-    let prof = pick(&state, req.profile.clone().as_deref())?;
+    let prof = pick(&state, req.profile.clone().as_deref(), Params::Query)?;
     let st = state.clone();
     let (png, meta, _win) = tokio::task::spawn_blocking(move || {
         let live = prof.targets();
@@ -1411,7 +1456,7 @@ pub async fn preview_png(
 /// controls into windows, and the way forward is drawing them by hand in `/editor`. The
 /// response says exactly that.
 pub async fn controls(State(state): State<SharedState>, Query(q): Query<HashMap<String, String>>) -> Result<Response, ApiError> {
-    let prof = pick(&state, q_get(&q, "profile").as_deref())?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
     tokio::task::spawn_blocking(move || {
         let t = prof.targets();
         let info = find_window(&t)?;
@@ -1487,7 +1532,7 @@ pub async fn admin_get_profile(
     State(state): State<SharedState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
-    let prof = pick(&state, q_get(&q, "profile").as_deref())?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
     let doc = serde_json::to_value(&*prof.targets())
         .map_err(|e| ApiError::internal(format!("could not serialize the profile: {e}")))?;
     Ok(json_ok(doc))
@@ -1745,7 +1790,7 @@ pub async fn admin_patch_profile(
         return Err(ApiError::bad_request("the patch is empty — nothing would change"));
     }
 
-    let prof = pick(&state, q_get(&q, "profile").as_deref())?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
     let before = prof.targets();
     let before_doc = serde_json::to_value(&*before)
         .map_err(|e| ApiError::internal(format!("could not serialize the profile: {e}")))?;
@@ -1889,7 +1934,7 @@ pub async fn admin_save_profile(
             });
             (p, true)
         }
-        other => (pick(&state, other.as_deref())?, false),
+        other => (pick(&state, other.as_deref(), Params::Query)?, false),
     };
 
     // A whole-document POST is where a confirm flag goes missing by accident: 140 buttons
@@ -2870,7 +2915,7 @@ const DEFAULT_SEQUENCE_SETTLE_MS: u64 = 800;
 const MAX_SEQUENCE: usize = 200;
 
 async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>, Value), ApiError> {
-    let prof = pick(state, req.profile.as_deref())?;
+    let prof = pick(state, req.profile.as_deref(), req.params)?;
     // One input at a time, across every profile. There is one mouse and one foreground on a
     // PC, so driving two windows at once would have them stealing focus from each other.
     let _guard = state.input_lock.lock().await;
@@ -3217,7 +3262,7 @@ async fn do_click(state: &SharedState, req: ClickReq) -> Result<(Option<Vec<u8>>
 /// reliable than clicking.
 pub async fn key(State(state): State<SharedState>, body: Bytes) -> Result<Response, ApiError> {
     let req: KeyReq = parse_body(&body)?;
-    let prof = pick(&state, req.profile.as_deref())?;
+    let prof = pick(&state, req.profile.as_deref(), Params::Body)?;
     let _guard = state.input_lock.lock().await;
     let st = state.clone();
     tokio::task::spawn_blocking(move || {
@@ -3348,7 +3393,7 @@ fn raw_keys_denied(t: &Targets) -> ApiError {
 /// Bring the window to the front. Done automatically before a click, but also useful when a
 /// person wants to look at the screen.
 pub async fn window_focus(State(state): State<SharedState>, Query(q): Query<HashMap<String, String>>) -> Result<Response, ApiError> {
-    let prof = pick(&state, q_get(&q, "profile").as_deref())?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
     let _guard = state.input_lock.lock().await;
     tokio::task::spawn_blocking(move || {
         let t = prof.targets();
@@ -3376,7 +3421,7 @@ pub async fn window_focus(State(state): State<SharedState>, Query(q): Query<Hash
 /// Restore the client area to `reference_client` — the one move that recovers from a window
 /// size drifting and taking every coordinate with it.
 pub async fn window_fit(State(state): State<SharedState>, Query(q): Query<HashMap<String, String>>) -> Result<Response, ApiError> {
-    let prof = pick(&state, q_get(&q, "profile").as_deref())?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
     let _guard = state.input_lock.lock().await;
     tokio::task::spawn_blocking(move || {
         let t = prof.targets();
@@ -3502,7 +3547,7 @@ pub async fn admin_delete_profile(
                               on the target PC, so a person can put it back",
         })));
     }
-    let prof = pick(&state, Some(&name))?;
+    let prof = pick(&state, Some(&name), Params::Query)?;
     not_the_configured_default(&state, &prof.name)?;
 
     let path = prof.path.clone();
@@ -3555,7 +3600,7 @@ pub async fn admin_rename_profile(
             "'{to}' is not a valid profile name — letters, digits, '-' and '_' only"
         )));
     }
-    let prof = pick(&state, q_get(&q, "profile").as_deref())?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
     if prof.name == to {
         return Err(ApiError::bad_request(format!("'{to}' is already its name")));
     }
@@ -3642,7 +3687,7 @@ pub async fn admin_reload(
         })));
     };
 
-    let prof = pick(&state, Some(&name))?;
+    let prof = pick(&state, Some(&name), Params::Query)?;
     let path = prof.path.clone();
     let fresh = tokio::task::spawn_blocking(move || Targets::load(&path))
         .await
@@ -4118,6 +4163,44 @@ mod tests {
         let v = near_names("qqqqqqqq", all(), "GET /buttons");
         assert!(v.get("did_you_mean").is_none(), "no near names: {v}");
         assert!(v.get("same_prefix").is_none(), "no underscore, no family: {v}");
+    }
+
+    /// The sentence a refusal carries has to name the place the caller is actually standing in.
+    /// `/click` reads a body and `/click.png` reads a query string, and neither reads both, so
+    /// the one message that mentioned both was wrong half the time - and wrong precisely for
+    /// the caller who had done the right thing and still been refused.
+    #[test]
+    fn a_refusal_names_the_place_that_endpoint_reads() {
+        let q = Params::Query.profile_hint();
+        let b = Params::Body.profile_hint();
+
+        // Each names its own place and not the other. Said plainly because "mentions the word
+        // query" is the whole content of the bug: the old sentence mentioned both.
+        assert!(q.contains("?profile=NAME"), "{q}");
+        assert!(!q.contains("body") || q.contains("does not read a body"), "{q}");
+        assert!(b.contains(r#""profile""#), "{b}");
+        assert!(!b.contains("?profile="), "{b}");
+        assert_ne!(q, b);
+
+        // A message split across source lines must not carry the indentation with it.
+        for h in [q, b] {
+            assert!(!h.contains("  "), "doubled spaces in: {h}");
+        }
+
+        // The wiring. A query-built request says query; a body-parsed one says body - which is
+        // the default, and is why the query constructors have to set it explicitly.
+        let empty = std::collections::HashMap::new();
+        assert_eq!(ClickReq::from_query(&empty).expect("empty query").params, Params::Query);
+        assert_eq!(CaptureReq::from_query(&empty).expect("empty query").params, Params::Query);
+
+        let from_body: ClickReq = parse_body(&Bytes::from_static(b"{}")).expect("empty body");
+        assert_eq!(from_body.params, Params::Body);
+        let from_body: CaptureReq = parse_body(&Bytes::from_static(b"{}")).expect("empty body");
+        assert_eq!(from_body.params, Params::Body);
+
+        // And `params` is ours, not the caller's: a body naming it is refused like any other
+        // unknown field rather than talking the server into the wrong advice.
+        assert!(parse_body::<ClickReq>(&Bytes::from_static(br#"{"params":"Query"}"#)).is_err());
     }
 
     /// Losing a confirm flag is detected whether the flag was cleared or the whole button
