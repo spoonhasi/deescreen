@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 use crate::captures::{self, Frame};
 use crate::config::Config;
 use crate::draw;
+use crate::sheet;
 use crate::state::SharedState;
 use crate::targets::{ButtonDef, Rect, Targets};
 use crate::web::{ApiError, json_ok, png_response};
@@ -1450,6 +1451,251 @@ pub async fn preview_png(
     Ok(png_response(png, &meta))
 }
 
+// ────────────────────────── the contact sheet ──────────────────────────
+
+/// Which order the cells come in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SheetOrder {
+    /// As they sit on the panel. The sheet becomes a map of it and can be read a row at a time
+    /// against the real thing.
+    Screen,
+    /// As `GET /buttons` lists them, which is by name. A family like `MDI_0`..`MDI_9` ends up
+    /// adjacent, so the odd picture out is obvious without knowing the panel.
+    Name,
+}
+
+impl SheetOrder {
+    fn parse(s: Option<&str>) -> Result<SheetOrder, ApiError> {
+        match s {
+            None | Some("screen") => Ok(SheetOrder::Screen),
+            Some("name") => Ok(SheetOrder::Name),
+            Some(other) => Err(ApiError::bad_request(format!(
+                "order must be 'screen' or 'name', got '{other}'"
+            ))),
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            SheetOrder::Screen => "screen",
+            SheetOrder::Name => "name",
+        }
+    }
+}
+
+/// **One cropped picture per button, with its name under it.**
+///
+/// The overlay answers "are these coordinates right". This answers "is this the right *name*",
+/// which the overlay cannot: printing 60 names next to 60 keys on one operator panel leaves no
+/// room, the labels overlap, and two names on top of each other look like one.
+///
+/// The response is the sheet's shape and, importantly, which buttons had **no picture to show**
+/// — those get a crossed-out cell rather than being left out, because a name missing from the
+/// sheet is the one nobody checks.
+pub async fn sheet_json(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let (_png, meta) = do_sheet(&state, q).await?;
+    Ok(json_ok(meta))
+}
+
+/// The sheet itself. `curl -o sheet.png "…/sheet.png?profile=NAME&region=operator_panel"`
+pub async fn sheet_png(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let (png, meta) = do_sheet(&state, q).await?;
+    Ok(png_response(png, &meta))
+}
+
+async fn do_sheet(state: &SharedState, q: HashMap<String, String>) -> Result<(Vec<u8>, Value), ApiError> {
+    let prof = pick(state, q_get(&q, "profile").as_deref(), Params::Query)?;
+    let order = SheetOrder::parse(q_get(&q, "order").as_deref())?;
+    let wanted: Option<Vec<String>> = q_get(&q, "buttons").map(|v| {
+        v.split(',').map(|b| b.trim().to_string()).filter(|b| !b.is_empty()).collect()
+    });
+    let inside = q_get(&q, "region");
+    let opt = sheet::Options {
+        // Enough margin to see that a key is centred in its rectangle, which is how a 16px
+        // drift shows up at a glance. At 0 an off-centre rectangle still looks like a key.
+        pad: q_num(&q, "pad")?.unwrap_or(8).clamp(0, 200),
+        cell: q_num(&q, "cell")?.unwrap_or(sheet::DEFAULT_CELL).clamp(16, 400),
+        scale: q_num(&q, "scale")?.unwrap_or(1.0),
+        cols: q_num(&q, "cols")?,
+        sheet_width: q_num(&q, "max_width")?.unwrap_or(sheet::DEFAULT_SHEET_WIDTH).clamp(200, 8000),
+        label: q_num(&q, "label")?.unwrap_or(1).clamp(1, 4),
+        heading: String::new(),
+    };
+    #[allow(clippy::neg_cmp_op_on_partial_ord)] // also catches NaN, which `scale=nan` produces
+    if !(opt.scale > 0.0) || opt.scale > 8.0 {
+        return Err(ApiError::bad_request(format!(
+            "scale must be greater than 0 and at most 8, got {}",
+            opt.scale
+        )));
+    }
+    let save = q_bool(&q, "save")?.unwrap_or(true);
+
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || sheet_now(&st, &prof, wanted, inside, order, opt, save))
+        .await
+        .map_err(|e| ApiError::internal(format!("sheet task failed: {e}")))?
+}
+
+fn sheet_now(
+    state: &SharedState,
+    prof: &crate::state::Profile,
+    wanted: Option<Vec<String>>,
+    inside: Option<String>,
+    order: SheetOrder,
+    mut opt: sheet::Options,
+    save: bool,
+) -> Result<(Vec<u8>, Value), ApiError> {
+    let t = prof.targets();
+    let (info, coord_scale, size_warning) = bind_window_view(&t)?;
+
+    // Every cell on this sheet **is** an anchored rectangle, so unlike an ordinary capture
+    // there is no part of the answer that survives the anchor not being found. Refusing is the
+    // honest outcome: a grid of crossed-out boxes would look like 140 separate problems.
+    let offsets = anchor_offsets(&t, &info)?;
+
+    // Only the buttons asked for, and a name that is not there is said so rather than quietly
+    // producing a shorter sheet.
+    let mut chosen: Vec<(&String, &ButtonDef)> = match &wanted {
+        None => t.buttons.iter().collect(),
+        Some(names) => {
+            let mut v = Vec::with_capacity(names.len());
+            for n in names {
+                match t.buttons.get_key_value(n) {
+                    Some(kv) => v.push(kv),
+                    None => {
+                        return Err(ApiError::not_found(format!("no button named '{n}'"))
+                            .with_detail(near_names(n, t.buttons.keys().cloned(), "GET /buttons")));
+                    }
+                }
+            }
+            v
+        }
+    };
+
+    // `region=NAME` narrows the sheet to one part of the panel — which is the usual way to
+    // look at 140 buttons, since they are checked a panel at a time.
+    let mut within: Option<Rect> = None;
+    if let Some(name) = &inside {
+        let r = t.region(name, info.client_size, &offsets).map_err(|e| {
+            ApiError::bad_request(e).with_detail(json!({"known_regions": t.region_names()}))
+        })?;
+        let r = Targets::scale_rect(r, coord_scale);
+        within = Some(r);
+        chosen.retain(|(_, b)| {
+            let s = Targets::shift_rect(
+                Targets::scale_rect(b.rect, coord_scale),
+                Targets::offset_for(&offsets, &b.anchor),
+            );
+            // By the centre, not by containment: a key on a panel's edge is part of that panel
+            // even where its rectangle, padded or not, runs a pixel past it.
+            let (cx, cy) = (s[0] + s[2] / 2, s[1] + s[3] / 2);
+            cx >= r[0] && cy >= r[1] && cx < r[0] + r[2] && cy < r[1] + r[3]
+        });
+        if chosen.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "no button's centre falls inside region '{name}' {r:?}"
+            ))
+            .with_detail(json!({
+                "known_regions": t.region_names(),
+                "note": "the region resolved and the buttons are placed; they simply do not \
+                         overlap. GET /capture.png?region=NAME&buttons=box shows both.",
+            })));
+        }
+    }
+
+    let cells: Vec<sheet::Cell> = chosen
+        .iter()
+        .map(|(name, b)| sheet::Cell {
+            name: (*name).clone(),
+            rect: Targets::shift_rect(
+                Targets::scale_rect(b.rect, coord_scale),
+                Targets::offset_for(&offsets, &b.anchor),
+            ),
+            confirm: b.confirm,
+        })
+        .collect();
+    let cells = match order {
+        // Half the median key height: keys within a row differ by a few pixels, and rows are
+        // at least a key apart. Derived rather than asked for, because a caller guessing it is
+        // a caller guessing at the panel this tool has already measured.
+        SheetOrder::Screen => {
+            let mut hs: Vec<i32> = cells.iter().map(|c| c.rect[3]).collect();
+            hs.sort_unstable();
+            sheet::screen_order(cells, (hs[hs.len() / 2] / 2).max(4))
+        }
+        SheetOrder::Name => cells,
+    };
+
+    let shot = wincap::capture_client(&info).map_err(ApiError::internal)?;
+    let full = captures::full_image(&shot).map_err(ApiError::internal)?;
+
+    opt.heading = format!(
+        "{} - {} BUTTONS - CLIENT {}X{} - {} ORDER",
+        prof.name.to_ascii_uppercase(),
+        cells.len(),
+        info.client_size.0,
+        info.client_size.1,
+        order.as_str().to_ascii_uppercase(),
+    );
+    let built = sheet::build(&full, &cells, &opt).map_err(ApiError::bad_request)?;
+    let png = captures::encode_png(&built.image).map_err(ApiError::internal)?;
+
+    let mut meta = json!({
+        "profile": prof.name,
+        "buttons": cells.len(),
+        "order": order.as_str(),
+        "cols": built.cols,
+        "rows": built.rows,
+        "cell": built.cell,
+        "pad": opt.pad,
+        "scale": opt.scale,
+        "width": built.image.width(),
+        "height": built.image.height(),
+        "bytes": png.len(),
+        "method": shot.method,
+        "black": shot.black,
+        "note": "one cell per button, all cropped from a single capture. The name under a cell \
+                 is what /click expects; the picture is what is actually there. A cell drawn as \
+                 an empty crossed box has a rectangle with no pixels on this window.",
+    });
+    if let Some(r) = within {
+        meta["region"] = json!(inside);
+        meta["region_rect"] = json!(r);
+    }
+    if shot.black {
+        meta["hint"] = json!(BLACK_HINT);
+    }
+    if !built.absent.is_empty() {
+        meta["not_on_screen"] = json!(built.absent);
+        meta["not_on_screen_hint"] = json!(
+            "these rectangles are off the window entirely. Either the window is smaller than \
+             the one they were measured on (POST /window/fit), or the profile is measured \
+             against a different build (GET /controls, then re-measure in /editor)."
+        );
+    }
+    if let Some(w) = size_warning {
+        meta["size_mismatch"] = json!(w);
+    }
+    if save {
+        let path = captures::save(&state.captures_dir, &format!("{}_sheet", safe_label(&prof.name)), &png)
+            .map_err(ApiError::internal)?;
+        captures::cleanup(
+            &state.captures_dir,
+            state.config.captures.keep,
+            state.config.captures.max_age_minutes,
+        );
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        meta["path"] = json!(path.to_string_lossy());
+        meta["url"] = json!(format!("/captures/{name}"));
+    }
+    Ok((png, meta))
+}
+
 /// The child controls inside the window — where this works, nothing is measured by eye.
 ///
 /// **An empty list is not a failure but an answer**: that application does not split its
@@ -2232,6 +2478,45 @@ LOOK AT SOMETHING
                   this where buttons are packed too tightly for names to fit.
   Names that cannot be placed without covering a neighbour are drawn as their number
   instead, and the metadata says how many ("labels_crowded").
+  CHECK THE NAMES, NOT JUST THE COORDINATES - the contact sheet
+  The overlay above answers "are these rectangles on the right keys". It cannot answer
+  "is this the right NAME for this key": 60 names printed beside 60 keys do not fit, and
+  two names drawn on top of each other look like one. The sheet is the same rectangles
+  laid out as a LIST instead - one cell per button, its picture cropped from a single
+  capture, its name underneath with nothing competing for the space.
+    curl -s -o sheet.png "{base}/sheet.png?profile=NAME"
+    curl -s -o sheet.png "{base}/sheet.png?profile=NAME&region=operator_panel&scale=2"
+  Read it against the real panel a row at a time. A cell whose picture is not the key its
+  name claims is a naming error - that is the only question this picture answers, and it
+  answers it for every button at once.
+
+    order=screen   default. Reading order on the panel, top to bottom and left to right,
+                   so the sheet is a map of it. Rows are worked out from the buttons' own
+                   heights, so a row of keys that are not pixel-aligned stays one row.
+    order=name     the GET /buttons order instead. Puts MDI_0..MDI_9 side by side, so the
+                   odd picture out shows even if you have never seen the panel.
+    buttons=A,B,C  only these. An unknown name is a 404 with the near ones, not a quietly
+                   shorter sheet.
+    region=NAME    only the buttons whose centre falls inside that region. This is the
+                   usual way to look at a panel of 140.
+    pad=8          context pixels kept around each rectangle (default 8). This is what
+                   makes a drift visible: at pad=0 a rectangle sitting 16px off its key
+                   still looks like a picture of a key.
+    scale=2        magnify each crop - for softkeys whose legend is only 32px tall.
+    cell=120       ceiling on one cell's picture. A whole-panel rectangle is shrunk to it
+                   rather than setting the cell size for the other 139.
+    cols=, max_width=, label=   the grid's shape, when the default does not suit.
+    save=false     do not keep a copy on the server.
+
+  A BUTTON WITH NO PICTURE IS STILL A CELL - drawn as an empty crossed box and listed in
+  "not_on_screen". It is never left out, because a name missing from the sheet is exactly
+  the one nobody checks. If the ANCHOR cannot be resolved the sheet is refused instead:
+  then every cell would be empty, and 140 empty cells look like 140 separate problems
+  rather than the one they are.
+
+  GET /sheet is the same sheet as JSON - its shape, where it was saved, and that list -
+  for when you want the failures without reading them off a picture.
+
   CAPTURE A BUTTON, WITH A MARGIN. A toggle's state is usually NOT inside its button - on
   an operator panel the lamp sits just above the key. Do not read the rect from
   GET /buttons and add a margin yourself; name the button and say how much:
@@ -2302,6 +2587,11 @@ ENDPOINTS
   GET  /profiles       every profile's full definition; one call tells you everything
   GET  /buttons        just the button list of one profile (subset of /profiles)
   GET  /regions        just the region list of one profile (subset of /profiles)
+  GET  /sheet.png      one cropped picture per button with its name under it. The way to
+                       check that a name belongs to the key it is on, which an overlay
+                       cannot show for a whole panel. See "the contact sheet" above
+  GET  /sheet          the same sheet as JSON - its shape, where it was saved, and which
+                       buttons had no picture to show
   GET  /windows        every visible top-level window (to find a title)
   GET  /controls       every child control inside the target window, with its rectangle
                        in window coordinates and its caption. Rectangles you can read

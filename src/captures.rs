@@ -135,19 +135,29 @@ impl Frame {
     }
 
     pub fn to_png(&self) -> Result<Vec<u8>, String> {
-        let mut buf = Vec::new();
-        // Fast compression — screenshots compress well anyway, and this path sits inside a
-        // round trip someone is waiting on.
-        PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, PngFilter::Adaptive)
-            .write_image(
-                self.image.as_raw(),
-                self.image.width(),
-                self.image.height(),
-                ExtendedColorType::Rgba8,
-            )
-            .map_err(|e| format!("PNG encode failed: {e}"))?;
-        Ok(buf)
+        encode_png(&self.image)
     }
+}
+
+/// Encode an image as PNG.
+///
+/// Its own function because the contact sheet is an image this module never cropped or scaled,
+/// and it should still come out of the same encoder with the same settings — two encoders
+/// eventually differ in some way nobody chose.
+pub fn encode_png(image: &RgbaImage) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    // Fast compression — screenshots compress well anyway, and this path sits inside a
+    // round trip someone is waiting on.
+    PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, PngFilter::Adaptive)
+        .write_image(image.as_raw(), image.width(), image.height(), ExtendedColorType::Rgba8)
+        .map_err(|e| format!("PNG encode failed: {e}"))?;
+    Ok(buf)
+}
+
+/// A shot as an image, uncropped.
+pub fn full_image(shot: &Shot) -> Result<RgbaImage, String> {
+    RgbaImage::from_raw(shot.width, shot.height, shot.rgba.clone())
+        .ok_or_else(|| "capture buffer size does not match its dimensions".to_string())
 }
 
 /// What changed between before and after a press — **where, and how much**.
@@ -165,8 +175,7 @@ pub struct Diff {
 
 /// Crop a region out of a capture and apply the scale.
 pub fn frame(shot: &Shot, rect: Rect, scale: Option<f64>, max_width: Option<u32>) -> Result<Frame, String> {
-    let full = RgbaImage::from_raw(shot.width, shot.height, shot.rgba.clone())
-        .ok_or_else(|| "capture buffer size does not match its dimensions".to_string())?;
+    let full = full_image(shot)?;
 
     // Clamp anything that runs past the client area. A region defined slightly larger than
     // the window is no reason for the whole capture to fail.

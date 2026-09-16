@@ -1,6 +1,6 @@
 [package]
 name = "deescreen"
-version = "0.6.4"
+version = "0.7.0"
 edition = "2024"
 authors = ["spoonhasi <spoonhasi@gmail.com>"]
 description = "Drive a Windows GUI application over HTTP — named click targets, cropped screen captures, key input. Built for AI agents operating a remote simulator."

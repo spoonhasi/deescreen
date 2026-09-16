@@ -600,6 +600,41 @@ drawn **hollow**, outline only. Two channels rather than one, so a confirm butto
 drifted off the window still reads as a confirm button — which is exactly the fact a single
 "something is wrong" colour used to take away. `outside_client` in the metadata names them.
 
+### Checking the names, not the coordinates — the contact sheet
+
+The overlay answers *are these rectangles on the right keys*. It cannot answer *is this the
+right **name** for this key*, and the paragraph above is why: sixty names do not fit beside
+sixty keys, and the fallback to numbers is the overlay conceding it.
+
+`/sheet.png` is the same rectangles laid out as a **list** instead — one cell per button, its
+picture cropped from a single capture, its name underneath with nothing competing for the
+space. Read it against the real panel a row at a time.
+
+```bash
+curl -s -o sheet.png "http://192.0.2.73:8090/sheet.png?profile=nctrainer-mill"
+curl -s -o sheet.png ".../sheet.png?profile=nctrainer-mill&region=operator_panel&scale=2"
+```
+
+| | |
+|---|---|
+| `order=screen` | default — reading order on the panel, so the sheet is a map of it. Rows are worked out from the buttons' own heights, so keys that are not pixel-aligned still form one row |
+| `order=name` | the `GET /buttons` order. `MDI_0`…`MDI_9` end up side by side, so the odd picture out shows without knowing the panel |
+| `buttons=A,B,C` | only these. An unknown name is a 404 with the near ones, not a quietly shorter sheet |
+| `region=NAME` | only the buttons whose **centre** falls inside that region — the usual way to look at a panel of 140 |
+| `pad=8` | context pixels around each rectangle (default 8). This is what makes drift visible: at `pad=0` a rectangle sitting 16px off its key still looks like a picture of a key |
+| `scale=2` | magnify each crop, for softkeys whose legend is 32px tall |
+| `cell=120` | ceiling on one cell's picture, so a whole-panel rectangle does not set the cell size for the other 139 |
+| `cols=` `max_width=` `label=` | the grid's shape, when the default does not suit |
+
+A button whose rectangle has no pixels on this window **still gets a cell**, drawn as an empty
+crossed box and listed in `not_on_screen`. It is never left out: a name missing from the sheet
+is exactly the one nobody checks. If the *anchor* cannot be resolved the sheet is refused
+instead — every cell would be empty, and 140 empty cells look like 140 separate problems
+rather than the one they are.
+
+`GET /sheet` is the same sheet as JSON — its shape, where it was saved, and that list — for
+when the failures are wanted without reading them off a picture.
+
 ---
 
 ## Using it from an AI — the PNG in one round trip
@@ -639,6 +674,8 @@ and a `/captures/<name>` URL instead.
 | GET | `/favicon.ico` · `/favicon.png` | read | the tray icon as a PNG — the tab should not be a different picture from the tray. Two names: the page links the `.png`, a browser asks for the `.ico` on its own |
 | GET | `/capture.png` | read | capture as PNG bytes. `?region= &rect=x,y,w,h &pad= &scale= &max_width= &save=`; `region=button:NAME` is that button's own rect <br>overlays: `&grid=50 &mark=x,y &inset=4 &inset_radius=40 &buttons=1\|box\|num` |
 | POST | `/capture` | read | same, JSON response (includes the server-side path) |
+| GET | `/sheet.png` | read | **one cropped picture per button, with its name under it** — for checking that a name belongs to the key it is on. `?profile= &region= &buttons=A,B &order=screen\|name &pad= &scale= &cell= &cols= &max_width= &label= &save=` |
+| GET | `/sheet` | read | the same sheet as JSON: its shape, where it was saved, and which buttons had no picture to show |
 | POST | `/preview.png` | read | draw a **candidate** definition from the body over the live screen. Saves nothing |
 | GET | `/captures/{name}` | read | fetch a stored capture |
 | POST | `/click` | **control** | `{button\|buttons[]\|rect\|point, confirm, click_button, double, settle_ms, gap_ms, capture, pad, ignore, scale, max_width}`. No `capture` means **no picture is taken**. `buttons` presses in order and stops at the first failure |

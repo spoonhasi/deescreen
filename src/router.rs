@@ -31,6 +31,11 @@ pub fn build(state: SharedState) -> Router {
         // Draw a candidate definition without saving it — presses nothing
         .route("/preview.png", post(api::preview_png))
         .route("/controls", get(api::controls))
+        // One cropped picture per button, with its name under it — the way to check that
+        // a name belongs to the key it is on. Both read a query string and neither reads a
+        // body, so there is one place to put a parameter.
+        .route("/sheet", get(api::sheet_json))
+        .route("/sheet.png", get(api::sheet_png))
         // The button editor (HTML). A static asset, so it is exempt from admin_code — the
         // page itself holds no secret, and the actual saving is what /admin/profile guards
         // three ways.

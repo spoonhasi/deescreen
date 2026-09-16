@@ -145,6 +145,10 @@ mod tests {
         assert!(!is_control_request("/profiles"));
         assert!(!is_control_request("/preview.png"));
         assert!(!is_control_request("/controls"));
+        // The contact sheet captures and crops. It presses nothing and raises nothing, so a
+        // reader may ask for it — the same standing as /capture.
+        assert!(!is_control_request("/sheet"));
+        assert!(!is_control_request("/sheet.png"));
         assert!(!is_control_request("/editor"));
         assert!(!is_control_request("/window"));
         assert!(!is_control_request("/windows"));

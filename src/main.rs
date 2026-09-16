@@ -24,6 +24,7 @@ mod config;
 mod draw;
 mod logging;
 mod router;
+mod sheet;
 mod state;
 mod targets;
 /// The 32x32 icon, as raw RGBA.
