@@ -454,7 +454,9 @@ edit protocol itself.
 `PATCH` sends only the difference:
 
 ```bash
-curl -s -X PATCH -H "Content-Type: application/json"   -d '{"buttons": {"NEW_KEY": {"rect": [820,640,60,40]}, "OLD_KEY": null}}'   ".../admin/profile?profile=fanuc"
+curl -s -X PATCH -H "Content-Type: application/json" \
+  -d '{"buttons": {"NEW_KEY": {"rect": [820,640,60,40]}, "OLD_KEY": null}}' \
+  ".../admin/profile?profile=fanuc"
 ```
 
 It is a **JSON merge patch** ([RFC 7386](https://www.rfc-editor.org/rfc/rfc7386)) and has three
@@ -625,7 +627,6 @@ curl -s -o sheet.png ".../sheet.png?profile=nctrainer-mill&region=operator_panel
 | `pad=8` | context pixels around each rectangle (default 8). This is what makes drift visible: at `pad=0` a rectangle sitting 16px off its key still looks like a picture of a key |
 | `scale=2` | magnify each crop, for softkeys whose legend is 32px tall |
 | `cell=120` | ceiling on one cell's picture, so a whole-panel rectangle does not set the cell size for the other 139 |
-| `cols=` `max_width=` `label=` | the grid's shape, when the default does not suit |
 
 A button whose rectangle has no pixels on this window **still gets a cell**, drawn as an empty
 crossed box and listed in `not_on_screen`. It is never left out: a name missing from the sheet
@@ -677,7 +678,7 @@ and a `/captures/<name>` URL instead.
 | GET | `/favicon.ico` · `/favicon.png` | read | the tray icon as a PNG — the tab should not be a different picture from the tray. Two names: the page links the `.png`, a browser asks for the `.ico` on its own |
 | GET | `/capture.png` | read | capture as PNG bytes. `?region= &rect=x,y,w,h &pad= &scale= &max_width= &save=`; `region=button:NAME` is that button's own rect <br>overlays: `&grid=50 &mark=x,y &inset=4 &inset_radius=40 &buttons=1\|box\|num` |
 | POST | `/capture` | read | same, JSON response (includes the server-side path) |
-| GET | `/sheet.png` | read | **one cropped picture per button, with its name under it** — for checking that a name belongs to the key it is on. `?profile= &region= &buttons=A,B &order=screen\|name &pad= &scale= &cell= &cols= &max_width= &label= &save=` |
+| GET | `/sheet.png` | read | **one cropped picture per button, with its name under it** — for checking that a name belongs to the key it is on. `?profile= &region= &buttons=A,B &order=screen\|name &pad= &scale= &cell= &save=` |
 | GET | `/sheet` | read | the same sheet as JSON: its shape, where it was saved, and which buttons had no picture to show |
 | POST | `/preview.png` | read | draw a **candidate** definition from the body over the live screen. Saves nothing |
 | GET | `/captures/{name}` | read | fetch a stored capture |
@@ -797,7 +798,7 @@ curl -s -X POST -H "Content-Type: application/json" \
 
 ```json
 "settle": { "measured": true, "settled": true, "last_change_ms": 850,
-            "quiet_for_ms": 310, "waited_ms": 1160, "samples": 22,
+            "quiet_for_ms": 310, "samples": 22,
             "resolution_ms": 53, "quiet_ms": 300, "suggest_settle_ms": 1100 }
 ```
 

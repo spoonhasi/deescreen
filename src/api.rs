@@ -873,7 +873,8 @@ fn watch_json(w: &Watch, quiet_ms: u64, ceiling_ms: u64) -> Value {
         "last_change_ms": w.last_change_ms,
         "first_change_ms": w.first_change_ms,
         "quiet_for_ms": w.quiet_for_ms,
-        "waited_ms": w.elapsed_ms,
+        // How long the watching took is `settle_ms` at the top of the reply. Repeating it
+        // here as a second name for one number is how two fields start disagreeing.
         "samples": w.samples,
         "resolution_ms": w.resolution_ms,
         "quiet_ms": quiet_ms,
@@ -1842,9 +1843,6 @@ async fn do_sheet(state: &SharedState, q: HashMap<String, String>) -> Result<(Ve
         pad: q_num(&q, "pad")?.unwrap_or(8).clamp(0, 200),
         cell: q_num(&q, "cell")?.unwrap_or(sheet::DEFAULT_CELL).clamp(16, 400),
         scale: q_num(&q, "scale")?.unwrap_or(1.0),
-        cols: q_num(&q, "cols")?,
-        sheet_width: q_num(&q, "max_width")?.unwrap_or(sheet::DEFAULT_SHEET_WIDTH).clamp(200, 8000),
-        label: q_num(&q, "label")?.unwrap_or(1).clamp(1, 4),
         heading: String::new(),
     };
     #[allow(clippy::neg_cmp_op_on_partial_ord)] // also catches NaN, which `scale=nan` produces
@@ -2656,7 +2654,7 @@ PRESS A SAVED BUTTON - click, wait for it to settle, re-capture, one round trip
   number to put on this button in the profile, so it is measured once here rather than
   guessed by every caller afterwards:
     "settle": {{"measured": true, "settled": true, "last_change_ms": 850,
-                "quiet_for_ms": 310, "waited_ms": 1160, "samples": 22,
+                "quiet_for_ms": 310, "samples": 22,
                 "resolution_ms": 53, "quiet_ms": 300, "suggest_settle_ms": 1100}}
     PATCH {{"buttons": {{"MONITOR": {{"settle_ms": 1100}}}}}}
 
@@ -2922,7 +2920,6 @@ LOOK AT SOMETHING
     scale=2        magnify each crop - for softkeys whose legend is only 32px tall.
     cell=120       ceiling on one cell's picture. A whole-panel rectangle is shrunk to it
                    rather than setting the cell size for the other 139.
-    cols=, max_width=, label=   the grid's shape, when the default does not suit.
     save=false     do not keep a copy on the server.
 
   A BUTTON WITH NO PICTURE IS STILL A CELL - drawn as an empty crossed box and listed in
@@ -3130,6 +3127,29 @@ CREATE A PROFILE FROM SCRATCH
      here records who set a flag: a month from now neither you nor a person can tell your
      caution apart from someone's hard requirement, and the note is the only place that
      difference can live. Adding one is not free either - taking it off later asks.
+
+     RECORD WHAT A KEY ENTERS, IF IT ENTERS ANYTHING. On a keypad, put the character in
+     "types" - the legend printed on the key:
+       "MDI_G": {{"rect": [...], "types": "G"}}
+     Where a key carries a SECOND legend reached through shift, that goes in
+     "shift_types", and the document says which key reaches it - "shift" is a field of
+     the PROFILE, beside "buttons", not of a button:
+       "buttons": {{"MDI_F": {{"rect": [...], "types": "F", "shift_types": "E"}},
+                   "MDI_SHIFT": {{"rect": [...]}}}},
+       "shift":   {{"button": "MDI_SHIFT", "mode": "oneshot"}}
+     This is the difference between "E is on the F key" being a sentence in a note that
+     only a person can read, and being a fact the server can act on - with it, a whole
+     string is entered by POST /click {{"spell": "G91X0"}} instead of by naming five keys.
+     Two keys may not claim the same legend, and a shifted legend without "shift"
+     declared will not load, so a half-recorded keypad is refused rather than surprising
+     somebody later. See SPELL A STRING above for what mode means and why it is not
+     guessed.
+
+     A MENU ITEM CAN BE MARKED THE SAME WAY a button is. The menu is read off the window
+     rather than written here, so the profile's say in it is which paths need a second
+     look:
+       "confirm_menus": ["File", "Tool/Set Machine Parameters"]
+     Matched on whole path segments. See THE WINDOW'S MENU BAR below.
 
      TAKING ONE OFF IS A HEAVIER CALL. That flag is somebody's judgement about a machine
      you cannot see, and removing it changes this server for everyone who uses it after

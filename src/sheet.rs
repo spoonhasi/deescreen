@@ -36,8 +36,15 @@ const CAPTION_GAP: i32 = 4;
 /// How large a cell's picture may get, before `scale`. A whole-panel "button" would otherwise
 /// set the cell size for all 140 of them.
 pub const DEFAULT_CELL: i32 = 120;
-/// The sheet is laid out to fit this width, unless `cols` says otherwise.
-pub const DEFAULT_SHEET_WIDTH: i32 = 1600;
+/// The sheet is laid out to fit this width, and the column count follows from it.
+///
+/// A constant rather than a parameter, along with the column count and the caption's glyph
+/// scale. All three were once asked for in the query string, and the manual had nothing to say
+/// about any of them beyond "when the default does not suit" - which is what a knob nobody
+/// needs looks like from the outside. They are one edit away if a reason ever turns up.
+const SHEET_WIDTH: i32 = 1600;
+/// Glyph scale for the names under the cells.
+const LABEL_SCALE: i32 = 1;
 /// Same ceiling the ordinary captures use, for the same reason: a response cannot explode.
 const MAX_SHEET_PIXELS: u64 = 64_000_000;
 
@@ -60,11 +67,6 @@ pub struct Options {
     pub cell: i32,
     /// Magnify (or shrink) each crop. Small softkeys are 32px and their legends want 2x.
     pub scale: f64,
-    /// Columns. `None` fits `sheet_width`.
-    pub cols: Option<i32>,
-    pub sheet_width: i32,
-    /// Glyph scale for the names.
-    pub label: i32,
     /// Drawn across the top. The sheet outlives the request that made it, so it says what it
     /// is a sheet of.
     pub heading: String,
@@ -90,7 +92,7 @@ pub fn build(full: &RgbaImage, cells: &[Cell], opt: &Options) -> Result<Sheet, S
     if cells.is_empty() {
         return Err("this profile has no buttons to lay out".to_string());
     }
-    let label = opt.label.max(1);
+    let label = LABEL_SCALE;
     let cap = opt.cell.max(8);
     let (fw, fh) = (full.width() as i32, full.height() as i32);
 
@@ -138,10 +140,7 @@ pub fn build(full: &RgbaImage, cells: &[Cell], opt: &Options) -> Result<Sheet, S
     let cell_w = content_w.max(widest) + GUTTER * 2;
     let cell_h = content_h + CAPTION_GAP + draw::GLYPH_H * label + GUTTER * 2;
     let n = cells.len() as i32;
-    let cols = match opt.cols {
-        Some(c) if c > 0 => c.min(n),
-        _ => (opt.sheet_width.max(cell_w) / cell_w).clamp(1, n),
-    };
+    let cols = (SHEET_WIDTH.max(cell_w) / cell_w).clamp(1, n);
     let rows = (n + cols - 1) / cols;
 
     let head_h = draw::GLYPH_H * label + GUTTER * 2;
@@ -266,9 +265,6 @@ mod tests {
             pad: 0,
             cell: DEFAULT_CELL,
             scale: 1.0,
-            cols: None,
-            sheet_width: DEFAULT_SHEET_WIDTH,
-            label: 1,
             heading: heading.to_string(),
         }
     }
