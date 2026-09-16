@@ -257,6 +257,14 @@ pub struct Targets {
     /// Everything that can be pressed. **A coordinate that is not here cannot be pressed.**
     #[serde(default, deserialize_with = "crate::config::no_duplicate_keys")]
     pub buttons: BTreeMap<String, ButtonDef>,
+    /// Menu paths that need `"confirm": true`, the way a button's `confirm` flag does.
+    ///
+    /// Matched as a **prefix on whole path segments**, so `"File"` protects the entire File
+    /// menu and `"Tool/Set Machine Parameters"` protects one item. A menu is not a whitelist -
+    /// it is read off the window, so anything in it can be reached - and this is where a
+    /// person says which parts of it need a second look.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub confirm_menus: Vec<String>,
     /// The keypad's shift key, for profiles whose keys carry a second legend.
     ///
     /// Absent is the ordinary case. It is required as soon as any button sets `shift_types`,
@@ -831,6 +839,22 @@ fn shift_press(button: &str) -> Spelled {
     Spelled { button: button.to_string(), enters: String::new(), is_shift: true, case_folded: false }
 }
 
+/// Whether a menu path is covered by a `confirm_menus` entry.
+///
+/// Prefix, but only on **whole segments**: `"File"` covers `"File/Save"` and does not cover
+/// `"Filename Options/..."`. A plain `starts_with` would protect the first and quietly also
+/// the second, and a protection that covers more than it says is as confusing as one that
+/// covers less.
+pub fn menu_needs_confirm(path: &str, guarded: &[String]) -> Option<String> {
+    let norm = |s: &str| s.trim().trim_matches('/').to_ascii_lowercase();
+    let p = norm(path);
+    guarded.iter().find(|g| {
+        let g = norm(g);
+        !g.is_empty() && (p == g || p.starts_with(&format!("{g}/")))
+    })
+    .cloned()
+}
+
 /// Move a profile's files to a new name. The save backup follows — left behind it is an orphan
 /// with no way to tell which profile it belonged to.
 pub fn move_profile_files(from: &Path, to: &Path) -> Result<(), String> {
@@ -955,6 +979,7 @@ mod tests {
             anchors: BTreeMap::new(),
             regions: BTreeMap::new(),
             buttons: BTreeMap::new(),
+            confirm_menus: Vec::new(),
             shift: None,
             keys: BTreeMap::new(),
         };
@@ -1295,6 +1320,37 @@ mod tests {
         t.validate().expect("valid");
         assert_eq!(spelt(&t, "G0"), ["G0"]);
         assert_eq!(spelt(&t, "0G"), ["ZERO", "G"]);
+    }
+
+    /// A confirm entry covers whole segments, not characters. Plain `starts_with` would let
+    /// "File" also protect "Filename Options", and a guard that covers more than it says is as
+    /// confusing as one that covers less - either way nobody can tell from the profile which
+    /// items need a second look.
+    #[test]
+    fn a_confirm_menu_entry_covers_whole_segments_only() {
+        let g = vec!["File".to_string(), "Tool/Set Machine Parameters".to_string()];
+
+        assert_eq!(menu_needs_confirm("File", &g).as_deref(), Some("File"));
+        assert_eq!(menu_needs_confirm("File/Save", &g).as_deref(), Some("File"));
+        assert_eq!(menu_needs_confirm("File/Recent/1", &g).as_deref(), Some("File"));
+        assert_eq!(
+            menu_needs_confirm("Tool/Set Machine Parameters", &g).as_deref(),
+            Some("Tool/Set Machine Parameters")
+        );
+
+        // The near misses.
+        assert_eq!(menu_needs_confirm("Filename Options/Save", &g), None);
+        assert_eq!(menu_needs_confirm("Tool", &g), None);
+        assert_eq!(menu_needs_confirm("Tool/Options", &g), None);
+        assert_eq!(menu_needs_confirm("Help/About", &g), None);
+
+        // Case and stray slashes are the menu's presentation, not the caller's mistake.
+        assert_eq!(menu_needs_confirm("file/save", &g).as_deref(), Some("File"));
+        assert_eq!(menu_needs_confirm("/File/Save", &g).as_deref(), Some("File"));
+
+        // An empty entry would otherwise match every path and guard the whole menu by accident.
+        assert_eq!(menu_needs_confirm("File/Save", &["".to_string()]), None);
+        assert_eq!(menu_needs_confirm("File/Save", &[]), None);
     }
 
     #[test]

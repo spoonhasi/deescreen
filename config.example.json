@@ -17,6 +17,7 @@
   },
   "allow_raw_clicks": false,
   "allow_raw_keys": false,
+  "allow_menus": false,
   "allow_profile_editing": false,
   "default_settle_ms": 500,
   "max_settle_ms": 10000,

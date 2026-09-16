@@ -72,6 +72,15 @@ pub struct Config {
     /// as a click, so it sits at the same level.
     #[serde(default)]
     pub allow_raw_keys: bool,
+    /// Whether the window's own **menu bar** may be invoked. Defaults to `false`.
+    ///
+    /// Menus are not in the profile — they are read off the window — so this endpoint can
+    /// reach anything the application's menu can reach, which is a wider surface than the
+    /// named buttons and belongs behind its own switch. Reading the menu (`GET /menus`) is
+    /// not gated: knowing what is there presses nothing, and refusing to say makes the
+    /// permission harder to reason about rather than tighter.
+    #[serde(default)]
+    pub allow_menus: bool,
 
     /// Whether `/editor` may **write** `profiles/deescreen.<name>.json` directly.
     /// Defaults to `false`.
@@ -235,6 +244,7 @@ impl Config {
             captures: CaptureConfig::default(),
             allow_raw_clicks: false,
             allow_raw_keys: false,
+            allow_menus: false,
             allow_profile_editing: false,
             default_settle_ms: default_settle_ms(),
             max_settle_ms: default_max_settle_ms(),

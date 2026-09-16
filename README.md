@@ -293,6 +293,7 @@ These files are **strict JSON — no comments.** What each setting means lives h
 | `captures.max_age_minutes` | delete captures older than this regardless of count. `0` = no age limit |
 | `allow_raw_clicks` | whether unnamed coordinates may be clicked. **This is the boundary in §1 of the design** — default `false` |
 | `allow_raw_keys` | whether unnamed key input (`chord`/`text`) is allowed. Default `false`; a key is as powerful as a click on a panel that maps them |
+| `allow_menus` | whether the window's own **menu bar** may be invoked (`POST /menu`). Default `false`; a menu is read off the window rather than written in the profile, so it reaches further than the named buttons. `GET /menus` is not gated |
 | `allow_profile_editing` | whether `/editor` may write profile files. Default `false`; on, the boundary moves from file permissions to HTTP reachability |
 | `default_settle_ms` | default wait between an input and the re-capture. Default 500 — a capture taken early returns the previous screen, which reads as a failed operation |
 | `max_settle_ms` | ceiling on the wait a request may ask for, so a connection is not held open. Default 10000 |
@@ -670,6 +671,7 @@ and a `/captures/<name>` URL instead.
 | GET | `/buttons` | read | one profile's button list (a subset of `/profiles`) |
 | GET | `/regions` | read | one profile's region list (coordinates absolute to the window) |
 | GET | `/controls` | read | enumerate child controls. **An empty list is an answer** (see below) |
+| GET | `/menus` | read | the window's own menu bar — paths, command ids, enabled/checked. Presses nothing |
 | GET | `/spell` | read | `?text=G91X0` — which keys that string would press on this keypad. Presses **nothing**; `POST /click {"spell": "…"}` presses it |
 | GET | `/editor` | read | the button editor (HTML) |
 | GET | `/favicon.ico` · `/favicon.png` | read | the tray icon as a PNG — the tab should not be a different picture from the tray. Two names: the page links the `.png`, a browser asks for the `.ico` on its own |
@@ -681,6 +683,7 @@ and a `/captures/<name>` URL instead.
 | GET | `/captures/{name}` | read | fetch a stored capture |
 | POST | `/click` | **control** | `{button\|buttons[]\|rect\|point, confirm, click_button, double, spell, settle_ms, measure, quiet_ms, per_press, gap_ms, capture, pad, ignore, scale, max_width}`. No `capture` means **no picture is taken**. `buttons` presses in order and stops at the first failure |
 | POST | `/click.png` | **control** | same, PNG bytes back. Parameters go in the query. No `capture` captures the whole client area (an image has to come back) |
+| POST | `/menu` | **control**+flag | `{path, confirm, capture, …}` — pick one item from the menu bar. The **only** name here that does not come from the profile, so it needs `allow_menus` |
 | POST | `/key` | **control** | `{key\|chord\|text, settle_ms, measure, quiet_ms, capture, pad, ignore, …}` |
 | POST | `/window/focus` | **control** | bring the window forward (restore if minimised) |
 | POST | `/window/fit` | **control** | restore the client area to `reference_client` |
@@ -1120,6 +1123,56 @@ changed size `POST /window/fit` or `reference_client` is already the answer.
 The arithmetic assumes the layout was *scaled*. That is a guess about the application, not a
 measurement — which is the whole reason the guess is checked against real controls before it can
 be saved, and why `GET /sheet.png` is worth a look afterwards.
+
+### The window's menu bar — the one thing not written in the profile
+
+A menu item has no stable rectangle. It exists only while the menu is open, it moves with the
+length of the items above it, and opening a menu in order to click inside it leaves the
+application open if the click then fails. So the menu is reached by its own identity: read the
+tree, name the path.
+
+```bash
+curl -s ".../menus?profile=NAME"
+curl -s -X POST -H "Content-Type: application/json" \
+  -d '{"path":"Tool/Set Machine Parameters","capture":"@client"}' .../menu
+```
+
+`path` is the full path as `GET /menus` prints it, separated by `/`. The `&` that marks the
+underlined letter and the accelerator column (`Ctrl+S`) are already stripped there — do not type
+them. Matching ignores case. A `submenu` entry is a place, not an action; naming one lists its
+children instead of pressing anything.
+
+**This is the one place where a name does not come from the profile.** Everything else in this
+tool can only press what a person wrote into the profile file. A menu is read off the window, so
+this endpoint reaches whatever the application's menu reaches — which is why it needs
+`"allow_menus": true` in `config.json` on top of the control whitelist. `GET /menus` is not
+gated: knowing what is there presses nothing, and refusing to say makes the boundary harder to
+reason about rather than tighter.
+
+A profile can mark paths that need a second look, and they behave exactly like a `confirm`
+button:
+
+```json
+"confirm_menus": ["File", "Tool/Set Machine Parameters"]
+```
+
+Matched on **whole path segments** — `"File"` covers the whole File menu and does *not* cover
+`"Filename Options"`. Those paths refuse unless the request carries `"confirm": true`.
+
+**A disabled item is refused, not attempted.** The command is delivered as `WM_COMMAND`, which
+is what an application receives *after* it has decided an item is enabled — so posting a
+greyed-out item's command may well be acted on. `enabled` in `GET /menus` is the state the menu
+carries right now; an application that greys items out as the menu *opens* reports everything
+enabled here, because nothing ever opens it.
+
+**The command is posted, not sent.** A menu item that opens a modal dialog would otherwise hold
+the request open for as long as the dialog is on screen. So the reply means the application
+received it, not that it did anything — capture to see. And a dialog that opened is a *new*
+window: the profile still points at the old one, so `GET /windows` is how you find it.
+
+An empty list is an answer. Plenty of applications have no menu Windows can see, and some draw
+their own (a ribbon, a WPF menu, a custom title bar). A drawn menu is pixels, and is reached by
+clicking like anything else.
 
 ## Known traps — every one of them fails silently, without an error
 

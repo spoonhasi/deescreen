@@ -16,6 +16,7 @@
 
 pub mod capture;
 pub mod input;
+pub mod menu;
 pub mod window;
 
 use std::ffi::c_void;

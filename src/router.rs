@@ -31,6 +31,9 @@ pub fn build(state: SharedState) -> Router {
         // Draw a candidate definition without saving it — presses nothing
         .route("/preview.png", post(api::preview_png))
         .route("/controls", get(api::controls))
+        // The window's own menu bar. Reading it presses nothing and sits with the reads;
+        // invoking one item is control, and needs allow_menus on top.
+        .route("/menus", get(api::menus))
         // One cropped picture per button, with its name under it — the way to check that
         // a name belongs to the key it is on. Both read a query string and neither reads a
         // body, so there is one place to put a parameter.
@@ -53,6 +56,7 @@ pub fn build(state: SharedState) -> Router {
         .route("/click", post(api::click_json))
         .route("/click.png", post(api::click_png))
         .route("/key", post(api::key))
+        .route("/menu", post(api::menu))
         .route("/window/focus", post(api::window_focus))
         .route("/window/fit", post(api::window_fit))
         // ── admin ──

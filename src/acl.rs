@@ -31,7 +31,7 @@ use crate::web::ApiError;
 /// The whitelist compares **numeric addresses only** (`ip_allowed`). Being the same PC is not
 /// an automatic pass — `127.0.0.1` has to be on the list like anything else.
 fn is_control_request(path: &str) -> bool {
-    matches!(path, "/click" | "/click.png" | "/key")
+    matches!(path, "/click" | "/click.png" | "/key" | "/menu")
         || path.starts_with("/window/")
         // Matched by prefix: GET, POST and DELETE on /admin/profile plus
         // /admin/profile/rename all have to sit at the same level. Any one of them left out
@@ -131,6 +131,9 @@ mod tests {
         assert!(is_control_request("/click"));
         assert!(is_control_request("/click.png"));
         assert!(is_control_request("/key"));
+        // Invoking a menu item acts on the application; reading the menu does not.
+        assert!(is_control_request("/menu"));
+        assert!(!is_control_request("/menus"));
         assert!(is_control_request("/window/focus"));
         assert!(is_control_request("/window/fit"));
 

@@ -1284,6 +1284,7 @@ pub async fn health(State(state): State<SharedState>) -> Response {
             "policy": {
                 "allow_raw_clicks": st.config.allow_raw_clicks,
                 "allow_raw_keys": st.config.allow_raw_keys,
+                "allow_menus": st.config.allow_menus,
                 "allow_profile_editing": st.config.allow_profile_editing,
                 "admin_code_required": !st.config.admin_code.is_empty(),
                 "default_settle_ms": st.config.default_settle_ms,
@@ -1418,6 +1419,7 @@ fn policy_json(state: &SharedState) -> Value {
     json!({
         "allow_raw_clicks": state.config.allow_raw_clicks,
         "allow_raw_keys": state.config.allow_raw_keys,
+        "allow_menus": state.config.allow_menus,
         "allow_profile_editing": state.config.allow_profile_editing,
         "admin_code_required": !state.config.admin_code.is_empty(),
     })
@@ -3007,6 +3009,10 @@ ENDPOINTS
                        cannot show for a whole panel. See "the contact sheet" above
   GET  /sheet          the same sheet as JSON - its shape, where it was saved, and which
                        buttons had no picture to show
+  GET  /menus          the window's own menu bar - paths, command ids, enabled/checked.
+                       Presses nothing. An empty list is an answer
+  POST /menu           {{path}} - pick one item from it. The ONLY name here that does not
+                       come from the profile, so it needs allow_menus as well
   GET  /spell          ?text=G91X0 - which keys that string would press on this keypad.
                        Presses NOTHING; POST /click {{"spell": "..."}} presses it
   GET  /windows        every visible top-level window (to find a title)
@@ -3414,6 +3420,46 @@ TRAPS - these fail quietly or confusingly. Read once, save yourself an hour.
 
   A profile with no anchors is refused - there is no container to re-seat against. For a
   window that merely changed size, POST /window/fit or reference_client is the answer.
+
+THE WINDOW'S MENU BAR - the one thing not written in the profile
+  A menu item has no stable rectangle. It exists only while the menu is open, it moves with
+  the length of the items above it, and opening a menu in order to click inside it leaves
+  the application open if the click then fails. So the menu is reached by its own identity
+  instead: read the tree, name the path.
+    curl -s "{base}/menus?profile=NAME"
+    curl -s -X POST -H "Content-Type: application/json" \
+      -d '{{"path":"Tool/Set Machine Parameters","capture":"@client"}}' {base}/menu
+
+  'path' is the full path as GET /menus prints it, separated by '/'. The '&' that marks the
+  underlined letter and the accelerator column (Ctrl+S) are already stripped there - do not
+  type them. Matching ignores case. A 'submenu' entry is a place, not an action; its
+  children are the actions, and naming one lists them.
+
+  THIS IS THE ONE PLACE WHERE A NAME IS NOT FROM THE PROFILE. Everything else here can only
+  press what a person wrote in the profile file. A menu is read off the window, so this
+  endpoint reaches whatever the application's menu reaches - which is why it needs
+  "allow_menus": true in config.json, on top of the control whitelist. GET /menus is not
+  gated: knowing what is there presses nothing.
+  A profile can name paths that need a second look, and they behave like a confirm button:
+    "confirm_menus": ["File", "Tool/Set Machine Parameters"]
+  Matched on whole path segments, so "File" covers the whole File menu and does NOT cover
+  "Filename Options". Those paths refuse unless the request carries "confirm": true.
+
+  A DISABLED ITEM IS REFUSED, NOT ATTEMPTED. The command is delivered as WM_COMMAND, which
+  is what an application receives AFTER it has decided an item is enabled - so posting a
+  greyed-out item's command may be acted on anyway. "enabled" in GET /menus is the state the
+  menu carries right now; an application that greys items out as the menu OPENS will report
+  everything enabled, because nothing opens it.
+
+  THE COMMAND IS POSTED, NOT SENT. A menu item that opens a modal dialog would otherwise
+  hold the request open for as long as the dialog is on screen. So the reply means the
+  application received it, not that it did anything - capture to see. And a dialog that
+  opened is a NEW window: this profile still points at the old one, so GET /windows is how
+  you find it.
+
+  An empty list is an answer. Plenty of applications have no menu Windows can see, and some
+  draw their own (a ribbon, a WPF menu, a custom title bar). A drawn menu is pixels, so it
+  is reached by clicking like anything else.
 
 HOW TO VERIFY WHAT YOU DID
   Prefer the application's own API over the screen wherever one exists. Use the screen
@@ -4477,6 +4523,239 @@ pub async fn admin_delete_profile(
     })))
 }
 
+// ────────────────────────── the window's menu bar ──────────────────────────
+
+fn menu_item_json(m: &crate::win::menu::MenuItem, guarded: &[String]) -> Value {
+    let mut v = json!({
+        "path": m.path,
+        "label": m.label,
+        "depth": m.depth,
+        "enabled": m.enabled,
+        "checked": m.checked,
+        "submenu": m.submenu,
+        "id": m.id,
+    });
+    if let Some(g) = crate::targets::menu_needs_confirm(&m.path, guarded) {
+        v["confirm"] = json!(true);
+        v["confirm_by"] = json!(g);
+    }
+    v
+}
+
+/// Advice shared by both menu endpoints when the bar is empty, so the two cannot drift apart.
+const NO_MENU: &str = "this window has no menu bar that Windows can see. Either it has none, \
+                       or it draws its own (a ribbon, a WPF/WinUI menu, a custom title bar) - \
+                       and a drawn menu is pixels, so it is reached by clicking like anything \
+                       else: GET /controls or a capture to find it, then a saved button.";
+
+/// **The window's menu bar** — paths, command IDs and state. Presses nothing.
+///
+/// An empty list is an answer. Not every application has a menu Windows can see, and the reply
+/// says which case this is rather than looking like a failure.
+pub async fn menus(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
+    tokio::task::spawn_blocking(move || {
+        let t = prof.targets();
+        let info = find_window(&t)?;
+        let items = crate::win::menu::read(info.handle);
+        let invocable = items.iter().filter(|m| !m.submenu && m.enabled).count();
+        let mut out = json!({
+            "profile": prof.name,
+            "window": window_json(&info),
+            "menus": items.iter().map(|m| menu_item_json(m, &t.confirm_menus)).collect::<Vec<_>>(),
+            "count": items.len(),
+            "invocable": invocable,
+            "allow_menus": state.config.allow_menus,
+        });
+        if items.is_empty() {
+            out["note"] = json!(NO_MENU);
+        } else {
+            out["note"] = json!(
+                "'path' is what POST /menu takes. A 'submenu' entry is a place, not an action - \
+                 its children are the actions. 'enabled' is the state the menu carries right \
+                 now; an application that greys items out only as the menu opens will report \
+                 everything enabled here, because nothing opens it."
+            );
+        }
+        if !t.confirm_menus.is_empty() {
+            out["confirm_menus"] = json!(t.confirm_menus);
+        }
+        Ok(json_ok(out))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("menu task failed: {e}")))?
+}
+
+/// What `POST /menu` was asked for.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MenuReq {
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// `"Tool/Set Machine Parameters"`, as `GET /menus` prints it.
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub confirm: bool,
+    #[serde(default)]
+    pub capture: Option<String>,
+    #[serde(default)]
+    pub pad: Option<i32>,
+    #[serde(default)]
+    pub ignore: Option<Rect>,
+    #[serde(default)]
+    pub settle_ms: Option<u64>,
+    #[serde(default)]
+    pub scale: Option<f64>,
+    #[serde(default)]
+    pub max_width: Option<u32>,
+}
+
+/// **Pick one item from the window's menu bar.**
+///
+/// `POST /menu {"path": "Tool/Set Machine Parameters"}`
+pub async fn menu(State(state): State<SharedState>, body: Bytes) -> Result<Response, ApiError> {
+    if !state.config.allow_menus {
+        return Err(ApiError::forbidden(
+            "invoking the window's menu is disabled — set \"allow_menus\": true in config.json",
+        )
+        .with_detail(json!({
+            "why": "a menu is read off the window rather than written in the profile, so this \
+                    endpoint reaches whatever the application's menu reaches — a wider surface \
+                    than the named buttons, which is why it has its own switch.",
+            "hint": "GET /menus still works and presses nothing, so what is there can be read \
+                     either way.",
+        })));
+    }
+    let req: MenuReq = parse_body(&body)?;
+    let path = req.path.clone().filter(|p| !p.trim().is_empty()).ok_or_else(|| {
+        ApiError::bad_request("'path' is required — GET /menus lists them")
+    })?;
+    let prof = pick(&state, req.profile.as_deref(), Params::Body)?;
+
+    // One input at a time, like a click: a menu command that opens a dialog changes what the
+    // next press would land on.
+    let _guard = state.input_lock.lock().await;
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || menu_now(&st, &prof, req, path))
+        .await
+        .map_err(|e| ApiError::internal(format!("menu task failed: {e}")))?
+}
+
+fn menu_now(
+    st: &SharedState,
+    prof: &crate::state::Profile,
+    req: MenuReq,
+    path: String,
+) -> Result<Response, ApiError> {
+    let t = prof.targets();
+    let info = find_window(&t)?;
+    let items = crate::win::menu::read(info.handle);
+    if items.is_empty() {
+        return Err(ApiError::conflict("this window has no menu bar")
+            .with_detail(json!({"note": NO_MENU})));
+    }
+
+    let wanted = path.trim().trim_matches('/');
+    let Some(item) = items.iter().find(|m| m.path.eq_ignore_ascii_case(wanted)) else {
+        return Err(ApiError::not_found(format!("no menu item at '{path}'")).with_detail(json!({
+            "menu": near_names(wanted, items.iter().map(|m| m.path.clone()), "GET /menus"),
+            "note": "the path is the full one, separated by '/', exactly as GET /menus prints \
+                     it — the '&' that marks the underlined letter and the accelerator column \
+                     are already stripped there, so do not type them.",
+        })));
+    };
+    if item.submenu {
+        return Err(ApiError::bad_request(format!("'{path}' is a submenu, not a command"))
+            .with_detail(json!({
+                "children": items
+                    .iter()
+                    .filter(|m| m.path.starts_with(&format!("{}/", item.path)))
+                    .map(|m| m.path.clone())
+                    .collect::<Vec<_>>(),
+                "note": "a submenu is a place. Name one of the items inside it.",
+            })));
+    }
+    if !item.enabled {
+        // Posting the command anyway might work, and that is the problem: an application that
+        // decides validity when the menu opens never gets to decide here. Refusing is the only
+        // answer that cannot act on something the application had said no to.
+        return Err(ApiError::conflict(format!("the menu item '{path}' is disabled"))
+            .with_detail(json!({
+                "path": item.path,
+                "note": "the menu itself reports it greyed out. Posting the command anyway may \
+                         still be acted on, because the application never sees the menu open - \
+                         which is exactly why this is refused rather than attempted. Put the \
+                         application into the mode where the item is available and ask again.",
+            })));
+    }
+    let Some(id) = item.id else {
+        return Err(ApiError::conflict(format!("the menu item '{path}' carries no command id")));
+    };
+
+    if let Some(g) = crate::targets::menu_needs_confirm(&item.path, &t.confirm_menus)
+        && !req.confirm
+    {
+        return Err(ApiError::forbidden(format!(
+            "'{}' is covered by confirm_menus ('{g}') — resend with \"confirm\": true if you \
+             meant it",
+            item.path
+        ))
+        .with_detail(json!({"path": item.path, "confirm_by": g})));
+    }
+
+    let pad = req.pad.unwrap_or(0).max(0);
+    let offsets = anchor_offsets(&t, &info)?;
+    let crop = match &req.capture {
+        None => None,
+        Some(r) => Some(Targets::pad_rect(
+            t.region(r, info.client_size, &offsets).map_err(|e| {
+                ApiError::bad_request(e).with_detail(json!({"known_regions": t.region_names()}))
+            })?,
+            pad,
+        )),
+    };
+    let before = crop.and_then(|rect| shoot(&info, rect, req.scale, req.max_width).ok().map(|(f, _, _)| f));
+
+    window::focus(info.handle).map_err(ApiError::conflict)?;
+    log::info!(
+        "MENU profile={} path={:?} id={id} window={:?} pid={}",
+        prof.name, item.path, info.title, info.pid
+    );
+    crate::win::menu::invoke(info.handle, id).map_err(ApiError::internal)?;
+
+    let settle = st.config.clamp_settle(req.settle_ms);
+    std::thread::sleep(std::time::Duration::from_millis(settle));
+
+    let info = window::describe(info.handle)
+        .ok_or_else(|| ApiError::conflict("the target window disappeared"))?;
+    let mut result = json!({
+        "profile": prof.name,
+        "menu": item.path,
+        "id": id,
+        "settle_ms": settle,
+        "window": window_json(&info),
+        "note": "the command was POSTED, not sent — a menu item that opens a modal dialog would \
+                 otherwise hold this request open for as long as the dialog is on screen. So \
+                 this says the application received it, not that it did anything. Capture to \
+                 see. A dialog that opened is a NEW window, and this profile points at the old \
+                 one: GET /windows to find it.",
+    });
+    if let (Some(rect), Some(region)) = (crop, req.capture.clone()) {
+        let (frame, method, black) = shoot(&info, rect, req.scale, req.max_width)?;
+        let (_png, mut meta) =
+            deliver(st, &frame, method, black, &format!("{}_{}", prof.name, safe_label(&region)), true)?;
+        if let Some(b) = before {
+            apply_change(&mut meta, &b, &frame, req.ignore, None);
+        }
+        result["capture"] = meta;
+    }
+    Ok(json_ok(result))
+}
+
 // ────────────────────────── refit ──────────────────────────
 
 /// What a refit was asked to do.
@@ -5001,6 +5280,7 @@ mod tests {
             anchors: std::collections::BTreeMap::new(),
             regions: std::collections::BTreeMap::new(),
             buttons: std::collections::BTreeMap::new(),
+            confirm_menus: Vec::new(),
             shift: None,
             keys: std::collections::BTreeMap::new(),
         };
@@ -5082,6 +5362,7 @@ mod tests {
             anchors: std::collections::BTreeMap::new(),
             regions: std::collections::BTreeMap::new(),
             buttons: std::collections::BTreeMap::new(),
+            confirm_menus: Vec::new(),
             shift: None,
             keys: std::collections::BTreeMap::new(),
         };
