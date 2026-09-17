@@ -537,6 +537,7 @@ impl Targets {
         // first one turned "all four anchors are stale" into four round trips, one per fix,
         // each revealing only the next.
         let mut failed: Vec<String> = Vec::new();
+        let mut renamed = false;
         for (name, a) in &self.anchors {
             let want = (a.rect[2], a.rect[3]);
             let found: Vec<&crate::win::window::ControlInfo> = controls
@@ -554,7 +555,26 @@ impl Targets {
                         .map(|c| format!("{}x{}", c.rect[2], c.rect[3]))
                         .collect();
                     failed.push(if sizes.is_empty() {
-                        format!("'{name}': no control carries the text {:?}", a.text)
+                        // A caption that carries a number changes with it. Say where it went, or
+                        // the only explanation offered is "a different application".
+                        let like = similar_captions(&a.text, controls);
+                        if like.is_empty() {
+                            format!("'{name}': no control carries the text {:?}", a.text)
+                        } else {
+                            renamed = true;
+                            let like: Vec<String> = like
+                                .iter()
+                                .take(3)
+                                .map(|c| {
+                                    format!("{:?} at [{},{},{},{}]", c.text, c.rect[0], c.rect[1], c.rect[2], c.rect[3])
+                                })
+                                .collect();
+                            format!(
+                                "'{name}': no control carries the text {:?}, but {} is similar",
+                                a.text,
+                                like.join(" and ")
+                            )
+                        }
                     } else {
                         format!(
                             "'{name}': {:?} is there at {} but not at {}x{}",
@@ -582,10 +602,18 @@ impl Targets {
         Err(format!(
             "{} of {} anchors did not resolve - {}. An anchor records a size as well as a place, \
              and the size is what identifies it: a different size means the application changed \
-             (POST /admin/profile/refit), a missing text means a different application or build.",
+             (POST /admin/profile/refit), a missing text means a different application or \
+             build{}",
             failed.len(),
             self.anchors.len(),
-            failed.join("; ")
+            failed.join("; "),
+            if renamed {
+                " - or a caption that carries a number, which changed with it. Where a similar \
+                 caption is named and it is the same control, POST /admin/profile/refit naming \
+                 that rectangle re-seats the anchor and saves the new caption."
+            } else {
+                "."
+            }
         ))
     }
 
@@ -949,14 +977,133 @@ fn shift_press(button: &str) -> Spelled {
 /// `"Filename Options/..."`. A plain `starts_with` would protect the first and quietly also
 /// the second, and a protection that covers more than it says is as confusing as one that
 /// covers less.
+///
+/// Each segment is compared by [`guard_key`], loosely. 0.16 changed how paths are printed -
+/// `Import(I)...` became `Import` - and an entry written the old way stopped matching anything,
+/// with nothing to say so: the protection was simply gone. Compared loosely, an entry never
+/// covers less than it was written for. It can cover more - a sibling that differs only in
+/// what the key drops - which is the side a guard should err on.
 pub fn menu_needs_confirm(path: &str, guarded: &[String]) -> Option<String> {
-    let norm = |s: &str| s.trim().trim_matches('/').to_ascii_lowercase();
-    let p = norm(path);
-    guarded.iter().find(|g| {
-        let g = norm(g);
+    let p = guard_keys(path);
+    guarded
+        .iter()
+        .find(|g| {
+            let g = guard_keys(g);
+            !g.is_empty() && p.len() >= g.len() && p[..g.len()] == g[..]
+        })
+        .cloned()
+}
+
+/// A menu path segment as `confirm_menus` compares it: without case, `&`, a mnemonic group -
+/// `(&P)`, or `(P)` as 0.15 printed it - or a trailing ellipsis.
+fn guard_key(seg: &str) -> String {
+    let s = crate::win::menu::clean_label(seg);
+    let s = s.trim_end();
+    // "Import(I)": the group 0.15 left behind when it removed only the ampersand.
+    let chars: Vec<char> = s.chars().collect();
+    let s: String = match chars.as_slice() {
+        [head @ .., open, x, close]
+            if matches!(open, '(' | '（') && matches!(close, ')' | '）') && x.is_ascii_alphanumeric() =>
+        {
+            head.iter().collect()
+        }
+        _ => s.to_string(),
+    };
+    let s = s.trim_end();
+    let s = s.strip_suffix("...").or_else(|| s.strip_suffix('…')).unwrap_or(s);
+    s.replace('&', "").trim().to_lowercase()
+}
+
+/// Whether two `confirm_menus` entries cover exactly the same items - `"Project(P)"` and
+/// `"Project"` do. Rewriting one into the other is not removing a protection.
+pub fn same_guard(a: &str, b: &str) -> bool {
+    let a = guard_keys(a);
+    !a.is_empty() && a == guard_keys(b)
+}
+
+fn guard_keys(path: &str) -> Vec<String> {
+    let path = path.trim().trim_matches('/');
+    if path.is_empty() {
+        return Vec::new();
+    }
+    path.split('/').map(guard_key).collect()
+}
+
+/// How one `confirm_menus` entry lines up with the menu as it was read.
+#[derive(Debug, PartialEq)]
+pub enum GuardFit {
+    /// Written as a path is printed - or a prefix of one.
+    Exact,
+    /// Covers these paths only because the comparison is loose. It protects them, but it is
+    /// written in a form no path is printed in; these are what to write instead.
+    Loose(Vec<String>),
+    /// Under this submenu, which came back empty: the application fills it only when it is
+    /// opened, so whether the entry matches cannot be told from this read.
+    Unchecked(String),
+    /// Matches nothing, so it protects nothing.
+    Nothing,
+}
+
+/// Line one entry up against the menu. `items` is `(path, came back empty)` in menu order.
+pub fn guard_fit(guard: &str, items: &[(&str, bool)]) -> GuardFit {
+    let exact = |g: &str, p: &str| {
+        let (g, p) = (g.trim().trim_matches('/').to_lowercase(), p.to_lowercase());
         !g.is_empty() && (p == g || p.starts_with(&format!("{g}/")))
-    })
-    .cloned()
+    };
+    if items.iter().any(|(p, _)| exact(guard, p)) {
+        return GuardFit::Exact;
+    }
+    let g = guard_keys(guard);
+    if g.is_empty() {
+        return GuardFit::Nothing;
+    }
+    let same: Vec<String> =
+        items.iter().filter(|(p, _)| guard_keys(p) == g).map(|(p, _)| p.to_string()).collect();
+    if !same.is_empty() {
+        return GuardFit::Loose(same);
+    }
+    let covered = items.iter().any(|(p, _)| menu_needs_confirm(p, &[guard.to_string()]).is_some());
+    if covered {
+        // Only a deeper item matched loosely, never the entry's own level - still loose.
+        let under: Vec<String> = items
+            .iter()
+            .filter(|(p, _)| menu_needs_confirm(p, &[guard.to_string()]).is_some())
+            .map(|(p, _)| p.to_string())
+            .take(3)
+            .collect();
+        return GuardFit::Loose(under);
+    }
+    // The deepest part of the entry that IS in the menu, if that part came back empty.
+    for k in (1..g.len()).rev() {
+        if let Some((p, _)) = items.iter().find(|(p, empty)| *empty && guard_keys(p) == g[..k]) {
+            return GuardFit::Unchecked(p.to_string());
+        }
+    }
+    GuardFit::Nothing
+}
+
+/// The part of a caption before its first digit or bracket, lowercased — what stays the same
+/// when the caption carries a size or a count.
+pub fn caption_stem(s: &str) -> String {
+    s.split(|c: char| c.is_ascii_digit() || matches!(c, '(' | '（' | '[' | ':'))
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase()
+}
+
+/// Controls whose caption matches `text` up to its first digit or bracket - where an anchor's
+/// caption went when the number in it changed. Offered, never taken: the same words are a hint
+/// that it is the same control, not proof.
+pub fn similar_captions<'a>(
+    text: &str,
+    controls: &'a [crate::win::window::ControlInfo],
+) -> Vec<&'a crate::win::window::ControlInfo> {
+    let stem = caption_stem(text);
+    if stem.chars().count() < 2 {
+        return Vec::new();
+    }
+    controls.iter().filter(|c| c.text.trim() != text.trim() && caption_stem(&c.text) == stem).take(10).collect()
 }
 
 /// Move a profile's files to a new name. The save backup follows — left behind it is an orphan
@@ -1437,6 +1584,51 @@ mod tests {
     /// confusing as one that covers less - either way nobody can tell from the profile which
     /// items need a second look.
     #[test]
+    fn a_confirm_menu_entry_written_before_0_16_still_protects_its_item() {
+        // 0.15 printed "Import(&I)..." as "Import(I)...", and 0.16 prints "Import". An entry
+        // copied from the old list matched nothing afterwards, and nothing said so.
+        let old = vec!["Project(P)/Import(I)...".to_string()];
+        assert_eq!(menu_needs_confirm("Project/Import", &old).as_deref(), Some("Project(P)/Import(I)..."));
+        assert_eq!(menu_needs_confirm("Project/Import/NC DATA", &old).as_deref(), Some("Project(P)/Import(I)..."));
+        assert_eq!(menu_needs_confirm("Project/Export", &old), None);
+        // The raw caption, as the application wrote it, is the same item too.
+        let raw = vec!["ファイル(&F)/Exit(&X)\tAlt+F4".to_string(), "R&&D".to_string()];
+        assert!(menu_needs_confirm("ファイル/Exit", &raw).is_some());
+        assert!(menu_needs_confirm("R&D", &raw).is_some());
+        // A bracket that is part of a name is not a mnemonic, and still has to match.
+        let named = vec!["View/Language/中文(简体)".to_string()];
+        assert!(menu_needs_confirm("View/Language/中文(简体)", &named).is_some());
+        assert_eq!(menu_needs_confirm("View/Language/中文(繁體)", &named), None);
+    }
+
+    #[test]
+    fn each_confirm_menu_entry_is_told_how_it_fits_the_menu() {
+        let items = [
+            ("Project", false),
+            ("Project/Import", false),
+            ("Project/Import/NC DATA", false),
+            ("File", true),
+            ("PMC", false),
+            ("PMC/I/O Operation Panel", false),
+            ("Tool", false),
+            ("Tool/Set Machine Parameters", false),
+        ];
+        assert_eq!(guard_fit("Project", &items), GuardFit::Exact);
+        assert_eq!(guard_fit("tool/set machine parameters", &items), GuardFit::Exact);
+        assert_eq!(guard_fit("PMC/I/O Operation Panel", &items), GuardFit::Exact);
+        assert_eq!(
+            guard_fit("Project(P)/Import(I)...", &items),
+            GuardFit::Loose(vec!["Project/Import".to_string()])
+        );
+        // An on-demand menu that came back empty: the entry cannot be judged from this read.
+        assert_eq!(guard_fit("File/Exit", &items), GuardFit::Unchecked("File".to_string()));
+        assert_eq!(guard_fit("Tool/Network Settings", &items), GuardFit::Nothing);
+        assert_eq!(guard_fit("Edit", &items), GuardFit::Nothing);
+        assert_eq!(guard_fit("", &items), GuardFit::Nothing);
+        assert_eq!(guard_fit("Edit", &[]), GuardFit::Nothing, "no menu bar at all");
+    }
+
+    #[test]
     fn a_confirm_menu_entry_covers_whole_segments_only() {
         let g = vec!["File".to_string(), "Tool/Set Machine Parameters".to_string()];
 
@@ -1515,7 +1707,11 @@ mod tests {
         let e = t.anchor_offsets(&live).expect_err("three of four fail");
         assert!(e.starts_with("3 of 4 anchors"), "{e}");
         assert!(e.contains("'keys': \"NC KEYBOARD\" is there at 120x50 but not at 100x50"), "{e}");
-        assert!(e.contains("'screen': no control carries the text"), "{e}");
+        assert!(
+            e.contains(r#"'screen': no control carries the text "NC DISPLAY", but "NC DISPLAY(1080 x 809)" at [0,300,400,300] is similar"#),
+            "{e}"
+        );
+        assert!(e.contains("saves the new caption"), "the way out is named: {e}");
         assert!(e.contains("'sub': no control carries the text"), "{e}");
         assert!(!e.contains("'main'"), "a resolved anchor is not a failure: {e}");
     }

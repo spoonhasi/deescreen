@@ -1676,6 +1676,16 @@ pub async fn health(State(state): State<SharedState>) -> Response {
                             }
                         };
                     }
+                    if !t.confirm_menus.is_empty() {
+                        // Read without asking the application to update its menus: /health is
+                        // called often, and asking is not invisible to the application.
+                        let menu = crate::win::menu::read(info.handle, false);
+                        let check = GuardReport::of(&t.confirm_menus, &menu.items);
+                        problems.extend(check.problems(name, !menu.items.is_empty()));
+                        if !check.is_clean() {
+                            entry["confirm_menus_check"] = check.json();
+                        }
+                    }
                     bindings.push(Binding {
                         profile: name.clone(),
                         program: t.program.clone(),
@@ -2637,7 +2647,9 @@ fn confirm_flags_lost(before: &Targets, after: &Targets) -> Vec<String> {
             before
                 .confirm_menus
                 .iter()
-                .filter(|m| !after.confirm_menus.contains(m))
+                // Rewritten into the form the path is printed in is still there: /health asks
+                // for exactly that rewrite, and it should not need confirm to do it.
+                .filter(|m| !after.confirm_menus.iter().any(|n| crate::targets::same_guard(m, n)))
                 .map(|m| format!("menu:{m}")),
         )
         .collect()
@@ -2846,16 +2858,33 @@ fn allow_losing_confirm(
     if lost.is_empty() || q_bool(q, "confirm")?.unwrap_or(false) {
         return Ok(lost);
     }
+    let (menus, buttons): (Vec<&String>, Vec<&String>) = lost.iter().partition(|l| l.starts_with("menu:"));
+    // Named for what is actually being unprotected. Removing a menu path used to be reported as
+    // taking the flag off "buttons: menu:File".
+    let what = match (buttons.len(), menus.len()) {
+        (1, 0) => "a button",
+        (_, 0) => "buttons",
+        (0, 1) => "a menu path",
+        (0, _) => "menu paths",
+        _ => "buttons and menu paths",
+    };
     Err(ApiError::forbidden(format!(
-        "this would take the confirm flag off {}: {}. Nothing was written.",
-        if lost.len() == 1 { "a button" } else { "buttons" },
+        "this would take the confirm protection off {what}: {}. Nothing was written.",
         lost.join(", ")
     ))
     .with_detail(json!({
-        "buttons": lost,
- "why": "a person marked those as needing a human before they are pressed. Removing the flag is the same decision as pressing one, so it asks the same way.",
- "hint": "resend with &confirm=true if removing it is part of the work you were asked to do. If you are here because a press was refused, this is not the way around that — the press itself takes \"confirm\": true, and leaves the flag where it is for whoever comes next.",
- "note": "dropping a button that had the flag counts too — a raw coordinate inside it stops being protected the moment the button is gone. Entries starting with menu: are paths removed from confirm_menus, which is the same protection for the menu bar.",
+        "buttons": buttons,
+        "menus": menus.iter().map(|m| m.trim_start_matches("menu:")).collect::<Vec<_>>(),
+        "why": "a person marked those as needing a human before they are used. Removing the \
+                protection is the same decision as using one, so it asks the same way.",
+        "hint": "resend with &confirm=true if removing it is part of the work you were asked to \
+                 do. If you are here because a press or a menu command was refused, this is not \
+                 the way around that - the request itself takes \"confirm\": true, and leaves \
+                 the protection where it is for whoever comes next.",
+        "note": "dropping a button that had the flag counts too - a raw coordinate inside it \
+                 stops being protected the moment the button is gone. A menu path removed from \
+                 confirm_menus is the same protection for the menu bar, and is listed as \
+                 menu:PATH.",
     })))
 }
 
@@ -3645,9 +3674,11 @@ ENDPOINTS
                        the window as it is now and how far each has moved - the answer to
                        "are the coordinates in this profile usable right now", before
                        anything is pressed. Anchors that cannot be found are listed in
-                       "problems" as well - all of them in one line, each with the size or
-                       caption that is there instead, which is what tells a resized
-                       application (refit, below) from a different build.
+                       "problems" as well - all of them in one line, each with the size
+                       there instead, or a similar caption where the text is gone, which is
+                       what tells a resized application (refit, below) from a different
+                       build. On an open window, a confirm_menus entry that matches no
+                       menu item is a problem too - see THE WINDOW'S MENU BAR.
                        "home" is where config.json, profiles/, captures/ and logs/ live on
                        that PC, and why that directory was chosen - the answer when a person
                        asks where their settings are. Moving them is theirs to do, not
@@ -4218,9 +4249,9 @@ TRAPS - these fail quietly or confusingly. Read once, save yourself an hour.
   A CAPTION THAT CARRIES A NUMBER CHANGES WITH IT. "NC DISPLAY(1080 x 809)" is
   "NC DISPLAY(1104 x 818)" once the size in it changes, and then no control carries the
   anchor's text. The refusal lists under "similar" the controls whose caption matches up
-  to the first digit or bracket. They are offered, not taken - name the one that is this
-  anchor's control as above, and "text_now" in the proposal shows the caption that will be
-  saved with it.
+  to the first digit or bracket - and so does the anchor error on any ordinary request, and
+  /health. They are offered, not taken - name the one that is this anchor's control as
+  above, and "text_now" in the proposal shows the caption that will be saved with it.
 
   ELEMENTS MARKED "@fixed" ARE NOT MOVED. Somebody stated they do not travel with a
   container, and a refit does not overrule that. They are listed under "untouched".
@@ -4273,6 +4304,17 @@ THE WINDOW'S MENU BAR - the one thing not written in the profile
     "confirm_menus": ["File", "Tool/Set Machine Parameters"]
   Matched on whole path segments, so "File" covers the whole File menu and does NOT cover
   "Filename Options". Those paths refuse unless the request carries "confirm": true.
+
+  ENTRIES ARE COMPARED LOOSELY - case, the '&', a mnemonic group such as "(&P)" or the "(P)"
+  paths were printed with before 0.16, and a trailing "..." do not matter - so an entry never
+  covers less than it was written for. It can cover a sibling that differs only in those.
+  AN ENTRY THAT MATCHES NOTHING PROTECTS NOTHING, and the menu goes on working without the
+  second look somebody asked for. So GET /menus reports such entries under
+  "confirm_menus_check", and GET /health lists them as problems for every open window -
+  together with entries that match only loosely, and the path to write instead. Rewriting an
+  entry into that form is not removing it, and needs no confirm. /health reads the menu
+  without asking the application to fill it, so an entry under a menu filled only on opening
+  is listed there as "unchecked", not as a problem; GET /menus settles it.
 
   A DISABLED ITEM IS REFUSED, NOT ATTEMPTED. The command is delivered as WM_COMMAND, which
   is what an application receives AFTER it has decided an item is enabled - so posting a
@@ -5393,6 +5435,104 @@ const EMPTY_SUBMENU: &str = "these submenus came back with nothing in them. That
                              invoked by path. Reach them by clicking: open the menu with a \
                              click, capture, and click the item.";
 
+/// How a profile's `confirm_menus` entries line up with the menu as it was read.
+///
+/// An entry that matches nothing protects nothing, and nothing else would ever say so - the
+/// menu goes on working, only without the second look somebody asked for.
+struct GuardReport {
+    /// Entries that match no item at all.
+    nothing: Vec<String>,
+    /// Entries that match only loosely, with the paths to write instead.
+    loose: Vec<(String, Vec<String>)>,
+    /// Entries under a submenu that came back empty, with that submenu.
+    unchecked: Vec<(String, String)>,
+}
+
+const GUARD_NOTE: &str = "confirm_menus entries are compared loosely - case, '&', a mnemonic \
+                          group such as (&P) or the (P) paths were printed with before 0.16, and \
+                          a trailing '...' do not matter - so an entry never covers less than it \
+                          was written for. 'protects_nothing' match no item at all: a typo, or a \
+                          path this build of the application does not have. 'written_loosely' \
+                          still protect their items; 'write_as' is how to write them. \
+                          'unchecked' sit under a submenu the application fills only when it is \
+                          opened - GET /menus asks it to, /health does not.";
+
+impl GuardReport {
+    fn of(guards: &[String], items: &[crate::win::menu::MenuItem]) -> GuardReport {
+        use crate::targets::GuardFit;
+        let listed: Vec<(&str, bool)> = items.iter().map(|m| (m.path.as_str(), m.empty)).collect();
+        let mut r = GuardReport { nothing: Vec::new(), loose: Vec::new(), unchecked: Vec::new() };
+        for g in guards {
+            match crate::targets::guard_fit(g, &listed) {
+                GuardFit::Exact => {}
+                GuardFit::Loose(paths) => r.loose.push((g.clone(), paths)),
+                GuardFit::Unchecked(under) => r.unchecked.push((g.clone(), under)),
+                GuardFit::Nothing => r.nothing.push(g.clone()),
+            }
+        }
+        r
+    }
+
+    fn is_clean(&self) -> bool {
+        self.nothing.is_empty() && self.loose.is_empty() && self.unchecked.is_empty()
+    }
+
+    fn json(&self) -> Value {
+        let mut v = json!({"note": GUARD_NOTE});
+        if !self.nothing.is_empty() {
+            v["protects_nothing"] = json!(self.nothing);
+        }
+        if !self.loose.is_empty() {
+            v["written_loosely"] = self
+                .loose
+                .iter()
+                .map(|(entry, paths)| json!({"entry": entry, "write_as": paths}))
+                .collect();
+        }
+        if !self.unchecked.is_empty() {
+            v["unchecked"] = self
+                .unchecked
+                .iter()
+                .map(|(entry, under)| json!({"entry": entry, "under": under}))
+                .collect();
+        }
+        v
+    }
+
+    /// The lines `/health` lists as problems. `unchecked` is not one: the read there does not
+    /// ask the application to fill its menus, so an entry under one that fills on opening would
+    /// be reported on every call for no fault of its own.
+    fn problems(&self, profile: &str, has_menu: bool) -> Vec<String> {
+        if !has_menu {
+            return vec![format!(
+                "profile '{profile}': confirm_menus has {} entries, but this window has no menu \
+                 bar Windows can see, so they protect nothing. Is this the right window?",
+                self.nothing.len()
+            )];
+        }
+        let mut out: Vec<String> = self
+            .nothing
+            .iter()
+            .map(|g| {
+                format!(
+                    "profile '{profile}': confirm_menus entry '{g}' matches no item in the \
+                     window's menu, so it protects nothing. GET /menus prints the paths; write \
+                     it as one of them."
+                )
+            })
+            .collect();
+        out.extend(self.loose.iter().map(|(g, paths)| {
+            format!(
+                "profile '{profile}': confirm_menus entry '{g}' is not written the way any path \
+                 is printed. It still protects {} - entries are compared loosely - but write it \
+                 as that.",
+                paths.join(", ")
+            )
+        }));
+        out
+    }
+}
+
 /// Why a menu item cannot be invoked by its path, or `None` if it can.
 ///
 /// Both refusals are for the same reason. `WM_COMMAND` is past the point where the application
@@ -5478,6 +5618,10 @@ pub async fn menus(
         }
         if !t.confirm_menus.is_empty() {
             out["confirm_menus"] = json!(t.confirm_menus);
+            let check = GuardReport::of(&t.confirm_menus, &items);
+            if !check.is_clean() {
+                out["confirm_menus_check"] = check.json();
+            }
         }
         let empty: Vec<&str> = items.iter().filter(|m| m.empty).map(|m| m.path.as_str()).collect();
         if !empty.is_empty() {
@@ -5738,11 +5882,8 @@ fn find_anchor_now(
             // A caption that carries a number changes with it. What stays is the part before
             // the number, so those are offered - not taken: the same words are a hint that it
             // is the same control, not proof.
-            let stem = text_stem(&a.text);
-            let similar: Vec<Value> = controls
+            let similar: Vec<Value> = crate::targets::similar_captions(&a.text, controls)
                 .iter()
-                .filter(|c| stem.chars().count() >= 2 && text_stem(&c.text) == stem)
-                .take(10)
                 .map(|c| json!({"text": c.text, "rect": c.rect}))
                 .collect();
             let (hint, note) = if similar.is_empty() {
@@ -5871,16 +6012,6 @@ fn anchor_at(name: &str, a: &AnchorDef, controls: Controls, r: Rect) -> Result<A
         "named in the request; the control there carries a different text, which is saved with it"
     };
     Ok(AnchorNow { rect: r, text, how })
-}
-
-/// The part of a caption before its first digit or bracket, lowercased — what stays the same
-/// when the caption carries a size or a count.
-fn text_stem(s: &str) -> String {
-    s.split(|c: char| c.is_ascii_digit() || matches!(c, '(' | '（' | '[' | ':'))
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_lowercase()
 }
 
 /// Whether the control found under a button is that button, as far as size can tell.
@@ -7216,6 +7347,24 @@ mod tests {
         .expect("parses");
         assert_eq!(confirm_flags_lost(&menus, &one_left), vec!["menu:File".to_string()]);
         assert!(confirm_flags_lost(&one_left, &menus).is_empty(), "adding one is free");
+
+        // Rewriting an old entry into the printed form protects the same items.
+        let old: Targets = serde_json::from_str(
+            r#"{"window":{"title":"x"},"confirm_menus":["Project(P)/Import(I)..."],"buttons":{}}"#,
+        )
+        .expect("parses");
+        let rewritten: Targets = serde_json::from_str(
+            r#"{"window":{"title":"x"},"confirm_menus":["Project/Import"],"buttons":{}}"#,
+        )
+        .expect("parses");
+        assert!(confirm_flags_lost(&old, &rewritten).is_empty());
+
+        // And the refusal names what is being unprotected - it once called menu paths buttons.
+        let q = HashMap::new();
+        let Err(e) = allow_losing_confirm(&q, &menus, &one_left) else { panic!("refused") };
+        assert!(e.message.contains("off a menu path: menu:File"), "{}", e.message);
+        let d = e.detail.expect("detail");
+        assert_eq!((d["buttons"].clone(), d["menus"].clone()), (json!([]), json!(["File"])));
     }
 
     /// Merge patch, the three rules that matter: a null removes, an object merges into what is
@@ -7393,11 +7542,47 @@ mod tests {
 
     #[test]
     fn a_caption_stem_is_what_stays_when_a_number_in_it_changes() {
+        use crate::targets::caption_stem as text_stem;
         assert_eq!(text_stem("NC DISPLAY(1080 x 809)"), "nc display");
         assert_eq!(text_stem("NC Display (1104x818)"), "nc display");
         assert_eq!(text_stem("Axis 1"), "axis");
         assert_eq!(text_stem("12:30"), "");
         assert_eq!(text_stem("OPERATION PANEL"), "operation panel");
+    }
+
+    /// An entry that matches nothing protects nothing, and before this nothing said so. /health
+    /// names it; an entry that still protects, but only loosely, is named with what to write.
+    /// One under a menu that fills on opening is not a problem there - /health does not ask.
+    #[test]
+    fn a_confirm_menu_entry_that_protects_nothing_is_a_problem() {
+        let item = |path: &str, empty: bool| crate::win::menu::MenuItem {
+            path: path.into(),
+            label: path.into(),
+            id: None,
+            depth: 0,
+            enabled: true,
+            checked: false,
+            blocked_by: None,
+            submenu: true,
+            empty,
+        };
+        let items = [item("File", true), item("Project", false), item("Project/Import", false)];
+        let guards: Vec<String> =
+            ["Project", "Project(P)/Import(I)...", "Tools", "File/Exit"].map(String::from).to_vec();
+        let r = GuardReport::of(&guards, &items);
+        let problems = r.problems("p", true);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].contains("'Tools' matches no item"), "{}", problems[0]);
+        assert!(problems[1].contains("'Project(P)/Import(I)...'") && problems[1].contains("Project/Import"));
+        let v = r.json();
+        assert_eq!(v["protects_nothing"], json!(["Tools"]));
+        assert_eq!(v["written_loosely"][0]["write_as"], json!(["Project/Import"]));
+        assert_eq!(v["unchecked"][0], json!({"entry": "File/Exit", "under": "File"}));
+
+        assert!(GuardReport::of(&guards[..1], &items).is_clean());
+        // No menu bar at all: one line, not one per entry.
+        let bare = GuardReport::of(&guards, &[]);
+        assert_eq!(bare.problems("p", false).len(), 1);
     }
 
     /// NCGuide greys "Cycle Time Estimate Function" and leaves "Start Estimation" inside it

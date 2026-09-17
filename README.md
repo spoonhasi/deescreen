@@ -946,7 +946,7 @@ The `/admin` endpoints take `profile` only.
 |---|---|---|---|
 | GET | `/` · `/help` | read | **the manual for agents**, one page (see below) |
 | GET | `/ping` | exempt | alive or not. Carries no information, hence whitelist-exempt |
-| GET | `/health` | read | is it operable right now — checks every trap in **Known traps** below. `status` is `ok` or `degraded`, `problems` lists what is wrong in plain language, `absent` lists the profiles whose window is simply not open, `policy` says which gated things are allowed |
+| GET | `/health` | read | is it operable right now — checks every trap in **Known traps** below. `status` is `ok` or `degraded`, `problems` lists what is wrong in plain language, `absent` lists the profiles whose window is simply not open, `policy` says which gated things are allowed. A `confirm_menus` entry that matches nothing on an open window is a problem |
 | GET | `/windows` | read | visible top-level windows — for finding a title |
 | GET | `/window` | read | the configured window's current state (client size, DPI, foreground) |
 | GET | `/profiles` | read | **every profile's full definition** — buttons, regions, keys, window. `?profile=` for one, `?program=` for one program's profiles; `programs` groups them |
@@ -1442,8 +1442,10 @@ the nearest controls listed, and so is a control whose text and size another one
 That matters because **a caption that carries a number changes with it**:
 `NC DISPLAY(1080 x 809)` is `NC DISPLAY(1104 x 818)` once the size in it changes, and then no
 control carries the anchor's text at all. The refusal lists under `similar` the controls whose
-caption matches up to the first digit or bracket. They are offered, not taken — name the right
-one as above, and `text_now` in the proposal shows the caption that will be saved.
+caption matches up to the first digit or bracket — and so does the anchor error on any ordinary
+request, and `/health`, which otherwise could only say "a different application or build". They
+are offered, not taken — name the right one as above, and `text_now` in the proposal shows the
+caption that will be saved.
 
 Elements marked `"@fixed"` are **not** moved — somebody stated they do not travel with a
 container, and a refit does not overrule that. They are listed under `untouched`. A profile with
@@ -1498,6 +1500,20 @@ button:
 
 Matched on **whole path segments** — `"File"` covers the whole File menu and does *not* cover
 `"Filename Options"`. Those paths refuse unless the request carries `"confirm": true`.
+
+Entries are **compared loosely**: case, the `&`, a mnemonic group such as `(&P)` — or the `(P)`
+that paths were printed with before 0.16 — and a trailing `...` do not matter. So an entry never
+covers less than it was written for; it can cover a sibling that differs only in those. This is
+not a nicety. When 0.16 started printing `Import(I)...` as `Import`, entries copied from the old
+list matched nothing, and **a protection that matches nothing is gone without a word** — the
+menu goes on working, only without the second look somebody asked for.
+
+So an entry that matches nothing is reported: `GET /menus` lists it under `confirm_menus_check`,
+and `GET /health` names it as a problem for every open window — together with entries that match
+only loosely, and the path to write instead. Rewriting an entry into that form is not removing
+it and needs no `confirm`. `/health` reads the menu without asking the application to fill it,
+so an entry under a menu filled only on opening is `unchecked` there rather than a problem;
+`GET /menus` settles it.
 
 **That asking is not invisible.** The application reacts as it would to a menu opening, and some
 do more than update states — an MFC program closes a drop-down list that is open. Read the menu
