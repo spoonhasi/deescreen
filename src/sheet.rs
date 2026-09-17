@@ -153,9 +153,9 @@ pub fn build(full: &RgbaImage, cells: &[Cell], opt: &Options) -> Result<Sheet, S
     let px = (w as u64) * (h as u64);
     if px > MAX_SHEET_PIXELS {
         return Err(format!(
-            "a {cols}x{rows} sheet of {cell_w}x{cell_h} cells is {w}x{h} ({} megapixels), past \
+            "a {cols}x{rows} sheet of {cell_w}x{cell_h} cells is {w}x{h} ({:.2} megapixels), past \
              the {} megapixel ceiling. Ask for fewer buttons, a smaller cell, or a lower scale.",
-            px / 1_000_000,
+            px as f64 / 1_000_000.0,
             MAX_SHEET_PIXELS / 1_000_000
         ));
     }

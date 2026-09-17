@@ -8,14 +8,23 @@
 //! menu's own identity instead: the item carries a command ID, and posting that ID is what the
 //! application receives when a person picks it.
 //!
-//! ## What that is not
+//! ## State is only true once the application has been asked
 //!
 //! `WM_COMMAND` is what an application receives **after** it has decided a menu item is
-//! enabled and which item was picked. An application that changes item state in
-//! `WM_INITMENUPOPUP` — greying out what is not currently valid — never runs that code here,
-//! because the menu is never opened. So a disabled item's ID posted anyway may be acted on. The
-//! state read from the menu is reported for exactly that reason, and invoking a disabled item
-//! is refused rather than attempted.
+//! enabled and which item was picked. Many applications decide that only as a menu opens: MFC
+//! sets every check mark and every greyed item in `WM_INITMENUPOPUP`, and leaves whatever the
+//! resource file said until then. Read cold, NC Trainer's menu had both of two exclusive view
+//! modes checked and a submenu greyed whose items all worked.
+//!
+//! So reading sends the same messages a person opening each menu would cause —
+//! `WM_INITMENU` for the bar, `WM_INITMENUPOPUP` before each submenu is read and
+//! `WM_UNINITMENUPOPUP` after — without opening anything. A menu the application builds on
+//! demand gets built by the same message. Each is sent with a timeout, since a sent message
+//! waits for the application, and one that does not answer ends the asking for the rest of
+//! the read: `Menu::refreshed` then says the states are as the menu held them.
+//!
+//! A disabled item's ID posted anyway may still be acted on, so invoking one is refused
+//! rather than attempted.
 //!
 //! Posted, never sent: a menu item that opens a modal dialog does not return until the dialog
 //! is closed, and `SendMessage` would hold this thread — and with it the input lock — for as
@@ -25,7 +34,8 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetMenu, GetMenuItemCount, GetMenuItemInfoW, MENUITEMINFOW, MF_BYPOSITION, MFS_CHECKED,
     MFS_DISABLED, MFS_GRAYED, MFT_SEPARATOR, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING,
-    MIIM_SUBMENU, PostMessageW, WM_COMMAND,
+    MIIM_SUBMENU, PostMessageW, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_COMMAND, WM_INITMENU,
+    WM_INITMENUPOPUP, WM_UNINITMENUPOPUP,
 };
 
 use super::hwnd;
@@ -56,45 +66,110 @@ pub struct MenuItem {
 
 /// Strip what belongs to the menu's presentation rather than to its name.
 ///
-/// `&` marks the underlined letter and is not part of what anyone calls the item; everything
-/// from a tab on is the accelerator column (`Ctrl+S`), which is a second way to reach the same
-/// item rather than part of its name. Both would otherwise have to be typed exactly into a
-/// path, including the position of an ampersand nobody can see.
+/// Three things are presentation, not name:
+///
+/// - the accelerator column, everything from a tab on (`Save\tCtrl+S`) - a second way to reach
+///   the item;
+/// - the mnemonic marker. Western menus put `&` before the underlined letter (`&File`);
+///   Japanese and Chinese ones append the letter as a group (`ファイル(&F)`, `Import(&I)`),
+///   and removing only the `&` there left `Import(I)` in the path;
+/// - a trailing ellipsis (`Import...`), which says a dialog follows.
+///
+/// All three would otherwise have to be typed exactly into a path. Only a group that is
+/// exactly `(&` + one character + `)` is removed, in ASCII or full-width parentheses, so a
+/// caption like `中文(简体)(&S)` keeps its `(简体)`. `&&` is a literal ampersand.
 pub fn clean_label(raw: &str) -> String {
-    let head = raw.split('\t').next().unwrap_or(raw);
+    let head: Vec<char> = raw.split('\t').next().unwrap_or(raw).chars().collect();
     let mut out = String::with_capacity(head.len());
-    let mut chars = head.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut i = 0;
+    while i < head.len() {
+        let c = head[i];
+        // (&X) or （&X）: the mnemonic group, and any space in front of it.
+        if (c == '(' || c == '（')
+            && head.get(i + 1) == Some(&'&')
+            && head.get(i + 2).is_some_and(|x| *x != '&')
+            && matches!(head.get(i + 3), Some(')') | Some('）'))
+        {
+            let kept = out.trim_end().len();
+            out.truncate(kept);
+            i += 4;
+            continue;
+        }
         if c == '&' {
-            // `&&` is a literal ampersand in a caption.
-            if chars.peek() == Some(&'&') {
-                chars.next();
+            if head.get(i + 1) == Some(&'&') {
                 out.push('&');
+                i += 2;
+            } else {
+                i += 1;
             }
             continue;
         }
         out.push(c);
+        i += 1;
     }
-    out.trim().to_string()
+    let trimmed = out.trim();
+    let trimmed = trimmed.strip_suffix("...").or_else(|| trimmed.strip_suffix('…')).unwrap_or(trimmed);
+    trimmed.trim_end().to_string()
+}
+
+/// The menu bar as read.
+pub struct Menu {
+    pub items: Vec<MenuItem>,
+    /// Whether the application was asked to bring every state up to date, and answered each
+    /// time. `false` when asking was turned off, or a message went unanswered — then `enabled`
+    /// and `checked` are what the menu held, which may be the resource file's defaults.
+    pub refreshed: bool,
+}
+
+/// How long one menu message may wait for the application. Opening a menu is instant for a
+/// responsive program; longer than this and it is busy, and a read should not wait it out.
+const ASK_TIMEOUT_MS: u32 = 500;
+
+/// Sends the opening messages, until one goes unanswered.
+struct Asker {
+    window: HWND,
+    /// Still asking. Cleared by the first failure, so a busy application costs one timeout per
+    /// read rather than one per submenu.
+    on: bool,
+}
+
+impl Asker {
+    fn send(&mut self, msg: u32, wparam: usize, lparam: isize) {
+        if !self.on {
+            return;
+        }
+        let mut result = 0usize;
+        let ok = unsafe {
+            SendMessageTimeoutW(self.window, msg, wparam, lparam, SMTO_ABORTIFHUNG, ASK_TIMEOUT_MS, &mut result)
+        };
+        if ok == 0 {
+            self.on = false;
+        }
+    }
 }
 
 /// Everything in the window's menu bar, depth-first, in the order it is drawn.
 ///
+/// With `refresh`, the application is first asked to update each menu's state, as it would be
+/// when a person opens it — see the module notes.
+///
 /// An empty list is an answer, not a failure: plenty of applications have no menu bar at all,
 /// and some put it inside their own drawing where no API can see it.
-pub fn read(window: isize) -> Vec<MenuItem> {
+pub fn read(window: isize, refresh: bool) -> Menu {
     let h = hwnd(window);
     let bar = unsafe { GetMenu(h) };
     if bar.is_null() {
-        return Vec::new();
+        return Menu { items: Vec::new(), refreshed: false };
     }
-    let mut out = Vec::new();
+    let mut ask = Asker { window: h, on: refresh };
+    ask.send(WM_INITMENU, bar as usize, 0);
+    let mut items = Vec::new();
     // Bounded so a corrupt or hostile menu cannot walk forever. Real menu bars are three deep.
-    walk(bar, "", 0, &mut out);
-    out
+    walk(bar, "", 0, &mut items, &mut ask);
+    Menu { items, refreshed: ask.on }
 }
 
-fn walk(menu: *mut core::ffi::c_void, prefix: &str, depth: u32, out: &mut Vec<MenuItem>) {
+fn walk(menu: *mut core::ffi::c_void, prefix: &str, depth: u32, out: &mut Vec<MenuItem>, ask: &mut Asker) {
     if depth > 8 {
         return;
     }
@@ -145,7 +220,10 @@ fn walk(menu: *mut core::ffi::c_void, prefix: &str, depth: u32, out: &mut Vec<Me
             empty: false,
         });
         if submenu {
-            walk(info.hSubMenu, &path, depth + 1, out);
+            // lParam: the position in the parent, and FALSE for "not the window menu".
+            ask.send(WM_INITMENUPOPUP, info.hSubMenu as usize, (i as u16) as isize);
+            walk(info.hSubMenu, &path, depth + 1, out, ask);
+            ask.send(WM_UNINITMENUPOPUP, info.hSubMenu as usize, 0);
             // Nothing was added under it — see `MenuItem::empty`.
             out[at].empty = out.len() == at + 1;
         }
@@ -185,9 +263,28 @@ mod tests {
         assert_eq!(clean_label("&File"), "File");
         assert_eq!(clean_label("Set &Machine Parameters"), "Set Machine Parameters");
         assert_eq!(clean_label("&Save\tCtrl+S"), "Save");
-        assert_eq!(clean_label("  &Open...  "), "Open...");
+        assert_eq!(clean_label("  &Open...  "), "Open");
         // A doubled ampersand is a literal one — "AT&&T" is a menu item called AT&T.
         assert_eq!(clean_label("AT&&T"), "AT&T");
         assert_eq!(clean_label(""), "");
+    }
+
+    /// NC Trainer's menus, as they came back: the group-style mnemonic kept its letter and
+    /// the dots stayed, so the path read "Project(P)/Import(I).../Project(P)".
+    #[test]
+    fn a_group_style_mnemonic_and_a_trailing_ellipsis_are_not_part_of_the_name() {
+        assert_eq!(clean_label("Project(&P)"), "Project");
+        assert_eq!(clean_label("Import(&I)..."), "Import");
+        assert_eq!(clean_label("New Project(&N)...\tCtrl+N"), "New Project");
+        assert_eq!(clean_label("Exit(&X)\tAlt+F4"), "Exit");
+        assert_eq!(clean_label("100%(&H)"), "100%");
+        assert_eq!(clean_label("ファイル（&F）"), "ファイル");
+        assert_eq!(clean_label("Project (&P)"), "Project");
+        assert_eq!(clean_label("Open…"), "Open");
+        // A parenthesised part of the name stays; only the mnemonic group goes.
+        assert_eq!(clean_label("中文(简体)(&S)"), "中文(简体)");
+        assert_eq!(clean_label("Size (A4)"), "Size (A4)");
+        // Not a mnemonic: a literal ampersand in parentheses.
+        assert_eq!(clean_label("R(&&D)"), "R(&D)");
     }
 }

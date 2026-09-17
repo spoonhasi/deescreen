@@ -315,9 +315,18 @@ curl -s -o keys.png "http://192.0.2.73:8090/capture.png?rect=820,600,300,80&scal
 
 The reason for refusing to magnify the whole screen is plain arithmetic — 1920×1080 at 4× is
 33 megapixels, which is no use to the reader either. A crop is what bounds the output size,
-and that condition is exactly the rule. The caps are **8×** and **4 megapixels**, and
-`max_width` bounds the output width in **both** directions, so `&scale=8&max_width=1200`
-means "as large as fits inside 1200px".
+and that condition is exactly the rule. `max_width` bounds the output width in **both**
+directions, so `&scale=8&max_width=1200` means "as large as fits inside 1200px".
+
+Magnifying stops at **8×** and at a **4 megapixel** image. Asking past either gets the largest
+scale that fits rather than a refusal — the same rule as `settle_ms` and `hold_ms`. The
+metadata's `scale` is what was applied, and `scale_note` says why it is less than asked; it is
+present only when that happened:
+
+```json
+"scale": 1.99213,
+"scale_note": "scale 2 was reduced to 1.992: a 1166x864 crop at 2.00x would be 4.03 megapixels, past the 4 megapixel ceiling for a magnified image - crop tighter to magnify further"
+```
 
 Magnification uses **nearest-neighbour, no interpolation**. The point is to see the glyphs
 larger, not to invent detail, so hard edges beat a smeared resample.
@@ -501,8 +510,9 @@ before naming a button.
 - `GET /profiles` lists `programs`; `GET /profiles?program=NAME` returns every profile of that
   program — a filter, not a pick.
 - `GET /health` says, per program, which profile is open right now, by the same rule a request
-  uses. It also names a program's profile that nothing could tell apart from a sibling — judged
-  from the documents alone, so with no window open.
+  uses. The closed ones are listed under `absent`, not `problems` — only one version is open at a
+  time, and that is not a fault. It also names a program's profile that nothing could tell apart
+  from a sibling — judged from the documents alone, so with no window open.
 - Editing (`/admin/…`) never takes `program`. Which version happens to be open is not a way to
   choose a file to rewrite; name the profile.
 - The editor has a **Program** field and groups its profile list by it. The list of open windows
@@ -936,14 +946,14 @@ The `/admin` endpoints take `profile` only.
 |---|---|---|---|
 | GET | `/` · `/help` | read | **the manual for agents**, one page (see below) |
 | GET | `/ping` | exempt | alive or not. Carries no information, hence whitelist-exempt |
-| GET | `/health` | read | is it operable right now — checks every trap in **Known traps** below. `status` is `ok` or `degraded`, `problems` lists what is wrong in plain language, `policy` says which gated things are allowed |
+| GET | `/health` | read | is it operable right now — checks every trap in **Known traps** below. `status` is `ok` or `degraded`, `problems` lists what is wrong in plain language, `absent` lists the profiles whose window is simply not open, `policy` says which gated things are allowed |
 | GET | `/windows` | read | visible top-level windows — for finding a title |
 | GET | `/window` | read | the configured window's current state (client size, DPI, foreground) |
 | GET | `/profiles` | read | **every profile's full definition** — buttons, regions, keys, window. `?profile=` for one, `?program=` for one program's profiles; `programs` groups them |
 | GET | `/buttons` | read | one profile's button list (a subset of `/profiles`) |
 | GET | `/regions` | read | one profile's region list (coordinates absolute to the window) |
 | GET | `/controls` | read | enumerate child controls. **An empty list is an answer** (see below) |
-| GET | `/menus` | read | the window's own menu bar — paths, command ids, enabled/checked. Presses nothing |
+| GET | `/menus` | read | the window's own menu bar — paths, command ids, enabled/checked, brought up to date first (`?refresh=false` skips that). Presses nothing |
 | GET | `/spell` | read | `?text=G91X0` — which keys that string would press on this keypad. Presses **nothing**; `POST /click {"spell": "…"}` presses it |
 | GET | `/editor` | read | the button editor (HTML) |
 | GET | `/favicon.ico` · `/favicon.png` | read | the tray icon as a PNG — the tab should not be a different picture from the tray. Two names: the page links the `.png`, a browser asks for the `.ico` on its own |
@@ -953,10 +963,10 @@ The `/admin` endpoints take `profile` only.
 | GET | `/sheet` | read | the same sheet as JSON: its shape, where it was saved, and which buttons had no picture to show |
 | POST | `/preview.png` | read | draw a **candidate** definition from the body over the live screen. Saves nothing |
 | GET | `/captures/{name}` | read | fetch a stored capture |
-| POST | `/click` | **control** | `{button\|buttons[]\|rect\|point, confirm, click_button, double, spell, settle_ms, measure, quiet_ms, per_press, gap_ms, capture, pad, ignore, scale, max_width}`. No `capture` means **no picture is taken**. `buttons` presses in order and stops at the first failure |
+| POST | `/click` | **control** | `{button\|buttons[]\|rect\|point, confirm, click_button, double, spell, settle_ms, measure, quiet_ms, per_press, gap_ms, capture\|capture_rect, pad, ignore, scale, max_width}`. No `capture` means **no picture is taken**. `buttons` presses in order and stops at the first failure |
 | POST | `/click.png` | **control** | same, PNG bytes back. Parameters go in the query. No `capture` captures the whole client area (an image has to come back) |
-| POST | `/menu` | **control**+flag | `{path, confirm, capture, …}` — pick one item from the menu bar. The **only** name here that does not come from the profile, so it needs `allow_menus` |
-| POST | `/key` | **control** | `{key\|chord\|text, settle_ms, measure, quiet_ms, capture, pad, ignore, …}` |
+| POST | `/menu` | **control**+flag | `{path, confirm, capture\|capture_rect, …}` — pick one item from the menu bar. The **only** name here that does not come from the profile, so it needs `allow_menus` |
+| POST | `/key` | **control** | `{key\|chord\|text, settle_ms, measure, quiet_ms, capture\|capture_rect, pad, ignore, …}` |
 | POST | `/window/focus` | **control** | bring the window forward (restore if minimised) |
 | POST | `/window/fit` | **control** | restore the client area to `reference_client` |
 | POST | `/admin/reload` | read+code | with `?profile=` re-reads that one; without, **rescans the disk** and picks up new files |
@@ -1052,6 +1062,18 @@ curl -s -X POST -o shot.png ".../click.png?button=OPT_STOP&capture=button&pad=25
 The point is not keystrokes saved. The rect is a number the server already holds, and
 re-deriving it in the caller is arithmetic done in a second place — which is where things go
 quietly wrong.
+
+### Capturing what nobody named — `capture_rect`
+
+What a press changes is often somewhere no region covers: a dialog, one line of a table.
+`"capture_rect": [x, y, w, h]` takes the place of `capture` on `/click`, `/key` and `/menu`
+(`capture_rect=x,y,w,h` in a query string). It is in live client coordinates — the ones
+`/capture.png?rect=` takes — so a rectangle read off one picture goes straight into the next
+press. `pad` applies to it; it is neither moved by an anchor nor scaled, because it came off
+the window as it is. Sending both `capture` and `capture_rect` is refused.
+
+In every reply `button` is a **name** — the one sent, as in a sequence's records and in
+`GET /buttons`. Which mouse button did the pressing is `click_button`.
 
 ### Measuring `settle_ms` instead of guessing it — `measure`
 
@@ -1178,6 +1200,11 @@ change is attributed to the press that caused it, which the end screen cannot do
 ```
 
 and `sequence.unchanged` lists those names outright.
+
+The profile's **shift key is not on that list**. It enters nothing — on a one-shot panel nothing
+shows until the next key — so it would be there after every shifted character, and a list that
+always carries the same entry gets skimmed past. Its presses are marked `"modifier": true`, and
+their indexes are in `sequence.modifiers`.
 
 **A press that changed nothing is not a failed press.** A toggle already in that state, a key
 with no legend to repaint, a key ignored in the current mode and a key that never arrived are
@@ -1397,10 +1424,22 @@ rectangle that may be stale to decide which control proves it stale. The reply l
 candidates; name the one you mean:
 
 ```bash
-curl -s -X POST -H "Content-Type: application/json" -H "X-Admin-Code: THECODE" \\
-  -d '{"anchors": {"OPERATION PANEL": [1142,384,746,251]}, "apply": true}' \\
+curl -s -X POST -H "Content-Type: application/json" -H "X-Admin-Code: THECODE" \
+  -d '{"anchors": {"OPERATION PANEL": [1142,384,746,251]}, "apply": true}' \
   ".../admin/profile/refit?profile=NAME"
 ```
+
+**A named rectangle has to be a control's own**, exactly as `GET /controls` prints it, and the
+anchor takes that control's **text** along with its place. Taken on trust, a rectangle was saved
+with the old text — so a rectangle that was no control's, or a control whose caption had
+changed, became an anchor the very next request could not find. Now the first is refused with
+the nearest controls listed, and so is a control whose text and size another one shares.
+
+That matters because **a caption that carries a number changes with it**:
+`NC DISPLAY(1080 x 809)` is `NC DISPLAY(1104 x 818)` once the size in it changes, and then no
+control carries the anchor's text at all. The refusal lists under `similar` the controls whose
+caption matches up to the first digit or bracket. They are offered, not taken — name the right
+one as above, and `text_now` in the proposal shows the caption that will be saved.
 
 Elements marked `"@fixed"` are **not** moved — somebody stated they do not travel with a
 container, and a refit does not overrule that. They are listed under `untouched`. A profile with
@@ -1424,10 +1463,20 @@ curl -s -X POST -H "Content-Type: application/json" \
   -d '{"path":"Tool/Set Machine Parameters","capture":"@client"}' .../menu
 ```
 
-`path` is the full path as `GET /menus` prints it, separated by `/`. The `&` that marks the
-underlined letter and the accelerator column (`Ctrl+S`) are already stripped there — do not type
-them. Matching ignores case. A `submenu` entry is a place, not an action; naming one lists its
-children instead of pressing anything.
+`path` is the full path as `GET /menus` prints it, separated by `/`. What a caption carries for
+presentation is already stripped there — do not type it: the `&` of the underlined letter, a
+mnemonic written as a group (`Import(&I)...` is `Import`), the accelerator column (`Ctrl+S`)
+and a trailing `...` or `…`. A bracket that is part of the name stays: `中文(简体)(&S)` is
+`中文(简体)`. `label` keeps the caption exactly as written. Matching ignores case. A `submenu`
+entry is a place, not an action; naming one lists its children instead of pressing anything.
+
+**`enabled` and `checked` are current.** Many applications set them only as a menu opens — every
+MFC program does, in `WM_INITMENUPOPUP` — and leave the loaded defaults until then. Read cold,
+NC Trainer's menu had two mutually exclusive view modes both checked, and a submenu greyed out
+whose items all worked. So reading first sends the application the messages a person opening
+each menu would cause, and opens nothing. `state_refreshed` says it answered; `false` means it
+did not within half a second, and the states are what the menu held. `?refresh=false` skips the
+asking, for an application that misbehaves when asked.
 
 **This is the one place where a name does not come from the profile.** Everything else in this
 tool can only press what a person wrote into the profile file. A menu is read off the window, so
@@ -1448,9 +1497,8 @@ Matched on **whole path segments** — `"File"` covers the whole File menu and d
 
 **A disabled item is refused, not attempted.** The command is delivered as `WM_COMMAND`, which
 is what an application receives *after* it has decided an item is enabled — so posting a
-greyed-out item's command may well be acted on. `enabled` in `GET /menus` is the state the menu
-carries right now; an application that greys items out as the menu *opens* reports everything
-enabled here, because nothing ever opens it.
+greyed-out item's command may well be acted on. `POST /menu` reads the state the same way
+`GET /menus` does, asking first, so the check is against what the application would show.
 
 **The command is posted, not sent.** A menu item that opens a modal dialog would otherwise hold
 the request open for as long as the dialog is on screen. So the reply means the application
@@ -1462,9 +1510,10 @@ their own (a ribbon, a WPF menu, a custom title bar). A drawn menu is pixels, an
 clicking like anything else.
 
 A submenu can also come back **empty** — `"empty": true`, and listed in `empty_submenus`. That is
-usually a menu the application fills at the moment it is opened; NCGuide's File menu is one.
-Nothing here ever opens a menu, so those items do not exist from this side, and asking for a path
-under one is refused with that reason rather than with a list of similar-looking names.
+a menu the application fills at the moment it is opened and did not fill when asked; the asking
+above builds most of them, but not one that waits for the menu to be really on screen. Those
+items do not exist from this side, and asking for a path under one is refused with that reason
+rather than with a list of similar-looking names.
 
 ## Known traps — every one of them fails silently, without an error
 

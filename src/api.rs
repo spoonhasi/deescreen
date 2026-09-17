@@ -264,6 +264,11 @@ pub struct ClickReq {
     /// The region to capture after the press. Absent, nothing is captured.
     #[serde(default)]
     pub capture: Option<String>,
+    /// Instead of `capture`: a rectangle to capture, in live client coordinates - the ones
+    /// `/capture`'s `rect` takes, so a rectangle read off one picture goes straight into the
+    /// next request. What a press changes is often somewhere nobody named.
+    #[serde(default)]
+    pub capture_rect: Option<Rect>,
     /// Photograph between presses, so each press's own change is reported with it.
     ///
     /// A sequence otherwise reports only the screen after the last press, and a key silently
@@ -320,6 +325,11 @@ pub struct KeyReq {
     pub settle_ms: Option<u64>,
     #[serde(default)]
     pub capture: Option<String>,
+    /// Instead of `capture`: a rectangle to capture, in live client coordinates - the ones
+    /// `/capture`'s `rect` takes, so a rectangle read off one picture goes straight into the
+    /// next request. What a press changes is often somewhere nobody named.
+    #[serde(default)]
+    pub capture_rect: Option<Rect>,
     /// Pixels to grow the capture rectangle by on every side.
     #[serde(default)]
     pub pad: Option<i32>,
@@ -445,6 +455,7 @@ impl ClickReq {
             measure: q_bool(q, "measure")?,
             quiet_ms: q_num(q, "quiet_ms")?,
             capture: q_get(q, "capture"),
+            capture_rect: q_rect_named(q, "capture_rect")?,
             pad: q_num(q, "pad")?,
             ignore: q_rect_named(q, "ignore")?,
             scale: q_num(q, "scale")?,
@@ -1130,6 +1141,24 @@ fn watch_until_still(
     })
 }
 
+/// Which presses of a sequence moved nothing, and which were the profile's shift key.
+///
+/// The first list is what `per_press` exists for: not "something is wrong somewhere in these
+/// twelve presses", but which ones. The shift key is kept off it and listed apart, by index. It
+/// enters nothing - on a one-shot panel nothing shows until the next key - so it was on the
+/// list after every shifted character, and a list that always carries the same entry gets
+/// skimmed past.
+fn quiet_presses(done: &[Value]) -> (Vec<Value>, Vec<Value>) {
+    let modifier = |e: &&Value| e["modifier"] == json!(true);
+    let quiet = done
+        .iter()
+        .filter(|e| e["change"]["changed"] == json!(false) && !modifier(e))
+        .map(|e| e["button"].clone())
+        .collect();
+    let modifiers = done.iter().filter(modifier).map(|e| e["index"].clone()).collect();
+    (quiet, modifiers)
+}
+
 /// What one press changed, for the record of that press.
 ///
 /// Deliberately the same shape as the request-level `changed`, and deliberately without a
@@ -1234,6 +1263,9 @@ fn deliver(
         "black": black,
         "bytes": png.len(),
     });
+    if let Some(note) = &frame.scale_note {
+        meta["scale_note"] = json!(note);
+    }
     if black {
         meta["hint"] = json!(BLACK_HINT);
     }
@@ -1553,6 +1585,8 @@ pub async fn health(State(state): State<SharedState>) -> Response {
         // them. Said first, because a missing profile explains every later "unknown profile".
         problems.extend(st.load_notes.load().iter().cloned());
         let mut bindings: Vec<Binding> = Vec::new();
+        // (profile, program, why) for each profile whose window is not open.
+        let mut absent: Vec<(String, String, String)> = Vec::new();
         for (name, prof) in snapshot.iter() {
             let t = prof.targets();
             let mut entry = json!({
@@ -1577,6 +1611,19 @@ pub async fn health(State(state): State<SharedState>) -> Response {
                 problems.push(format!(
                     "profile '{name}': on_size_mismatch is \"reject\" but reference_client is not set, so nothing is checking the window size and every coordinate is used at whatever size the window happens to be. Open the window, read client_size from GET /window?profile={name}, and save it back as reference_client."
                 ));
+            }
+            // A window that is not open - or is open on another of the program's projects - is
+            // not a fault. Several profiles of one program means all but one are closed at any
+            // moment, and listing them as problems left "degraded" permanently on, which is a
+            // status nobody reads. Only what is wrong with an open window, or with the files,
+            // stays a problem. Several windows matching IS one: nothing can be pressed.
+            if let Err(e @ (FindError::NotFound | FindError::Unmarked(_))) = window::find(&t.window) {
+                let why = find_error(&t, e).message;
+                entry["status"] = json!("absent");
+                entry["why"] = json!(why);
+                absent.push((name.clone(), t.program.clone(), why));
+                per_profile.insert(name.clone(), entry);
+                continue;
             }
             match bind_window(&t) {
                 Err(e) => {
@@ -1687,10 +1734,24 @@ pub async fn health(State(state): State<SharedState>) -> Response {
                 programs.insert(prog.clone(), json!({"profiles": names, "open": open, "why": why}));
             }
         }
+        // For a closed profile of a program, which of its siblings is open instead - usually the
+        // whole explanation.
+        let absent: Vec<Value> = absent
+            .into_iter()
+            .map(|(profile, program, why)| {
+                let mut e = json!({"profile": profile, "why": why});
+                if !program.is_empty() {
+                    e["program"] = json!(program);
+                    e["program_open"] = programs.get(&program).map(|p| p["open"].clone()).unwrap_or(Value::Null);
+                }
+                e
+            })
+            .collect();
 
         json!({
             "status": if problems.is_empty() { "ok" } else { "degraded" },
             "problems": problems,
+            "absent": absent,
             "session": {"interactive": interactive},
             "home": {
                 "dir": crate::config::home().dir.to_string_lossy(),
@@ -2282,7 +2343,7 @@ async fn do_sheet(state: &SharedState, q: HashMap<String, String>) -> Result<(Ve
         v.split(',').map(|b| b.trim().to_string()).filter(|b| !b.is_empty()).collect()
     });
     let inside = q_get(&q, "region");
-    let opt = sheet::Options {
+    let mut opt = sheet::Options {
         // Enough margin to see that a key is centred in its rectangle, which is how a 16px
         // drift shows up at a glance. At 0 an off-centre rectangle still looks like a key.
         pad: q_num(&q, "pad")?.unwrap_or(8).clamp(0, 200),
@@ -2291,18 +2352,29 @@ async fn do_sheet(state: &SharedState, q: HashMap<String, String>) -> Result<(Ve
         heading: String::new(),
     };
     #[allow(clippy::neg_cmp_op_on_partial_ord)] // also catches NaN, which `scale=nan` produces
-    if !(opt.scale > 0.0) || opt.scale > 8.0 {
-        return Err(ApiError::bad_request(format!(
-            "scale must be greater than 0 and at most 8, got {}",
-            opt.scale
-        )));
+    if !(opt.scale > 0.0) {
+        return Err(ApiError::bad_request(format!("scale must be greater than 0, got {}", opt.scale)));
     }
+    // Past 8x a cell is blocks, not glyphs. The same ceiling as a capture, and the same rule:
+    // reduced and said so, not refused.
+    let scale_note = (opt.scale > 8.0).then(|| {
+        let note = format!("scale {} was reduced to 8: 8x is the most this magnifies", opt.scale);
+        opt.scale = 8.0;
+        note
+    });
     let save = q_bool(&q, "save")?.unwrap_or(true);
 
     let st = state.clone();
-    tokio::task::spawn_blocking(move || sheet_now(&st, &prof, wanted, inside, order, opt, save))
-        .await
-        .map_err(|e| ApiError::internal(format!("sheet task failed: {e}")))?
+    tokio::task::spawn_blocking(move || {
+        sheet_now(&st, &prof, wanted, inside, order, opt, save).map(|(png, mut meta)| {
+            if let Some(n) = scale_note {
+                meta["scale_note"] = json!(n);
+            }
+            (png, meta)
+        })
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("sheet task failed: {e}")))?
 }
 
 fn sheet_now(
@@ -2595,6 +2667,59 @@ fn anchor_offsets(t: &Targets, info: &crate::win::window::WindowInfo) -> Result<
 }
 
 type AnchorOffsets = std::collections::HashMap<String, (i32, i32)>;
+
+/// What a request asked to look at once its input is in.
+struct Look {
+    /// A region name, `@client`, or `button:NAME`.
+    region: Option<String>,
+    /// Live client coordinates, taken as given.
+    rect: Option<Rect>,
+    pad: i32,
+    /// `measure` and `per_press` compare pictures, so with nothing named they watch the whole
+    /// client area.
+    needs_one: bool,
+}
+
+impl Look {
+    /// The rectangle to capture and the label its file is saved under, or `None` for no
+    /// picture.
+    ///
+    /// A region is in the profile's coordinates, so it is placed by its anchor and scaled to
+    /// the window. `capture_rect` is already in the window's, like `/capture`'s `rect`, and is
+    /// only padded.
+    fn resolve(
+        self,
+        t: &Targets,
+        client_size: (i32, i32),
+        offsets: &AnchorOffsets,
+        scale: (f64, f64),
+    ) -> Result<Option<(Rect, String)>, ApiError> {
+        let region = self.region.filter(|r| !r.trim().is_empty());
+        match (region, self.rect) {
+            (Some(r), Some(_)) => Err(ApiError::bad_request(format!(
+                "'capture' ({r}) and 'capture_rect' both say what to capture - send one"
+            ))),
+            (None, Some(r)) => {
+                if r[2] <= 0 || r[3] <= 0 {
+                    return Err(ApiError::bad_request(format!(
+                        "capture_rect [{},{},{},{}] must have positive width and height",
+                        r[0], r[1], r[2], r[3]
+                    )));
+                }
+                Ok(Some((Targets::pad_rect(r, self.pad), "rect".to_string())))
+            }
+            (region, None) => {
+                let Some(name) = region.or_else(|| self.needs_one.then(|| "@client".to_string())) else {
+                    return Ok(None);
+                };
+                let r = t.region(&name, client_size, offsets).map_err(|e| {
+                    ApiError::bad_request(e).with_detail(json!({"known_regions": t.region_names()}))
+                })?;
+                Ok(Some((Targets::scale_rect(Targets::pad_rect(r, self.pad), scale), name)))
+            }
+        }
+    }
+}
 
 /// Whether the control under the press sits where the profile says it does.
 ///
@@ -3108,7 +3233,8 @@ PROFILES
   so read it before you name a button.
   GET /profiles lists "programs", and GET /profiles?program=NAME returns every profile of
   that program - a filter, not a pick. GET /health says per program which profile is open
-  right now, by the same rule a request uses. Editing (/admin/...) never takes program:
+  right now, by the same rule a request uses; the closed ones are in "absent", not in
+  "problems", because only one is ever open. Editing (/admin/...) never takes program:
   name the exact profile you mean to change.
   A dialog that opens BESIDE the main window is not an alternative. In the same program it
   would make the program ambiguous whenever it shows - give it no program. And where the
@@ -3133,6 +3259,15 @@ PRESS A SAVED BUTTON - click, wait for it to settle, re-capture, one round trip
   JSON variant - no image in the body, a server-side path and /captures URL instead:
   curl -s -X POST -H "Content-Type: application/json" \
     -d '{{"button":"NAME","capture":"REGION","settle_ms":500}}' {base}/click
+
+  In every reply "button" is a NAME - the one you sent, as in a sequence's records and in
+  GET /buttons. Which mouse button did the pressing is "click_button".
+
+  NO REGION FOR WHAT YOU WANT TO SEE? "capture_rect": [x,y,w,h] instead of "capture" -
+  live client coordinates, the same ones GET /capture.png?rect= takes, so a rectangle read
+  off one picture goes straight into the next press. pad applies to it; it is not moved by
+  an anchor or scaled, because it came off the window as it is. Send one of the two, not
+  both. POST /key and POST /menu take it too; in a query string, capture_rect=x,y,w,h.
 
   settle_ms is how long to wait after the press before re-capturing. Left out it uses
   the server's default (500ms); ask for more than the server's ceiling and it is CLAMPED,
@@ -3306,6 +3441,10 @@ PRESS SEVERAL BUTTONS IN ORDER - for keypads, where a half-entry is worse than n
      "change": {{"changed": false, "pixels": 0, "bbox": null}}}}
   and "sequence.unchanged" lists the names outright, which is the answer you wanted.
 
+  The profile's shift key is not on that list. It enters nothing - on a one-shot panel
+  nothing shows until the next key - so it would be there after every shifted character.
+  Its presses carry "modifier": true and their indexes are in "sequence.modifiers".
+
   A PRESS THAT CHANGED NOTHING IS NOT A FAILED PRESS. A toggle already in that state, a key
   with no legend to repaint, a key ignored in the current mode and a key that never arrived
   all look identical from here, so "change" states what moved and passes no verdict. It
@@ -3388,10 +3527,14 @@ LOOK AT SOMETHING
 
   READING SMALL TEXT - scale magnifies, but only on a crop:
     curl -s -o shot.png "{base}/capture.png?rect=820,600,300,80&scale=4"
-  scale<1 shrinks (any capture), scale>1 magnifies (needs region= or rect=, capped at
-  8x and 4 megapixels, nearest-neighbour so the strokes stay crisp). Magnifying the
-  whole client area is refused - crop first. max_width caps the output width either
-  way, so &scale=8&max_width=1200 means "as big as fits in 1200px".
+  scale<1 shrinks (any capture), scale>1 magnifies (needs region= or rect=,
+  nearest-neighbour so the strokes stay crisp). Magnifying the whole client area is
+  refused - crop first. max_width caps the output width either way, so
+  &scale=8&max_width=1200 means "as big as fits in 1200px".
+  Magnifying stops at 8x and at a 4 megapixel image. Ask past either and you get the
+  largest scale that fits, not a refusal - the metadata's "scale" is what was applied and
+  "scale_note" says why it is less than you asked. Present only when that happened, so
+  check for it before measuring anything off the picture.
 
   &buttons= draws the saved buttons and regions over the capture, three ways:
     buttons=1     outline + name + crosshair at the click point
@@ -3427,6 +3570,7 @@ LOOK AT SOMETHING
                    makes a drift visible: at pad=0 a rectangle sitting 16px off its key
                    still looks like a picture of a key.
     scale=2        magnify each crop - for softkeys whose legend is only 32px tall.
+                   At most 8; more is reduced to 8 and "scale_note" says so.
     cell=120       ceiling on one cell's picture. A whole-panel rectangle is shrunk to it
                    rather than setting the cell size for the other 139.
     save=false     do not keep a copy on the server.
@@ -3515,8 +3659,16 @@ ENDPOINTS
                        current rules refuse) is listed too; the next save has to fix it.
                        "status" is ok or degraded and "problems" lists what is wrong, in
                        plain language - a locked session, a profile that failed to parse,
-                       a window that is not open. "policy" says which of the gated things
-                       this server allows, including whether an admin code is required
+                       a window that is open but cannot be used. "policy" says which of the
+                       gated things this server allows, including whether an admin code is
+                       required.
+                       A WINDOW THAT IS NOT OPEN IS NOT A PROBLEM. Of a program's profiles
+                       only one is open at a time, so each closed one is listed in "absent"
+                       instead - profile, why, and for a program, "program_open": which of
+                       its profiles is open now. Its entry in "profiles" says "status":
+                       "absent". "degraded" therefore means something needs fixing; a
+                       profile you are about to use being in "absent" means its window has
+                       to be opened first, which is the person's to do.
   GET  /profiles       every profile's full definition; one call tells you everything.
                        ?program=NAME for that program's profiles; "programs" groups them
   GET  /buttons        just the button list of one profile (subset of /profiles)
@@ -3526,10 +3678,12 @@ ENDPOINTS
                        cannot show for a whole panel. See "the contact sheet" above
   GET  /sheet          the same sheet as JSON - its shape, where it was saved, and which
                        buttons had no picture to show
-  GET  /menus          the window's own menu bar - paths, command ids, enabled/checked.
+  GET  /menus          the window's own menu bar - paths, command ids, enabled/checked,
+                       brought up to date first (refresh=false to skip that).
                        Presses nothing. An empty list is an answer
   POST /menu           {{path}} - pick one item from it. The ONLY name here that does not
-                       come from the profile, so it needs allow_menus as well
+                       come from the profile, so it needs allow_menus as well. Takes
+                       {{capture | capture_rect, pad, ignore, settle_ms}} like a click
   GET  /spell          ?text=G91X0 - which keys that string would press on this keypad.
                        Presses NOTHING; POST /click {{"spell": "..."}} presses it
   GET  /windows        every visible top-level window (to find a title)
@@ -3547,7 +3701,8 @@ ENDPOINTS
                        read right now. Parameters go in the body
   POST /click          {{button | buttons[] | spell | rect | point, confirm, click_button,
                        double, hold_ms, measure, quiet_ms, per_press,
-                       settle_ms, gap_ms, capture, pad, ignore}} - the reply carries "hit"
+                       settle_ms, gap_ms, capture | capture_rect, pad, ignore}} - the
+                       reply carries "hit"
                        (what was under the point) and "change" (pixels + bbox). With
                        "buttons" it presses them in order and stops at the first failure
   POST /click.png      same, returns PNG bytes; parameters go in the query string
@@ -3555,8 +3710,9 @@ ENDPOINTS
                        (NOT in /buttons - that endpoint is buttons only). {{chord}} presses an
                        unnamed combination ("f1", "ctrl+alt+f1") and {{text}} types a string;
                        both need allow_raw_keys.
-                       Takes {{capture, ignore, settle_ms, measure, quiet_ms, scale,
-                       max_width}} too, so one call presses and shows you the result -
+                       Takes {{capture | capture_rect, pad, ignore, settle_ms, measure,
+                       quiet_ms, scale, max_width}} too, so one call presses and shows you
+                       the result -
                        and "measure": true times this key's settle exactly as it does for
                        a click. There is no "hit" here -
                        a key has no coordinate, so "did it arrive" has no cheap answer;
@@ -4045,6 +4201,18 @@ TRAPS - these fail quietly or confusingly. Read once, save yourself an hour.
   candidates; name the right one:
     -d '{{"anchors": {{"OPERATION PANEL": [1142,384,746,251]}}, "apply": true}}'
 
+  A NAMED RECTANGLE HAS TO BE A CONTROL'S OWN - exactly as GET /controls prints it - and the
+  anchor takes that control's text along with its place. A rectangle that is no control's
+  is refused with the nearest ones listed, and so is one whose text and size another
+  control shares: saved, either would be an anchor nothing can find again.
+
+  A CAPTION THAT CARRIES A NUMBER CHANGES WITH IT. "NC DISPLAY(1080 x 809)" is
+  "NC DISPLAY(1104 x 818)" once the size in it changes, and then no control carries the
+  anchor's text. The refusal lists under "similar" the controls whose caption matches up
+  to the first digit or bracket. They are offered, not taken - name the one that is this
+  anchor's control as above, and "text_now" in the proposal shows the caption that will be
+  saved with it.
+
   ELEMENTS MARKED "@fixed" ARE NOT MOVED. Somebody stated they do not travel with a
   container, and a refit does not overrule that. They are listed under "untouched".
 
@@ -4060,10 +4228,21 @@ THE WINDOW'S MENU BAR - the one thing not written in the profile
     curl -s -X POST -H "Content-Type: application/json" \
       -d '{{"path":"Tool/Set Machine Parameters","capture":"@client"}}' {base}/menu
 
-  'path' is the full path as GET /menus prints it, separated by '/'. The '&' that marks the
-  underlined letter and the accelerator column (Ctrl+S) are already stripped there - do not
-  type them. Matching ignores case. A 'submenu' entry is a place, not an action; its
-  children are the actions, and naming one lists them.
+  'path' is the full path as GET /menus prints it, separated by '/'. What a caption carries
+  for presentation is already stripped there - do not type it: the '&' of the underlined
+  letter, a mnemonic written as a group ("Import(&I)" is "Import"), the accelerator column
+  (Ctrl+S) and a trailing "..." or "…". A bracket that is part of the name stays -
+  "中文(简体)(&S)" is "中文(简体)". "label" keeps the caption exactly as written. Matching
+  ignores case. A 'submenu' entry is a place, not an action; its children are the actions,
+  and naming one lists them.
+
+  "enabled" AND "checked" ARE CURRENT. Many applications set them only as a menu opens -
+  every MFC program does - and leave the loaded defaults in place until then; read cold, one
+  showed two exclusive view modes both checked. So reading first sends the application the
+  messages a person opening each menu would cause, and opens nothing. "state_refreshed"
+  says it answered. false means it did not answer within half a second, and the states are
+  what the menu held; "state_note" says so. refresh=false skips the asking, for an
+  application that misbehaves when asked.
 
   THIS IS THE ONE PLACE WHERE A NAME IS NOT FROM THE PROFILE. Everything else here can only
   press what a person wrote in the profile file. A menu is read off the window, so this
@@ -4077,9 +4256,8 @@ THE WINDOW'S MENU BAR - the one thing not written in the profile
 
   A DISABLED ITEM IS REFUSED, NOT ATTEMPTED. The command is delivered as WM_COMMAND, which
   is what an application receives AFTER it has decided an item is enabled - so posting a
-  greyed-out item's command may be acted on anyway. "enabled" in GET /menus is the state the
-  menu carries right now; an application that greys items out as the menu OPENS will report
-  everything enabled, because nothing opens it.
+  greyed-out item's command may be acted on anyway. POST /menu reads the state the same way
+  GET /menus does, asking first, so the check is against what the application would show.
 
   THE COMMAND IS POSTED, NOT SENT. A menu item that opens a modal dialog would otherwise
   hold the request open for as long as the dialog is on screen. So the reply means the
@@ -4092,10 +4270,10 @@ THE WINDOW'S MENU BAR - the one thing not written in the profile
   is reached by clicking like anything else.
 
   A SUBMENU CAN COME BACK EMPTY, marked "empty": true and listed in "empty_submenus". That is
-  usually a menu the application fills at the moment it is opened - NCGuide's File menu is
-  one. Nothing here opens a menu, so its items do not exist from this side; asking for a
-  path under it is refused with that reason rather than a list of similar names. Reach
-  those items by clicking.
+  a menu the application fills at the moment it is opened and did not fill when asked - the
+  asking above builds most of them, but not one that waits for the menu to be really on
+  screen. Its items do not exist from this side; asking for a path under it is refused with
+  that reason rather than a list of similar names. Reach those items by clicking.
 
 HOW TO VERIFY WHAT YOU DID
   Prefer the application's own API over the screen wherever one exists. Use the screen
@@ -4156,7 +4334,7 @@ pub async fn click_png(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
     let mut req = ClickReq::from_query(&q)?;
-    if req.capture.is_none() {
+    if req.capture.is_none() && req.capture_rect.is_none() {
         req.capture = Some("@client".to_string());
     }
     let (png, result) = do_click(&state, req).await?;
@@ -4520,32 +4698,21 @@ async fn do_click(state: &SharedState, mut req: ClickReq) -> Result<(Option<Vec<
         // whatever the press moved is somewhere in it.
         let measure = req.measure.unwrap_or(false);
         let per_press = req.per_press.unwrap_or(false);
-        let region_name = req
-            .capture
-            .clone()
-            .filter(|r| !r.is_empty())
-            .or_else(|| (measure || per_press).then(|| "@client".to_string()))
-            .map(|r| {
+        let pad = req.pad.unwrap_or(0).max(0);
+        let (crop, region_name) = Look {
+            region: req.capture.clone().map(|r| {
                 if r == "button" {
                     format!("button:{}", presses.last().map(|p| p.name.as_str()).unwrap_or(""))
                 } else {
                     r
                 }
-            });
-        let pad = req.pad.unwrap_or(0).max(0);
-        let crop = match &region_name {
-            None => None,
-            Some(r) => Some(Targets::scale_rect(
-                Targets::pad_rect(
-                    t.region(r, info.client_size, &offsets).map_err(|e| {
-                        ApiError::bad_request(e)
-                            .with_detail(json!({"known_regions": t.region_names()}))
-                    })?,
-                    pad,
-                ),
-                scale,
-            )),
-        };
+            }),
+            rect: req.capture_rect,
+            pad,
+            needs_one: measure || per_press,
+        }
+        .resolve(&t, info.client_size, &offsets, scale)?
+        .unzip();
         // Hold the whole frame, not a digest. A digest is enough for a boolean, but reporting
         // where and how much changed needs the pixels.
         let before = match crop {
@@ -4571,6 +4738,7 @@ async fn do_click(state: &SharedState, mut req: ClickReq) -> Result<(Option<Vec<
         };
 
         let gap = st.config.clamp_settle(Some(req.gap_ms.unwrap_or(DEFAULT_GAP_MS)));
+        let shift_button = t.shift.as_ref().map(|s| s.button.as_str());
         let mut done: Vec<Value> = Vec::with_capacity(presses.len());
         let mut failure: Option<Value> = None;
         // The last press is the one the "nothing changed" hint has to reason about.
@@ -4668,7 +4836,7 @@ async fn do_click(state: &SharedState, mut req: ClickReq) -> Result<(Option<Vec<
                 );
             }
             last_hit = hit.clone();
-            done.push(json!({
+            let mut record = json!({
                 "index": i,
                 "button": pr.name,
                 // How long the contact was actually closed. A panel key that needs longer than
@@ -4679,7 +4847,11 @@ async fn do_click(state: &SharedState, mut req: ClickReq) -> Result<(Option<Vec<
                 "hit": hit.as_ref().map(hit_json),
                 // Answers "is it still where the file says", which the hit alone cannot.
                 "aim": aim_json(pr.saved_rect, hit.as_ref()),
-            }));
+            });
+            if shift_button == Some(pr.name.as_str()) {
+                record["modifier"] = json!(true);
+            }
+            done.push(record);
         }
 
         // settle_ms belongs to the whole request, not to each press — the sequence has its own
@@ -4735,19 +4907,14 @@ async fn do_click(state: &SharedState, mut req: ClickReq) -> Result<(Option<Vec<
         }
         if sequence {
             result["pressed"] = json!(done);
-            // The list the whole feature exists for: not "something is wrong somewhere in
-            // these twelve presses", but which ones moved nothing.
-            let quiet: Vec<Value> = done
-                .iter()
-                .filter(|e| e["change"]["changed"] == json!(false))
-                .map(|e| e["button"].clone())
-                .collect();
+            let (quiet, modifiers) = quiet_presses(&done);
             result["sequence"] = json!({
                 "requested": presses.len(),
                 "pressed": done.len(),
                 "gap_ms": gap,
                 "per_press": per_press,
                 "unchanged": if per_press { json!(quiet) } else { Value::Null },
+                "modifiers": if modifiers.is_empty() { Value::Null } else { json!(modifiers) },
                 "unchanged_hint": if per_press && !quiet.is_empty() {
                     json!("these presses moved nothing on the screen. That is not by itself a \
                            failure - a toggle already in that state, a key with no legend to \
@@ -4765,8 +4932,11 @@ async fn do_click(state: &SharedState, mut req: ClickReq) -> Result<(Option<Vec<
                          the screen before doing anything else.",
             });
         } else {
+            // "button" is the name everywhere - in the request, in a sequence's records, in
+            // /buttons. It once meant the mouse button here, and only here.
+            result["button"] = last["button"].clone();
             result["clicked"] = last["button"].clone();
-            result["button"] = json!(presses[0].button.as_str());
+            result["click_button"] = json!(presses[0].button.as_str());
             result["double"] = json!(presses[0].double);
             // Lifted out of the per-press record, which only a sequence publishes. A single
             // press is the commonest call and the one where a key that needs a longer hold
@@ -4878,22 +5048,14 @@ pub async fn key(State(state): State<SharedState>, body: Bytes) -> Result<Respon
 
         // Same rule as a click: measuring is comparing pictures, so it needs one to compare.
         let measure = req.measure.unwrap_or(false);
-        let region_name =
-            req.capture.clone().or_else(|| measure.then(|| "@client".to_string()));
-        let pad = req.pad.unwrap_or(0).max(0);
-        let crop = match &region_name {
-            None => None,
-            Some(r) => Some(Targets::scale_rect(
-                Targets::pad_rect(
-                    t.region(r, info.client_size, &offsets).map_err(|e| {
-                        ApiError::bad_request(e)
-                            .with_detail(json!({"known_regions": t.region_names()}))
-                    })?,
-                    pad,
-                ),
-                scale,
-            )),
-        };
+        let (crop, region_name) = Look {
+            region: req.capture.clone(),
+            rect: req.capture_rect,
+            pad: req.pad.unwrap_or(0).max(0),
+            needs_one: measure,
+        }
+        .resolve(&t, info.client_size, &offsets, scale)?
+        .unzip();
         let before = match crop {
             Some(rect) => shoot(&info, rect, req.scale, req.max_width).ok().map(|(f, _, _)| f),
             None => None,
@@ -5185,11 +5347,21 @@ const NO_MENU: &str = "this window has no menu bar that Windows can see. Either 
                        and a drawn menu is pixels, so it is reached by clicking like anything \
                        else: GET /controls or a capture to find it, then a saved button.";
 
+/// Why the states in a menu read may not be current.
+const STALE_BUSY: &str = "'enabled' and 'checked' may be stale: the application did not answer \
+                          the request to update them within half a second, so they are what \
+                          the menu held - for many applications, the defaults it was loaded \
+                          with. Read again once it is idle.";
+const STALE_ASKED: &str = "'enabled' and 'checked' are what the menu held, not refreshed \
+                           (refresh=false). Many applications set them only as a menu opens, \
+                           so these may be the defaults it was loaded with.";
+
 /// Why a submenu can come back empty, shared by both menu endpoints.
 const EMPTY_SUBMENU: &str = "these submenus came back with nothing in them. That is usually a \
                              menu the application fills at the moment it is opened - a recent \
-                             files list, or a whole File menu built on demand. Reading never \
-                             opens a menu, so those items do not exist from here and cannot be \
+                             files list, or a whole File menu built on demand. The \
+                             application was asked to build them as it would on opening, and \
+                             did not, so those items do not exist from here and cannot be \
                              invoked by path. Reach them by clicking: open the menu with a \
                              click, capture, and click the item.";
 
@@ -5202,10 +5374,12 @@ pub async fn menus(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
     let prof = pick(&state, q_get(&q, "profile").as_deref(), q_get(&q, "program").as_deref(), Params::Query)?;
+    let refresh = q_bool(&q, "refresh")?.unwrap_or(true);
     tokio::task::spawn_blocking(move || {
         let t = prof.targets();
         let info = find_window(&t)?;
-        let items = crate::win::menu::read(info.handle);
+        let menu = crate::win::menu::read(info.handle, refresh);
+        let items = menu.items;
         let invocable = items.iter().filter(|m| !m.submenu && m.enabled).count();
         let mut out = json!({
             "profile": prof.name,
@@ -5213,17 +5387,24 @@ pub async fn menus(
             "menus": items.iter().map(|m| menu_item_json(m, &t.confirm_menus)).collect::<Vec<_>>(),
             "count": items.len(),
             "invocable": invocable,
+            "state_refreshed": menu.refreshed,
             "allow_menus": state.config.allow_menus,
         });
         if items.is_empty() {
             out["note"] = json!(NO_MENU);
+        } else if menu.refreshed {
+            out["note"] = json!(
+                "'path' is what POST /menu takes. A 'submenu' entry is a place, not an action - \
+                 its children are the actions. 'enabled' and 'checked' are current: the \
+                 application was asked to update them, as it is when a person opens each menu, \
+                 and nothing was opened."
+            );
         } else {
             out["note"] = json!(
                 "'path' is what POST /menu takes. A 'submenu' entry is a place, not an action - \
-                 its children are the actions. 'enabled' is the state the menu carries right \
-                 now; an application that greys items out only as the menu opens will report \
-                 everything enabled here, because nothing opens it."
+                 its children are the actions."
             );
+            out["state_note"] = json!(if refresh { STALE_BUSY } else { STALE_ASKED });
         }
         if !t.confirm_menus.is_empty() {
             out["confirm_menus"] = json!(t.confirm_menus);
@@ -5254,6 +5435,11 @@ pub struct MenuReq {
     pub confirm: bool,
     #[serde(default)]
     pub capture: Option<String>,
+    /// Instead of `capture`: a rectangle to capture, in live client coordinates - the ones
+    /// `/capture`'s `rect` takes, so a rectangle read off one picture goes straight into the
+    /// next request. What a press changes is often somewhere nobody named.
+    #[serde(default)]
+    pub capture_rect: Option<Rect>,
     #[serde(default)]
     pub pad: Option<i32>,
     #[serde(default)]
@@ -5305,7 +5491,10 @@ fn menu_now(
 ) -> Result<Response, ApiError> {
     let t = prof.targets();
     let info = find_window(&t)?;
-    let items = crate::win::menu::read(info.handle);
+    // Always refreshed: whether the item is enabled is checked below, and that is only worth
+    // checking against the state the application would show.
+    let menu = crate::win::menu::read(info.handle, true);
+    let items = menu.items;
     if items.is_empty() {
         return Err(ApiError::conflict("this window has no menu bar")
             .with_detail(json!({"note": NO_MENU})));
@@ -5343,16 +5532,21 @@ fn menu_now(
             })));
     }
     if !item.enabled {
-        // Posting the command anyway might work, and that is the problem: an application that
-        // decides validity when the menu opens never gets to decide here. Refusing is the only
-        // answer that cannot act on something the application had said no to.
+        // Posting the command anyway might work, and that is the problem: WM_COMMAND is past
+        // the point where the application decides. Refusing is the only answer that cannot act
+        // on something the application had said no to.
         return Err(ApiError::conflict(format!("the menu item '{path}' is disabled"))
             .with_detail(json!({
                 "path": item.path,
-                "note": "the menu itself reports it greyed out. Posting the command anyway may \
-                         still be acted on, because the application never sees the menu open - \
-                         which is exactly why this is refused rather than attempted. Put the \
-                         application into the mode where the item is available and ask again.",
+                "state_refreshed": menu.refreshed,
+                "note": if menu.refreshed {
+                    "the application, asked for the current state as it is when a person opens \
+                     the menu, reports it greyed out. Posting the command anyway may still be \
+                     acted on, which is exactly why this is refused rather than attempted. Put \
+                     the application into the mode where the item is available and ask again."
+                } else {
+                    STALE_BUSY
+                },
             })));
     }
     let Some(id) = item.id else {
@@ -5370,17 +5564,21 @@ fn menu_now(
         .with_detail(json!({"path": item.path, "confirm_by": g})));
     }
 
-    let pad = req.pad.unwrap_or(0).max(0);
-    let offsets = anchor_offsets(&t, &info)?;
-    let crop = match &req.capture {
-        None => None,
-        Some(r) => Some(Targets::pad_rect(
-            t.region(r, info.client_size, &offsets).map_err(|e| {
-                ApiError::bad_request(e).with_detail(json!({"known_regions": t.region_names()}))
-            })?,
-            pad,
-        )),
+    // A menu is found by its path, not by coordinates, so the anchors matter only to a picture
+    // of a named region. Resolving them regardless refused a menu command on a window whose
+    // anchors had gone stale - which is when a menu is most likely the way out.
+    let offsets = match req.capture.as_deref().map(str::trim) {
+        Some(r) if !r.is_empty() && r != "@client" => anchor_offsets(&t, &info)?,
+        _ => AnchorOffsets::new(),
     };
+    let (crop, region_name) = Look {
+        region: req.capture.clone(),
+        rect: req.capture_rect,
+        pad: req.pad.unwrap_or(0).max(0),
+        needs_one: false,
+    }
+    .resolve(&t, info.client_size, &offsets, (1.0, 1.0))?
+    .unzip();
     let before = crop.and_then(|rect| shoot(&info, rect, req.scale, req.max_width).ok().map(|(f, _, _)| f));
 
     window::focus(info.handle).map_err(ApiError::conflict)?;
@@ -5401,13 +5599,14 @@ fn menu_now(
         "id": id,
         "settle_ms": settle,
         "window": window_json(&info),
+        "state_refreshed": menu.refreshed,
         "note": "the command was POSTED, not sent — a menu item that opens a modal dialog would \
                  otherwise hold this request open for as long as the dialog is on screen. So \
                  this says the application received it, not that it did anything. Capture to \
                  see. A dialog that opened is a NEW window, and this profile points at the old \
                  one: GET /windows to find it.",
     });
-    if let (Some(rect), Some(region)) = (crop, req.capture.clone()) {
+    if let (Some(rect), Some(region)) = (crop, region_name) {
         let (frame, method, black) = shoot(&info, rect, req.scale, req.max_width)?;
         let (_png, mut meta) =
             deliver(st, &frame, method, black, &format!("{}_{}", prof.name, safe_label(&region)), true)?;
@@ -5437,6 +5636,19 @@ pub struct RefitReq {
     pub force: Option<bool>,
 }
 
+/// Where an anchor's control is now, and the text it carries there.
+struct AnchorNow {
+    rect: Rect,
+    /// What the anchor is saved with. Only a rectangle named in the request can change it: the
+    /// control found there may caption itself differently now - "NC DISPLAY(1080 x 809)"
+    /// becomes "NC DISPLAY(1104 x 818)" when the size in it changes - and an anchor saved with
+    /// the old caption would be found by nothing on the next request.
+    text: String,
+    how: &'static str,
+}
+
+type Controls<'a> = &'a [crate::win::window::ControlInfo];
+
 /// Where an anchor's control is on the window right now.
 ///
 /// The ordinary match is text **and** size, and size is what identifies one control among
@@ -5452,31 +5664,61 @@ pub struct RefitReq {
 fn find_anchor_now(
     name: &str,
     a: &AnchorDef,
-    controls: &[crate::win::window::ControlInfo],
+    controls: Controls,
     told: Option<&Rect>,
-) -> Result<(Rect, &'static str), ApiError> {
+) -> Result<AnchorNow, ApiError> {
     if let Some(r) = told {
-        return Ok((*r, "named in the request"));
+        return anchor_at(name, a, controls, *r);
     }
+    let found = |rect: Rect, how| Ok(AnchorNow { rect, text: a.text.clone(), how });
     let same_text: Vec<&crate::win::window::ControlInfo> =
         controls.iter().filter(|c| c.text.trim() == a.text.trim()).collect();
 
     if let Some(c) = same_text.iter().find(|c| (c.rect[2], c.rect[3]) == (a.rect[2], a.rect[3])) {
-        return Ok((c.rect, "text and size still match — this anchor did not change"));
+        return found(c.rect, "text and size still match — this anchor did not change");
     }
     match same_text.as_slice() {
-        [c] => Ok((c.rect, "the only control carrying that text")),
-        [] => Err(ApiError::not_found(format!(
-            "anchor '{name}': no control on this window carries the text {:?}",
-            a.text
-        ))
-        .with_detail(json!({
-            "anchor": name,
-            "text": a.text,
-            "note": "the anchor cannot be re-seated because it is not there at all. This is a \
+        [c] => found(c.rect, "the only control carrying that text"),
+        [] => {
+            // A caption that carries a number changes with it. What stays is the part before
+            // the number, so those are offered - not taken: the same words are a hint that it
+            // is the same control, not proof.
+            let stem = text_stem(&a.text);
+            let similar: Vec<Value> = controls
+                .iter()
+                .filter(|c| stem.chars().count() >= 2 && text_stem(&c.text) == stem)
+                .take(10)
+                .map(|c| json!({"text": c.text, "rect": c.rect}))
+                .collect();
+            let (hint, note) = if similar.is_empty() {
+                (
+                    Value::Null,
+                    "the anchor cannot be re-seated because it is not there at all. This is a \
                      different application or a different build, not a resized one. GET \
                      /controls lists what is present.",
-        }))),
+                )
+            } else {
+                (
+                    json!(format!("POST a body of {{\"anchors\": {{\"{name}\": [x,y,w,h]}}}}")),
+                    "nothing carries that text, but the controls in 'similar' match it up to \
+                     the first digit or bracket. A caption that includes a size or a count - \
+                     \"NC DISPLAY(1080 x 809)\" - changes whenever that does. If one of them is \
+                     this anchor's control, name its rect in the request: the refit takes the \
+                     text from the control there and saves it with the anchor.",
+                )
+            };
+            Err(ApiError::not_found(format!(
+                "anchor '{name}': no control on this window carries the text {:?}",
+                a.text
+            ))
+            .with_detail(json!({
+                "anchor": name,
+                "text": a.text,
+                "similar": if similar.is_empty() { Value::Null } else { json!(similar) },
+                "hint": hint,
+                "note": note,
+            })))
+        }
         more => Err(ApiError::conflict(format!(
             "anchor '{name}': {} controls carry the text {:?} and none is still {}x{}, so which \
              one this anchor means cannot be worked out",
@@ -5497,6 +5739,93 @@ fn find_anchor_now(
             ),
         }))),
     }
+}
+
+/// The control whose rectangle is exactly `r`, as the anchor's new place and new text.
+///
+/// Taken on trust, a rectangle named in the request was saved as given with the OLD text - so
+/// a rectangle that was no control's, or a control whose caption had changed, produced an
+/// anchor the very next request could not find. The rectangle has to be a control's own, as
+/// `GET /controls` prints it, and the text comes from that control.
+fn anchor_at(name: &str, a: &AnchorDef, controls: Controls, r: Rect) -> Result<AnchorNow, ApiError> {
+    type Info = crate::win::window::ControlInfo;
+    let listed = |c: &&Info| json!({"text": c.text, "rect": c.rect});
+    let here: Vec<&Info> = controls.iter().filter(|c| c.rect == r && !c.text.trim().is_empty()).collect();
+    let same = here.iter().find(|c| c.text.trim() == a.text.trim());
+    let c: &Info = match (same, here.as_slice()) {
+        (Some(c), _) | (None, [c]) => c,
+        (None, []) => {
+            let off = |c: &Info| (0..4).map(|i| (c.rect[i] - r[i]).abs()).sum::<i32>();
+            let mut near: Vec<&Info> = controls.iter().filter(|c| !c.text.trim().is_empty()).collect();
+            near.sort_by_key(|c| off(c));
+            return Err(ApiError::not_found(format!(
+                "anchor '{name}': no control with a text sits at exactly [{},{},{},{}]",
+                r[0], r[1], r[2], r[3]
+            ))
+            .with_detail(json!({
+                "anchor": name,
+                "rect": r,
+                "nearest": near.iter().take(6).map(listed).collect::<Vec<_>>(),
+                "note": "a rectangle named for an anchor has to be one control's own, exactly as \
+                         GET /controls prints it. The anchor is saved as that control's text and \
+                         size, and a rectangle that is no control's would be an anchor nothing \
+                         finds again. 'nearest' are the closest controls that carry a text. \
+                         Nothing was changed.",
+            })));
+        }
+        (None, more) => {
+            return Err(ApiError::conflict(format!(
+                "anchor '{name}': {} controls sit at exactly [{},{},{},{}] and none carries the \
+                 text {:?}, so which one it is cannot be told",
+                more.len(),
+                r[0],
+                r[1],
+                r[2],
+                r[3],
+                a.text
+            ))
+            .with_detail(json!({
+                "anchor": name,
+                "here": more.iter().map(listed).collect::<Vec<_>>(),
+                "note": "controls nested inside one another can share a rectangle. Anchor a \
+                         container whose rectangle is its own. Nothing was changed.",
+            })));
+        }
+    };
+    // Saved, the anchor is found again by this text and this size - which has to be one control.
+    let twins = controls
+        .iter()
+        .filter(|o| o.text.trim() == c.text.trim() && (o.rect[2], o.rect[3]) == (r[2], r[3]))
+        .count();
+    if twins > 1 {
+        return Err(ApiError::conflict(format!(
+            "anchor '{name}': {twins} controls carry the text {:?} at {}x{}, so an anchor saved \
+             from this one would identify none of them",
+            c.text, r[2], r[3]
+        ))
+        .with_detail(json!({
+            "anchor": name,
+            "note": "anchor a different container, one whose text and size are unique in GET \
+                     /controls. Nothing was changed.",
+        })));
+    }
+    let text = c.text.trim().to_string();
+    let how = if text == a.text.trim() {
+        "named in the request"
+    } else {
+        "named in the request; the control there carries a different text, which is saved with it"
+    };
+    Ok(AnchorNow { rect: r, text, how })
+}
+
+/// The part of a caption before its first digit or bracket, lowercased — what stays the same
+/// when the caption carries a size or a count.
+fn text_stem(s: &str) -> String {
+    s.split(|c: char| c.is_ascii_digit() || matches!(c, '(' | '（' | '[' | ':'))
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase()
 }
 
 /// Whether the control found under a button is that button, as far as size can tell.
@@ -5590,22 +5919,26 @@ fn refit_now(
     // ── where each anchor is now ──
     let mut anchors_json = serde_json::Map::new();
     let mut moves: std::collections::HashMap<String, (Rect, Rect)> = Default::default();
+    let mut texts: std::collections::HashMap<String, String> = Default::default();
     for (name, a) in &t.anchors {
         // The saved rect is in the profile's own coordinates; the control's is in live pixels.
         let was = Targets::scale_rect(a.rect, coord_scale);
-        let (now, how) = find_anchor_now(name, a, &list.items, req.anchors.get(name))?;
-        anchors_json.insert(
-            name.clone(),
-            json!({
-                "text": a.text,
-                "was": was,
-                "now": now,
-                "moved": [now[0] - was[0], now[1] - was[1]],
-                "resized": [now[2] - was[2], now[3] - was[3]],
-                "matched_by": how,
-            }),
-        );
+        let found = find_anchor_now(name, a, &list.items, req.anchors.get(name))?;
+        let now = found.rect;
+        let mut entry = json!({
+            "text": a.text,
+            "was": was,
+            "now": now,
+            "moved": [now[0] - was[0], now[1] - was[1]],
+            "resized": [now[2] - was[2], now[3] - was[3]],
+            "matched_by": found.how,
+        });
+        if found.text != a.text {
+            entry["text_now"] = json!(found.text);
+        }
+        anchors_json.insert(name.clone(), entry);
         moves.insert(name.clone(), (was, now));
+        texts.insert(name.clone(), found.text);
     }
 
     // ── move everything that belongs to one ──
@@ -5650,6 +5983,9 @@ fn refit_now(
     for (name, a) in &mut fresh.anchors {
         if let Some((_, now)) = moves.get(name) {
             a.rect = *now;
+        }
+        if let Some(text) = texts.remove(name) {
+            a.text = text;
         }
     }
     // Everything above is now in live pixels, so this is the size they were measured at. Left
@@ -6010,6 +6346,7 @@ mod tests {
             },
         );
         let mut frame = crate::captures::Frame {
+            scale_note: None,
             image: image::RgbaImage::from_pixel(200, 200, image::Rgba([9, 9, 9, 255])),
             source_rect: [0, 0, 200, 200],
             scale: 1.0,
@@ -6467,6 +6804,7 @@ mod tests {
     /// A flat frame at 1:1, for comparing against another one.
     fn frame_of(w: u32, h: u32, grey: u8) -> Frame {
         Frame {
+            scale_note: None,
             image: image::RgbaImage::from_pixel(w, h, image::Rgba([grey, grey, grey, 255])),
             source_rect: [0, 0, w as i32, h as i32],
             scale: 1.0,
@@ -6878,6 +7216,133 @@ mod tests {
         let msg = e.to_string();
         assert!(msg.contains("keys"), "names what was wrong: {msg}");
         assert!(msg.contains("chord"), "names what to use instead: {msg}");
+    }
+
+    /// The shift key enters nothing, so it always looked unchanged and sat on the list after
+    /// every shifted character. It is listed apart, by index; a real key that moved nothing
+    /// still shows.
+    #[test]
+    fn the_shift_key_is_not_reported_as_a_press_that_changed_nothing() {
+        let still = json!({"changed": false, "pixels": 0});
+        let moved = json!({"changed": true, "pixels": 40});
+        let done = vec![
+            json!({"index": 0, "button": "MDI_SHIFT", "modifier": true, "change": still}),
+            json!({"index": 1, "button": "MDI_F", "change": moved}),
+            json!({"index": 2, "button": "CURSOR_RIGHT", "change": still}),
+            json!({"index": 3, "button": "MDI_SHIFT", "modifier": true, "change": moved}),
+            json!({"index": 4, "button": "MDI_X"}),
+        ];
+        let (quiet, modifiers) = quiet_presses(&done);
+        assert_eq!(quiet, vec![json!("CURSOR_RIGHT")]);
+        assert_eq!(modifiers, vec![json!(0), json!(3)], "every shift press, changed or not");
+    }
+
+    /// `capture_rect` is the unnamed twin of `capture`: taken as given, padded, and never
+    /// together with a name.
+    #[test]
+    fn a_capture_rect_is_taken_as_given_and_not_alongside_a_name() {
+        let t: Targets = serde_json::from_str(
+            r#"{"window":{"title":"x"},"regions":{"hmi":{"rect":[10,10,100,50]}}}"#,
+        )
+        .expect("parses");
+        let none = AnchorOffsets::new();
+        let look = |region: Option<&str>, rect: Option<Rect>, needs_one: bool| Look {
+            region: region.map(str::to_string),
+            rect,
+            pad: 5,
+            needs_one,
+        }
+        .resolve(&t, (800, 600), &none, (2.0, 2.0));
+
+        // Live coordinates: padded, not scaled - it came off a picture of this window.
+        let got = look(None, Some([100, 200, 30, 20]), false).expect("fine").expect("a picture");
+        assert_eq!(got, ([95, 195, 40, 30], "rect".to_string()));
+        // A region is the profile's, so it is scaled.
+        let got = look(Some("hmi"), None, false).expect("fine").expect("a picture");
+        assert_eq!(got.0, [10, 10, 220, 120]);
+        assert_eq!(got.1, "hmi");
+
+        let Err(e) = look(Some("hmi"), Some([0, 0, 5, 5]), false) else { panic!("both named") };
+        assert!(e.message.contains("send one"), "{}", e.message);
+        let Err(e) = look(None, Some([0, 0, 0, 5]), true) else { panic!("an empty rect") };
+        assert!(e.message.contains("positive"), "{}", e.message);
+
+        // Nothing named: no picture, unless the request measures - then the whole window.
+        assert!(look(None, None, false).expect("fine").is_none());
+        assert!(look(Some("  "), None, false).expect("fine").is_none(), "a blank name is none");
+        assert_eq!(look(None, None, true).expect("fine").expect("watched").1, "@client");
+
+        // And it arrives from a body and from a query string.
+        let r: ClickReq =
+            serde_json::from_str(r#"{"button":"A","capture_rect":[1,2,3,4]}"#).expect("body");
+        assert_eq!(r.capture_rect, Some([1, 2, 3, 4]));
+        let mut q = HashMap::new();
+        q.insert("capture_rect".to_string(), "1, 2,3,4".to_string());
+        assert_eq!(ClickReq::from_query(&q).expect("query").capture_rect, Some([1, 2, 3, 4]));
+        let r: KeyReq = serde_json::from_str(r#"{"key":"k","capture_rect":[1,2,3,4]}"#).expect("key");
+        assert_eq!(r.capture_rect, Some([1, 2, 3, 4]));
+        let r: MenuReq = serde_json::from_str(r#"{"path":"a/b","capture_rect":[1,2,3,4]}"#).expect("menu");
+        assert_eq!(r.capture_rect, Some([1, 2, 3, 4]));
+    }
+
+    /// Taken on trust, a rectangle named for an anchor was saved with the old caption, so an
+    /// anchor on "NC DISPLAY(1080 x 809)" re-seated at 1104x818 was found by nothing afterwards.
+    /// The rectangle has to be a control's own, and that control's caption is what is saved.
+    #[test]
+    fn a_rectangle_named_for_an_anchor_must_be_a_control_and_brings_its_caption() {
+        let a: AnchorDef =
+            serde_json::from_str(r#"{"text":"NC DISPLAY(1080 x 809)","rect":[0,0,1080,809]}"#).expect("anchor");
+        let ctl = |text: &str, rect: Rect| crate::win::window::ControlInfo {
+            class: String::new(), text: text.into(), id: 0, rect, depth: 2, visible: true,
+        };
+        let live = [
+            ctl("", [2, 2, 1104, 818]), // a frame sharing the rectangle, with no caption
+            ctl("NC DISPLAY(1104 x 818)", [2, 2, 1104, 818]),
+            ctl("OPERATION PANEL", [0, 830, 300, 200]),
+            ctl("KEY", [0, 0, 40, 40]),
+            ctl("KEY", [50, 0, 40, 40]),
+        ];
+
+        // Not named: nothing carries the old caption, so the similar one is offered, not taken.
+        let Err(e) = find_anchor_now("screen", &a, &live, None) else { panic!("nothing matches") };
+        assert_eq!(e.status, StatusCode::NOT_FOUND);
+        let d = e.detail.expect("detail");
+        assert_eq!(d["similar"][0]["text"], json!("NC DISPLAY(1104 x 818)"), "{d}");
+        assert!(d["hint"].as_str().expect("hint").contains("\"screen\""), "{d}");
+
+        // Named: the caption comes from the control, and the preview says so.
+        let got = find_anchor_now("screen", &a, &live, Some(&[2, 2, 1104, 818])).expect("a control");
+        assert_eq!(got.rect, [2, 2, 1104, 818]);
+        assert_eq!(got.text, "NC DISPLAY(1104 x 818)");
+        assert!(got.how.contains("different text"), "{}", got.how);
+
+        // A rectangle that is no control's is refused, with the nearest ones listed.
+        let Err(e) = find_anchor_now("screen", &a, &live, Some(&[2, 2, 1100, 818])) else {
+            panic!("no control is exactly there")
+        };
+        assert!(e.message.contains("exactly [2,2,1100,818]"), "{}", e.message);
+        let d = e.detail.expect("detail");
+        assert_eq!(d["nearest"][0]["text"], json!("NC DISPLAY(1104 x 818)"), "{d}");
+
+        // Saved from a control whose caption and size are not unique, it would identify none.
+        let key: AnchorDef = serde_json::from_str(r#"{"text":"KEY","rect":[0,0,30,30]}"#).expect("anchor");
+        let Err(e) = find_anchor_now("k", &key, &live, Some(&[0, 0, 40, 40])) else { panic!("two KEYs") };
+        assert!(e.message.contains("identify none"), "{}", e.message);
+
+        // Unchanged caption: said plainly.
+        let same: AnchorDef =
+            serde_json::from_str(r#"{"text":"OPERATION PANEL","rect":[0,800,280,200]}"#).expect("anchor");
+        let got = find_anchor_now("p", &same, &live, Some(&[0, 830, 300, 200])).expect("a control");
+        assert_eq!((got.text.as_str(), got.how), ("OPERATION PANEL", "named in the request"));
+    }
+
+    #[test]
+    fn a_caption_stem_is_what_stays_when_a_number_in_it_changes() {
+        assert_eq!(text_stem("NC DISPLAY(1080 x 809)"), "nc display");
+        assert_eq!(text_stem("NC Display (1104x818)"), "nc display");
+        assert_eq!(text_stem("Axis 1"), "axis");
+        assert_eq!(text_stem("12:30"), "");
+        assert_eq!(text_stem("OPERATION PANEL"), "operation panel");
     }
 
     /// A sequence and a single press are mutually exclusive, and the body shape parses.

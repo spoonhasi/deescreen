@@ -533,6 +533,10 @@ impl Targets {
         controls: &[crate::win::window::ControlInfo],
     ) -> Result<std::collections::HashMap<String, (i32, i32)>, String> {
         let mut out = std::collections::HashMap::new();
+        // Every anchor is looked at, and every failure reported together. Stopping at the
+        // first one turned "all four anchors are stale" into four round trips, one per fix,
+        // each revealing only the next.
+        let mut failed: Vec<String> = Vec::new();
         for (name, a) in &self.anchors {
             let want = (a.rect[2], a.rect[3]);
             let found: Vec<&crate::win::window::ControlInfo> = controls
@@ -544,28 +548,45 @@ impl Targets {
                     out.insert(name.clone(), (c.rect[0] - a.rect[0], c.rect[1] - a.rect[1]));
                 }
                 [] => {
-                    let same_text = controls.iter().filter(|c| c.text.trim() == a.text.trim()).count();
-                    return Err(format!(
-                        "anchor '{name}' was not found: no control with text {:?} and size {}x{}. \
-                         {} control(s) carry that text. Either the application changed, or the \
-                         anchor's own rect is stale — it records the size as well as the place, \
-                         and the size is what identifies it.",
-                        a.text, want.0, want.1, same_text
-                    ));
+                    let sizes: Vec<String> = controls
+                        .iter()
+                        .filter(|c| c.text.trim() == a.text.trim())
+                        .map(|c| format!("{}x{}", c.rect[2], c.rect[3]))
+                        .collect();
+                    failed.push(if sizes.is_empty() {
+                        format!("'{name}': no control carries the text {:?}", a.text)
+                    } else {
+                        format!(
+                            "'{name}': {:?} is there at {} but not at {}x{}",
+                            a.text,
+                            sizes.join(", "),
+                            want.0,
+                            want.1
+                        )
+                    });
                 }
-                more => {
-                    // Picking one would be a guess, and a wrong guess moves every coordinate
-                    // that belongs to this anchor. Refuse and say what would have to change.
-                    return Err(format!(
-                        "anchor '{name}' is ambiguous: {} controls have text {:?} AND size {}x{}. \
-                         Text and size together are supposed to identify one control. Anchor a \
-                         different container that is unique, or give this one a size that is.",
-                        more.len(), a.text, want.0, want.1
-                    ));
-                }
+                // Picking one would be a guess, and a wrong guess moves every coordinate that
+                // belongs to this anchor.
+                more => failed.push(format!(
+                    "'{name}': {} controls have text {:?} AND size {}x{}, so it identifies none",
+                    more.len(),
+                    a.text,
+                    want.0,
+                    want.1
+                )),
             }
         }
-        Ok(out)
+        if failed.is_empty() {
+            return Ok(out);
+        }
+        Err(format!(
+            "{} of {} anchors did not resolve - {}. An anchor records a size as well as a place, \
+             and the size is what identifies it: a different size means the application changed \
+             (POST /admin/profile/refit), a missing text means a different application or build.",
+            failed.len(),
+            self.anchors.len(),
+            failed.join("; ")
+        ))
     }
 
     /// The offset an element with this anchor value should be shifted by.
@@ -1471,6 +1492,34 @@ mod tests {
         assert!(t.lint().is_empty());
     }
 
+    /// All four anchors failed on a live window and the reply named one. The next fix would
+    /// have named the next. Every failure comes back at once, each with what IS there.
+    #[test]
+    fn every_unresolved_anchor_is_reported_at_once() {
+        let doc = r#"{"window":{"title":"x"},
+            "anchors":{
+                "keys":{"text":"NC KEYBOARD","rect":[0,0,100,50]},
+                "main":{"text":"OPERATION PANEL","rect":[0,60,300,200]},
+                "screen":{"text":"NC DISPLAY","rect":[0,300,400,300]},
+                "sub":{"text":"SUB","rect":[500,0,50,50]}},
+            "buttons":{"A":{"rect":[1,1,5,5],"anchor":"keys"}}}"#;
+        let t: Targets = serde_json::from_str(doc).expect("parses");
+        let ctl = |text: &str, rect: [i32; 4]| crate::win::window::ControlInfo {
+            class: String::new(), text: text.into(), id: 0, rect, depth: 2, visible: true,
+        };
+        let live = [
+            ctl("NC KEYBOARD", [0, 0, 120, 50]),       // resized
+            ctl("OPERATION PANEL", [0, 60, 300, 200]), // fine
+            ctl("NC DISPLAY(1080 x 809)", [0, 300, 400, 300]), // text changed
+        ];
+        let e = t.anchor_offsets(&live).expect_err("three of four fail");
+        assert!(e.starts_with("3 of 4 anchors"), "{e}");
+        assert!(e.contains("'keys': \"NC KEYBOARD\" is there at 120x50 but not at 100x50"), "{e}");
+        assert!(e.contains("'screen': no control carries the text"), "{e}");
+        assert!(e.contains("'sub': no control carries the text"), "{e}");
+        assert!(!e.contains("'main'"), "a resolved anchor is not a failure: {e}");
+    }
+
     #[test]
     fn scale_policy_scales_coordinates() {
         let mut t = sample();
@@ -1711,8 +1760,8 @@ mod tests {
         let mut stale = t.clone();
         stale.anchors.get_mut("screen").expect("there").rect = [54, 92, 999, 818];
         let e = stale.anchor_offsets(&live).expect_err("not found");
-        assert!(e.contains("not found"), "{e}");
-        assert!(e.contains("1 control"), "says how many carry the text: {e}");
+        assert!(e.contains("did not resolve"), "{e}");
+        assert!(e.contains("is there at 1104x818 but not at 999x818"), "says what size IS there: {e}");
 
         // Ambiguous: two controls match text AND size, so refuse rather than pick one.
         let twins = vec![
@@ -1729,7 +1778,7 @@ mod tests {
             },
         );
         let e = only_sub.anchor_offsets(&twins).expect_err("ambiguous");
-        assert!(e.contains("ambiguous"), "{e}");
+        assert!(e.contains("2 controls have text") && e.contains("identifies none"), "{e}");
     }
 
     /// Declaring one anchor makes the whole profile answer for itself.

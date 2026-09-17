@@ -42,7 +42,12 @@ pub struct Frame {
     pub image: RgbaImage,
     /// The cropped region in client coordinates, before scaling.
     pub source_rect: Rect,
+    /// The scale actually applied.
     pub scale: f64,
+    /// Set when `scale` is not what was asked for because a ceiling reduced it - the reason,
+    /// for the reply. A reduced magnification is still a picture, but the caller has to know
+    /// it is not the one they sized their reading for.
+    pub scale_note: Option<String>,
 }
 
 impl Frame {
@@ -230,11 +235,34 @@ pub fn frame(shot: &Shot, rect: Rect, scale: Option<f64>, max_width: Option<u32>
             shot.width, shot.height
         ));
     }
+    // Past either magnification ceiling, the largest scale that fits is used and the reply
+    // says so - the same rule as settle_ms, hold_ms and max_width. Refusing sent the caller
+    // back to compute a factor the server could compute itself.
+    let requested = factor;
+    let mut scale_note: Option<String> = None;
     if factor > MAX_MAGNIFY {
-        return Err(format!("scale is capped at {MAX_MAGNIFY}x, got {factor}"));
+        scale_note = Some(format!("{MAX_MAGNIFY}x is the most this magnifies"));
+        factor = MAX_MAGNIFY;
+    }
+    let px_at = |f: f64| ((w as f64 * f).round() as u64) * ((h as f64 * f).round() as u64);
+    if factor > 1.0 && px_at(factor) > MAX_MAGNIFIED_PIXELS {
+        let (pre, over) = (factor, px_at(factor));
+        let mut f = (MAX_MAGNIFIED_PIXELS as f64 / (w as f64 * h as f64)).sqrt();
+        while f > 1.0 && px_at(f) > MAX_MAGNIFIED_PIXELS {
+            f -= 0.0005;
+        }
+        factor = f.max(1.0);
+        scale_note = Some(format!(
+            "a {w}x{h} crop at {:.2}x would be {:.2} megapixels, past the {} megapixel ceiling \
+             for a magnified image - crop tighter to magnify further",
+            pre,
+            over as f64 / 1_000_000.0,
+            MAX_MAGNIFIED_PIXELS / 1_000_000
+        ));
     }
     // max_width bounds the output width in **both directions**. Being able to cap
-    // magnification with it too means the caller never has to compute a scale factor.
+    // magnification with it too means the caller never has to compute a scale factor. It is
+    // the caller's own limit, so it reduces without a note.
     if let Some(mw) = max_width
         && mw > 0
     {
@@ -244,24 +272,15 @@ pub fn frame(shot: &Shot, rect: Rect, scale: Option<f64>, max_width: Option<u32>
     let nw = ((w as f64 * factor).round() as u32).max(1);
     let nh = ((h as f64 * factor).round() as u32).max(1);
     let out_px = (nw as u64) * (nh as u64);
-    if factor > 1.0 {
-        if out_px > MAX_MAGNIFIED_PIXELS {
-            return Err(format!(
-                "scale {factor} would produce a {nw}x{nh} image ({} megapixels); the cap while \
-                 magnifying is {} megapixels. Crop tighter, lower the scale, or set max_width.",
-                out_px / 1_000_000,
-                MAX_MAGNIFIED_PIXELS / 1_000_000
-            ));
-        }
-    } else if out_px > MAX_OUTPUT_PIXELS {
+    if factor <= 1.0 && out_px > MAX_OUTPUT_PIXELS {
         // Not reachable from any real window; here so the ceiling exists rather than being
         // assumed. The advice differs because nobody asked for a scale — the picture is this
         // big because the window is.
         return Err(format!(
-            "this is a {nw}x{nh} image ({} megapixels) at 1:1, past the {} megapixel ceiling. \
+            "this is a {nw}x{nh} image ({:.2} megapixels) at 1:1, past the {} megapixel ceiling. \
              Nothing was magnified - the window itself is that large. Ask for part of it with \
              region=NAME or rect=x,y,w,h, or set max_width.",
-            out_px / 1_000_000,
+            out_px as f64 / 1_000_000.0,
             MAX_OUTPUT_PIXELS / 1_000_000
         ));
     }
@@ -280,7 +299,12 @@ pub fn frame(shot: &Shot, rect: Rect, scale: Option<f64>, max_width: Option<u32>
         imageops::resize(&cropped, nw, nh, filter)
     };
 
-    Ok(Frame { image, source_rect: [x0 as i32, y0 as i32, w as i32, h as i32], scale: factor })
+    // A note is only worth sending if the scale really moved; rounding back to what was
+    // asked is not news.
+    let scale_note = scale_note.filter(|_| (factor - requested).abs() > 1e-9).map(|why| {
+        format!("scale {requested} was reduced to {factor:.3}: {why}")
+    });
+    Ok(Frame { image, source_rect: [x0 as i32, y0 as i32, w as i32, h as i32], scale: factor, scale_note })
 }
 
 /// A local timestamp for file names (`2026-08-12T14-05-33.482`).
@@ -405,13 +429,13 @@ mod tests {
         assert_eq!(f.width(), 1920);
 
         // Magnifying is where a request can conjure pixels out of nothing, so that ceiling
-        // stays where it was: a 1000x1000 crop at 8x would be 64 MP.
-        // Frame has no Debug, so unwrap the error by hand rather than derive one for a test.
-        let Err(e) = frame(&big, [0, 0, 1000, 1000], Some(8.0), None) else {
-            panic!("magnifying a 1000x1000 crop 8x is 64 megapixels and must be refused");
-        };
-        assert!(e.contains("magnifying"), "says which ceiling was hit: {e}");
-        assert!(e.contains("4 megapixels"), "and where it is: {e}");
+        // stays where it was: a 1000x1000 crop at 8x would be 64 MP. It is reduced to fit and
+        // the reason travels with the picture.
+        let f = frame(&big, [0, 0, 1000, 1000], Some(8.0), None).expect("reduced, not refused");
+        assert!(u64::from(f.width()) * u64::from(f.height()) <= MAX_MAGNIFIED_PIXELS);
+        assert!((f.scale - 2.0).abs() < 0.01, "sqrt(4 MP / 1 MP) = 2, got {}", f.scale);
+        let note = f.scale_note.expect("says why it is not 8x");
+        assert!(note.contains("64.00 megapixels") && note.contains("4 megapixel"), "{note}");
 
         // Under that ceiling a magnified crop still works.
         assert!(frame(&big, [0, 0, 700, 700], Some(2.0), None).is_ok());
@@ -506,13 +530,28 @@ mod tests {
         assert_eq!(f.map(10, 10), (0, 0));
         assert_eq!(f.map(15, 10), (20, 0));
 
-        // the scale ceiling
-        assert!(frame(&shot(100, 100, 0), [0, 0, 20, 10], Some(9.0), None).is_err());
-        // the output pixel ceiling — within 8x, but still too large a result is refused
-        let Err(e) = frame(&shot(4000, 4000, 0), [0, 0, 1500, 1500], Some(2.0), None) else {
-            panic!("too many output pixels must be refused");
-        };
-        assert!(e.contains("megapixels"), "{e}");
+        // the scale ceiling: 9x becomes 8x, and says so
+        let f = frame(&shot(100, 100, 0), [0, 0, 20, 10], Some(9.0), None).expect("reduced");
+        assert_eq!(f.scale, MAX_MAGNIFY);
+        assert!(f.scale_note.expect("noted").contains("8x is the most"));
+
+        // The output pixel ceiling: 1500x1500 at 2x is 9 MP. The live case read "4 megapixels;
+        // the cap is 4 megapixels" for 4.03 - a reduced picture with the real number now.
+        let f = frame(&shot(4000, 4000, 0), [0, 0, 1500, 1500], Some(2.0), None).expect("reduced");
+        assert!(u64::from(f.width()) * u64::from(f.height()) <= MAX_MAGNIFIED_PIXELS);
+        assert!(f.scale > 1.3 && f.scale < 1.34, "{}", f.scale);
+        assert!(f.scale_note.expect("noted").contains("9.00 megapixels"));
+
+        // Only just over: 1166x864 at 2x is 4.03 MP, which used to print as 4.
+        let f = frame(&shot(4000, 4000, 0), [0, 0, 1166, 864], Some(2.0), None).expect("reduced");
+        let note = f.scale_note.expect("noted");
+        assert!(note.contains("4.03 megapixels"), "{note}");
+        // The README quotes this reply, numbers and all.
+        assert!(note.starts_with("scale 2 was reduced to 1.992: a 1166x864 crop at 2.00x"), "{note}");
+
+        // Under every ceiling, nothing is said.
+        let f = frame(&shot(100, 100, 0), [0, 0, 20, 10], Some(4.0), None).expect("fine");
+        assert!(f.scale_note.is_none());
     }
 
     #[test]
@@ -538,7 +577,7 @@ mod tests {
         let mut img = f.image.clone();
         let p = img.get_pixel_mut(x, y);
         p.0 = [255, 0, 0, 255];
-        Frame { image: img, source_rect: f.source_rect, scale: f.scale }
+        Frame { image: img, source_rect: f.source_rect, scale: f.scale, scale_note: None }
     }
 
     #[test]
