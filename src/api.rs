@@ -625,7 +625,7 @@ fn resolve_program(state: &SharedState, program: &str) -> Result<std::sync::Arc<
     match choose(&seen) {
         Chosen::One(i) => Ok(members[i].clone()),
         Chosen::NoneOpen => Err(ApiError::not_found(format!(
-            "none of program '{program}''s profiles has its window open"
+            "none of the profiles in program '{program}' has its window open"
         ))
         .with_detail(json!({
             "profiles": report(&all),
@@ -649,7 +649,7 @@ fn resolve_program(state: &SharedState, program: &str) -> Result<std::sync::Arc<
                  one you mean with profile="
             };
             Err(ApiError::conflict(format!(
-                "{} of program '{program}''s profiles are open, so which one is meant cannot be \
+                "{} profiles in program '{program}' are open, so which one is meant cannot be \
                  decided",
                 ix.len()
             ))
@@ -3942,7 +3942,7 @@ TRAPS - these fail quietly or confusingly. Read once, save yourself an hour.
                    belongs to: use that one, or ask the person to open the project this
                    profile was made for. If the right project IS open, the window is
                    likely at another size - see CHOOSING THE MARK above.
-  409 program      "N of program P's profiles are open", or "only X accepts the open
+  409 program      "N profiles in program P are open", or "only X accepts the open
                    window, but it cannot show the window is its own". The server would not
                    pick a profile it could not prove. Two open: name the one you mean with
                    profile=. One unproven: that profile needs window.has. Do not answer it by
