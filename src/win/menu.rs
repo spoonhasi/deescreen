@@ -45,6 +45,13 @@ pub struct MenuItem {
     pub checked: bool,
     /// A submenu. Not invocable; its children are.
     pub submenu: bool,
+    /// A submenu that came back with nothing in it.
+    ///
+    /// Usually a menu the application fills at the moment it is opened — a recent-files list,
+    /// or a whole File menu built on demand. Reading never opens a menu, so those items do not
+    /// exist yet from here, and cannot be invoked by path. Flagged so that asking for one gets
+    /// that explanation instead of a list of names that look similar.
+    pub empty: bool,
 }
 
 /// Strip what belongs to the menu's presentation rather than to its name.
@@ -124,6 +131,7 @@ fn walk(menu: *mut core::ffi::c_void, prefix: &str, depth: u32, out: &mut Vec<Me
         let path = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
 
         let submenu = !info.hSubMenu.is_null();
+        let at = out.len();
         out.push(MenuItem {
             path: path.clone(),
             label,
@@ -134,9 +142,12 @@ fn walk(menu: *mut core::ffi::c_void, prefix: &str, depth: u32, out: &mut Vec<Me
             enabled: info.fState & (MFS_DISABLED | MFS_GRAYED) == 0,
             checked: info.fState & MFS_CHECKED != 0,
             submenu,
+            empty: false,
         });
         if submenu {
             walk(info.hSubMenu, &path, depth + 1, out);
+            // Nothing was added under it — see `MenuItem::empty`.
+            out[at].empty = out.len() == at + 1;
         }
     }
 }

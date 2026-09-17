@@ -1107,6 +1107,14 @@ window. `landed` only means *a* control is there; `worst_offset` is the number t
 because a point half a key off still lands — on the neighbour. More than a few pixels means the
 layout did not scale, it re-flowed, and this endpoint is the wrong tool for that application.
 
+`worst_offset` is taken over the `measured` buttons only — those that are their own control, of
+about their own size. A key **drawn inside** something larger (softkeys painted onto the CNC
+screen, keys on a panel bitmap) lands on the whole container, and its distance from the middle
+of a 640×480 screen is not an error. Those go under `inside_container` instead. Measured on
+NCGuide 0i: the 12 softkeys went there, and the other 130 keys came out 12px apart at worst —
+where counting the softkeys had reported 306px for a button that was placed correctly. Nothing
+here can check the ones inside a container; `GET /sheet.png` can, by eye.
+
 ```bash
 curl -s -X POST -H "X-Admin-Code: THECODE" ".../admin/profile/refit?profile=NAME&apply=true"
 ```
@@ -1186,6 +1194,11 @@ window: the profile still points at the old one, so `GET /windows` is how you fi
 An empty list is an answer. Plenty of applications have no menu Windows can see, and some draw
 their own (a ribbon, a WPF menu, a custom title bar). A drawn menu is pixels, and is reached by
 clicking like anything else.
+
+A submenu can also come back **empty** — `"empty": true`, and listed in `empty_submenus`. That is
+usually a menu the application fills at the moment it is opened; NCGuide's File menu is one.
+Nothing here ever opens a menu, so those items do not exist from this side, and asking for a path
+under one is refused with that reason rather than with a list of similar-looking names.
 
 ## Known traps — every one of them fails silently, without an error
 

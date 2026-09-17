@@ -3443,6 +3443,13 @@ TRAPS - these fail quietly or confusingly. Read once, save yourself an hour.
   More than a few pixels means the layout did not merely scale - it re-flowed - and this
   endpoint is not the answer for that application.
 
+  worst_offset is taken over "measured" buttons only - the ones that are their own control
+  of about their own size. A key DRAWN INSIDE something larger (softkeys painted onto the
+  CNC screen, keys on a panel bitmap) lands on the whole container, and the distance to the
+  middle of a 640x480 screen is not an error. Those are listed under "inside_container"
+  instead. On NCGuide 0i that is the 12 softkeys; the other 130 keys came out at 12px worst.
+  Nothing here can check the ones inside a container - look at them on GET /sheet.png.
+
   Then save it:
     curl -s -X POST -H "X-Admin-Code: THECODE" \
       "{base}/admin/profile/refit?profile=NAME&apply=true"
@@ -3502,6 +3509,12 @@ THE WINDOW'S MENU BAR - the one thing not written in the profile
   An empty list is an answer. Plenty of applications have no menu Windows can see, and some
   draw their own (a ribbon, a WPF menu, a custom title bar). A drawn menu is pixels, so it
   is reached by clicking like anything else.
+
+  A SUBMENU CAN COME BACK EMPTY, marked "empty": true and listed in "empty_submenus". That is
+  usually a menu the application fills at the moment it is opened - NCGuide's File menu is
+  one. Nothing here opens a menu, so its items do not exist from this side; asking for a
+  path under it is refused with that reason rather than a list of similar names. Reach
+  those items by clicking.
 
 HOW TO VERIFY WHAT YOU DID
   Prefer the application's own API over the screen wherever one exists. Use the screen
@@ -4578,6 +4591,9 @@ fn menu_item_json(m: &crate::win::menu::MenuItem, guarded: &[String]) -> Value {
         "submenu": m.submenu,
         "id": m.id,
     });
+    if m.empty {
+        v["empty"] = json!(true);
+    }
     if let Some(g) = crate::targets::menu_needs_confirm(&m.path, guarded) {
         v["confirm"] = json!(true);
         v["confirm_by"] = json!(g);
@@ -4590,6 +4606,14 @@ const NO_MENU: &str = "this window has no menu bar that Windows can see. Either 
                        or it draws its own (a ribbon, a WPF/WinUI menu, a custom title bar) - \
                        and a drawn menu is pixels, so it is reached by clicking like anything \
                        else: GET /controls or a capture to find it, then a saved button.";
+
+/// Why a submenu can come back empty, shared by both menu endpoints.
+const EMPTY_SUBMENU: &str = "these submenus came back with nothing in them. That is usually a \
+                             menu the application fills at the moment it is opened - a recent \
+                             files list, or a whole File menu built on demand. Reading never \
+                             opens a menu, so those items do not exist from here and cannot be \
+                             invoked by path. Reach them by clicking: open the menu with a \
+                             click, capture, and click the item.";
 
 /// **The window's menu bar** — paths, command IDs and state. Presses nothing.
 ///
@@ -4625,6 +4649,11 @@ pub async fn menus(
         }
         if !t.confirm_menus.is_empty() {
             out["confirm_menus"] = json!(t.confirm_menus);
+        }
+        let empty: Vec<&str> = items.iter().filter(|m| m.empty).map(|m| m.path.as_str()).collect();
+        if !empty.is_empty() {
+            out["empty_submenus"] = json!(empty);
+            out["empty_note"] = json!(EMPTY_SUBMENU);
         }
         Ok(json_ok(out))
     })
@@ -4703,6 +4732,17 @@ fn menu_now(
     }
 
     let wanted = path.trim().trim_matches('/');
+    // Asked for something under a submenu that came back empty. "No such item, did you mean"
+    // would send the caller hunting for a typo when the item is simply not visible from here.
+    if let Some(parent) = items.iter().find(|m| {
+        m.empty && wanted.to_ascii_lowercase().starts_with(&format!("{}/", m.path.to_ascii_lowercase()))
+    }) {
+        return Err(ApiError::conflict(format!(
+            "'{}' has no items this endpoint can see, so '{path}' cannot be reached by path",
+            parent.path
+        ))
+        .with_detail(json!({"submenu": parent.path, "note": EMPTY_SUBMENU})));
+    }
     let Some(item) = items.iter().find(|m| m.path.eq_ignore_ascii_case(wanted)) else {
         return Err(ApiError::not_found(format!("no menu item at '{path}'")).with_detail(json!({
             "menu": near_names(wanted, items.iter().map(|m| m.path.clone()), "GET /menus"),
@@ -4879,6 +4919,28 @@ fn find_anchor_now(
     }
 }
 
+/// Whether the control found under a button is that button, as far as size can tell.
+///
+/// A key that is its own Win32 control comes back at about its own size. A key **drawn inside**
+/// something larger — softkeys painted onto a CNC screen, keys on a panel bitmap — comes back as
+/// the whole container, and the distance between their centres is the distance to the middle
+/// of the container, which says nothing about whether the key is where the profile thinks.
+///
+/// Measured on NCGuide 0i: 130 of 142 buttons were their own control, the worst 12px apart.
+/// The other 12 were softkeys inside a 640x480 screen, reported 213-306px "off", and every one
+/// of them was correctly placed.
+///
+/// Four times the area either way. A rectangle drawn by hand around a key is rarely the
+/// control's exact size — one measured at half — while a container is two orders of magnitude
+/// larger, so the band has room on both sides. Same principle as [`aim_json`], which refuses to
+/// conclude anything from a control of a different size; this is the tolerant version of it,
+/// because here the rectangle was drawn rather than copied.
+fn same_thing(button: Rect, control: Rect) -> bool {
+    let area = |r: Rect| (r[2].max(1) as i64) * (r[3].max(1) as i64);
+    let (a, b) = (area(button), area(control));
+    b <= a * 4 && a <= b * 4
+}
+
 /// **Re-seat a profile onto the window as it is now**, when a container changed size.
 ///
 /// `POST /admin/profile/refit?profile=NAME` — a proposal by default, saved only with
@@ -5017,6 +5079,9 @@ fn refit_now(
     // ── check it against the window ──
     let mut landed = 0usize;
     let mut failed: Vec<Value> = Vec::new();
+    // Landed, but inside something much larger than the key: there is nothing to measure
+    // against, so these are counted and named rather than folded into the offset.
+    let mut inside: Vec<String> = Vec::new();
     let mut worst: Option<(String, i32, Value)> = None;
     for (name, b) in &fresh.buttons {
         if !moves.contains_key(&b.anchor) {
@@ -5026,6 +5091,10 @@ fn refit_now(
         match window::control_at(info.handle, px, py) {
             Some(h) if !h.is_window_itself => {
                 landed += 1;
+                if !same_thing(b.rect, h.rect) {
+                    inside.push(name.clone());
+                    continue;
+                }
                 // How far the new rectangle sits from the control it landed on. A perfect
                 // refit puts them on top of each other; half a key's width means the point is
                 // inside the NEIGHBOUR, which still "lands" and is still wrong.
@@ -5065,12 +5134,23 @@ fn refit_now(
             "checked": checked,
             "landed": landed,
             "failed": failed,
+            "measured": landed - inside.len(),
             "worst_offset": worst.as_ref().map(|(_, _, v)| v.clone()),
+            "inside_container": {
+                "count": inside.len(),
+                "buttons": inside,
+            },
             "note": "each moved button's new click point was looked up on the live window. \
-                     'landed' only means a control is there — 'worst_offset' is the one to \
-                     read, because a point half a key off still lands, on the NEIGHBOUR. \
-                     Anything more than a few pixels means the layout did not merely scale, \
-                     and the refit is not the answer for this application.",
+                     'landed' only means a control is there. 'worst_offset' is the one to read, \
+                     because a point half a key off still lands, on the NEIGHBOUR - and it is \
+                     taken only over the 'measured' buttons, the ones that are their own control \
+                     of about their own size. Those in 'inside_container' are drawn inside \
+                     something much larger (softkeys painted onto a screen, keys on a panel \
+                     bitmap): they landed, but the distance to the middle of a container says \
+                     nothing, so they are left out of the offset rather than dragging it to \
+                     hundreds of pixels. Check those by eye with GET /sheet.png. A worst_offset \
+                     of more than a few pixels means the layout did not merely scale, and \
+                     refit is not the answer for this application.",
         },
     });
     if !fixed.is_empty() {
@@ -5867,6 +5947,22 @@ mod tests {
         assert_eq!(a["name"], json!("screen"));
         assert_eq!(a["text"], json!("NC DISPLAY"));
         assert_eq!(a["rect"], json!([10, 10, 100, 100]));
+    }
+
+    /// The numbers from the live NCGuide 0i window. A softkey painted onto the CNC screen
+    /// comes back as the screen, and treating that as the key reported a correctly placed
+    /// button as 306px off — which the manual then told the reader meant refit was useless.
+    #[test]
+    fn a_key_drawn_inside_a_container_is_not_measured_against_it() {
+        // SOFTKEY_MENU_LEFT, and the 640x480 screen control under its centre.
+        assert!(!same_thing([18, 469, 22, 45], [15, 38, 640, 480]));
+        // A key that is its own control, drawn by hand at twice the control's area.
+        assert!(same_thing([100, 100, 60, 60], [110, 110, 42, 42]));
+        // Exactly the same size is the plain case.
+        assert!(same_thing([0, 0, 47, 50], [0, 0, 47, 50]));
+        // And the other direction: a hand-drawn rectangle far larger than the control it
+        // covers is not that control either.
+        assert!(!same_thing([0, 0, 400, 400], [0, 0, 40, 40]));
     }
 
     /// The sentence a refusal carries has to name the place the caller is actually standing in.
