@@ -1672,7 +1672,11 @@ pub async fn health(State(state): State<SharedState>) -> Response {
                             }
                             Err(e) => {
                                 problems.push(format!("profile '{name}': {e}"));
-                                json!({"resolved": false, "error": e})
+                                let mut v = json!({"resolved": false, "error": e});
+                                if let Some(similar) = anchor_similar(&t, &found.items) {
+                                    v["similar"] = similar;
+                                }
+                                v
                             }
                         };
                     }
@@ -2665,7 +2669,7 @@ fn anchor_offsets(t: &Targets, info: &crate::win::window::WindowInfo) -> Result<
     }
     let found = crate::win::window::enumerate_controls_all(info.handle);
     t.anchor_offsets(&found.items).map_err(|e| {
-        ApiError::new(StatusCode::CONFLICT, e).with_detail(json!({
+        let mut detail = json!({
             "why": "this profile's coordinates are recorded relative to a control, and that \
                    control could not be identified on the window as it is now. Using the saved \
                    numbers uncorrected is what the anchor exists to prevent, so nothing was \
@@ -2674,11 +2678,34 @@ fn anchor_offsets(t: &Targets, info: &crate::win::window::WindowInfo) -> Result<
                      anchor's rect if the application changed, or anchor a container whose text \
                      and size are unique.",
             "controls_seen": found.items.len(),
-        }))
+        });
+        if let Some(similar) = anchor_similar(t, &found.items) {
+            detail["similar"] = similar;
+        }
+        ApiError::new(StatusCode::CONFLICT, e).with_detail(detail)
     })
 }
 
 type AnchorOffsets = std::collections::HashMap<String, (i32, i32)>;
+
+/// `{anchor: [{text, rect}]}` for each anchor whose caption no control carries and that has
+/// similar ones, or `None`. The same candidates the error sentence names, as data: a caller
+/// that re-seats anchors from a program should not have to take a sentence apart for them.
+fn anchor_similar(t: &Targets, controls: &[crate::win::window::ControlInfo]) -> Option<Value> {
+    let map: serde_json::Map<String, Value> = t
+        .anchors
+        .iter()
+        .filter(|(_, a)| !controls.iter().any(|c| c.text.trim() == a.text.trim()))
+        .filter_map(|(name, a)| {
+            let like = crate::targets::similar_captions(&a.text, controls);
+            (!like.is_empty()).then(|| {
+                let like: Vec<Value> = like.iter().map(|c| json!({"text": c.text, "rect": c.rect})).collect();
+                (name.clone(), json!(like))
+            })
+        })
+        .collect();
+    (!map.is_empty()).then_some(Value::Object(map))
+}
 
 /// What a request asked to look at once its input is in.
 struct Look {
@@ -4249,9 +4276,14 @@ TRAPS - these fail quietly or confusingly. Read once, save yourself an hour.
   A CAPTION THAT CARRIES A NUMBER CHANGES WITH IT. "NC DISPLAY(1080 x 809)" is
   "NC DISPLAY(1104 x 818)" once the size in it changes, and then no control carries the
   anchor's text. The refusal lists under "similar" the controls whose caption matches up
-  to the first digit or bracket - and so does the anchor error on any ordinary request, and
-  /health. They are offered, not taken - name the one that is this anchor's control as
-  above, and "text_now" in the proposal shows the caption that will be saved with it.
+  to the first digit or bracket. They are offered, not taken - name the one that is this
+  anchor's control as above, and "text_now" in the proposal shows the caption that will be
+  saved with it.
+  The anchor error on any ordinary request names them too, in its sentence and as data:
+    "similar": {{"screen": [{{"text": "NC DISPLAY(1104 x 818)", "rect": [2,2,1104,818]}}]}}
+  keyed by anchor, present only for an anchor whose caption is gone and that has candidates.
+  /health carries the same field in that profile's "anchors". The refit's own refusal is for
+  one anchor, so there "similar" is the list itself, next to "anchor".
 
   ELEMENTS MARKED "@fixed" ARE NOT MOVED. Somebody stated they do not travel with a
   container, and a refit does not overrule that. They are listed under "untouched".
@@ -7583,6 +7615,30 @@ mod tests {
         // No menu bar at all: one line, not one per entry.
         let bare = GuardReport::of(&guards, &[]);
         assert_eq!(bare.problems("p", false).len(), 1);
+    }
+
+    /// The candidates the anchor error names in its sentence come back as data as well, keyed
+    /// by anchor - only for an anchor whose caption is gone, and only when there are some.
+    #[test]
+    fn similar_captions_are_a_field_keyed_by_anchor() {
+        let t: Targets = serde_json::from_str(
+            r#"{"window":{"title":"x"},
+                "anchors":{"screen":{"text":"NC DISPLAY(1080 x 809)","rect":[0,0,1080,809]},
+                           "keys":{"text":"NC KEYBOARD","rect":[0,0,100,50]},
+                           "gone":{"text":"SUB","rect":[0,0,5,5]}},
+                "buttons":{}}"#,
+        )
+        .expect("parses");
+        let ctl = |text: &str, rect: Rect| crate::win::window::ControlInfo {
+            class: String::new(), text: text.into(), id: 0, rect, depth: 2, visible: true,
+        };
+        let live = [
+            ctl("NC DISPLAY(1104 x 818)", [2, 2, 1104, 818]),
+            ctl("NC KEYBOARD", [0, 0, 120, 50]), // resized: its caption is there, so not listed
+        ];
+        let v = anchor_similar(&t, &live).expect("one anchor has candidates");
+        assert_eq!(v, json!({"screen": [{"text": "NC DISPLAY(1104 x 818)", "rect": [2, 2, 1104, 818]}]}));
+        assert!(anchor_similar(&t, &live[1..]).is_none(), "nothing similar, no field");
     }
 
     /// NCGuide greys "Cycle Time Estimate Function" and leaves "Start Estimation" inside it

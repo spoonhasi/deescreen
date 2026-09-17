@@ -1442,10 +1442,20 @@ the nearest controls listed, and so is a control whose text and size another one
 That matters because **a caption that carries a number changes with it**:
 `NC DISPLAY(1080 x 809)` is `NC DISPLAY(1104 x 818)` once the size in it changes, and then no
 control carries the anchor's text at all. The refusal lists under `similar` the controls whose
-caption matches up to the first digit or bracket — and so does the anchor error on any ordinary
-request, and `/health`, which otherwise could only say "a different application or build". They
-are offered, not taken — name the right one as above, and `text_now` in the proposal shows the
-caption that will be saved.
+caption matches up to the first digit or bracket. They are offered, not taken — name the right
+one as above, and `text_now` in the proposal shows the caption that will be saved.
+
+The anchor error on any ordinary request names them too — without them it could only say "a
+different application or build" — in its sentence and as data, for a caller that re-seats
+anchors from a program:
+
+```json
+"similar": { "screen": [ { "text": "NC DISPLAY(1104 x 818)", "rect": [2, 2, 1104, 818] } ] }
+```
+
+Keyed by anchor, and present only for an anchor whose caption is gone and that has candidates.
+`/health` carries the same field in that profile's `anchors`. The refit's own refusal is about one
+anchor, so there `similar` is the list itself, next to `anchor`.
 
 Elements marked `"@fixed"` are **not** moved — somebody stated they do not travel with a
 container, and a refit does not overrule that. They are listed under `untouched`. A profile with
