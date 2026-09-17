@@ -835,8 +835,14 @@ where a screen is known to arrive in stages.
 all: something is animating. `ignore=x,y,w,h` drops that rectangle from the comparison. The
 reply says so outright instead of handing back the ceiling as though it were the answer.
 
-Measuring costs a capture every 50ms until the screen is still, which is why it is opt-in. Do
-it once per button that needs it and write the number down.
+**Resolution is what one capture costs, not a fixed interval.** Each sample renders the whole
+window; on a 1920×997 NCGuide window that took about 190ms, so the samples came 236ms apart.
+`resolution_ms` is that measured gap, and every other number in the reply is only as fine as it.
+Naming a smaller capture region does not speed it up — the crop happens after the window has
+been rendered. `suggest_settle_ms` already rounds up past it.
+
+Measuring costs one whole-window capture per sample until the screen is still, which is why it
+is opt-in. Do it once per button that needs it and write the number down.
 
 ### Pressing several buttons in order — `buttons`
 

@@ -265,9 +265,9 @@ pub struct ClickReq {
     pub per_press: Option<bool>,
     /// Measure how long the screen takes to settle, instead of waiting a fixed `settle_ms`.
     ///
-    /// Costs a capture every 50ms until it holds still, so it is opt-in — but it answers
-    /// the question `settle_ms` otherwise leaves to repetition, and the reply carries the
-    /// number to write into the profile.
+    /// Costs a whole-window capture per sample until it holds still, so it is opt-in — but
+    /// it answers the question `settle_ms` otherwise leaves to repetition, and the reply
+    /// carries the number to write into the profile.
     #[serde(default)]
     pub measure: Option<bool>,
     /// How long the screen has to hold still before `measure` calls it settled. Raise it for an
@@ -313,9 +313,9 @@ pub struct KeyReq {
     pub pad: Option<i32>,
     /// Measure how long the screen takes to settle, instead of waiting a fixed `settle_ms`.
     ///
-    /// Costs a capture every 50ms until it holds still, so it is opt-in — but it answers
-    /// the question `settle_ms` otherwise leaves to repetition, and the reply carries the
-    /// number to write into the profile.
+    /// Costs a whole-window capture per sample until it holds still, so it is opt-in — but
+    /// it answers the question `settle_ms` otherwise leaves to repetition, and the reply
+    /// carries the number to write into the profile.
     #[serde(default)]
     pub measure: Option<bool>,
     /// How long the screen has to hold still before `measure` calls it settled. Raise it for an
@@ -728,9 +728,13 @@ fn shoot(
     Ok((frame, method, black))
 }
 
-/// How often to look while measuring. Fine enough that 50ms of resolution is not the limiting
-/// factor on a number in the hundreds, coarse enough that the looking does not become the
-/// thing being measured.
+/// The pause between two looks while measuring — **not** the sampling interval.
+///
+/// Each look is a whole-window PrintWindow, and that is the expensive part: on a 1920x997
+/// NCGuide window it took about 190ms, so the samples came 236ms apart, not 50. Cropping to a
+/// smaller region does not help, because the crop happens after the window has been rendered.
+/// What the caller gets is `resolution_ms`, which is measured rather than assumed; this is only
+/// the floor under it, so a small window is not sampled faster than it can be compared.
 const WATCH_POLL_MS: u64 = 50;
 /// How long the screen has to hold still before it counts as settled.
 const DEFAULT_QUIET_MS: u64 = 300;
@@ -2689,8 +2693,15 @@ PRESS A SAVED BUTTON - click, wait for it to settle, re-capture, one round trip
   ignore=x,y,w,h to drop that rectangle from the comparison and measure again. The reply
   says this outright rather than handing back the ceiling as though it were an answer.
 
-  Measuring costs a capture every 50ms until the screen is still, which is why it is opt-in.
-  Do it once per button that needs it, write the number down, and never do it again.
+  RESOLUTION IS WHAT ONE CAPTURE COSTS, not a fixed interval. Each sample renders the whole
+  window, and on a 1920x997 NCGuide window that took about 190ms, so the samples came 236ms
+  apart - "resolution_ms" in the reply is that measured gap, and every other number in the
+  reply is only as fine as it. Naming a smaller capture does not speed it up; the crop
+  happens after the window is rendered. suggest_settle_ms already rounds up past it.
+
+  Measuring costs one whole-window capture per sample until the screen is still, which is
+  why it is opt-in. Do it once per button that needs it, write the number down, and never
+  do it again.
 
 
   HOW LONG THE KEY IS HELD DOWN - "hold_ms"
