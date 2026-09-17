@@ -242,6 +242,20 @@ pub struct Targets {
     /// to connect a person's words to.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+    /// **Which application this profile is one version of.**
+    ///
+    /// A program's profiles are **alternatives**: the same application with different projects
+    /// loaded, only one of which is open at a time — NCGuide's 0i lathe, 0i mill and 30i. Naming
+    /// the program instead of the profile lets the server pick whichever of them is open, and
+    /// only when it can prove which one that is.
+    ///
+    /// A dialog or a second window of the same application is **not** an alternative: it is
+    /// open at the same time as the main one, so putting it in the program makes the program
+    /// ambiguous whenever it shows. Give it no program, or one of its own.
+    ///
+    /// Empty is fine: the profile is then addressed by its own name only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub program: String,
     /// The window to drive. If you do not know the title, find it with `GET /windows` first.
     pub window: WindowSpec,
     /// **The client size the coordinates below were measured at.** A change of window size
@@ -307,6 +321,13 @@ impl Targets {
             for n in names {
                 check_name(kind, n)?;
             }
+        }
+        if !self.program.is_empty() && !crate::config::is_safe_profile_name(&self.program) {
+            return Err(format!(
+                "program {:?} is not a valid name - letters, digits, '-' and '_' only, because it \
+                 travels in ?program= the way a profile name travels in ?profile=",
+                self.program
+            ));
         }
         if self.window.title.trim().is_empty() && self.window.class.trim().is_empty() {
             return Err("window.title (or window.class) must be set — \
@@ -1010,6 +1031,7 @@ mod tests {
     fn sample() -> Targets {
         let mut t = Targets {
             description: String::new(),
+            program: String::new(),
             window: WindowSpec {
                 title: "Sample".into(),
                 title_exact: false,

@@ -211,8 +211,10 @@
       <h2 data-i18n="h.window">Target window</h2>
       <div class="row"><label data-i18n="l.desc">Description</label>
         <input id="p_desc" type="text" data-i18n-title="l.desc.t" data-i18n-ph="l.desc.ph"></div>
-      <div class="row"><label data-i18n="l.programs">Programs</label>
-        <select id="winpick" data-i18n-title="l.programs.t"></select></div>
+      <div class="row"><label data-i18n="l.program">Program</label>
+        <input id="p_prog" type="text" data-i18n-title="l.program.t" data-i18n-ph="l.program.ph"></div>
+      <div class="row"><label data-i18n="l.openwin">Open windows</label>
+        <select id="winpick" data-i18n-title="l.openwin.t"></select></div>
       <div class="row"><label data-i18n="l.title">Title</label>
         <input id="w_title" type="text" data-i18n-ph="l.title.ph" data-i18n-title="l.title.t"></div>
       <div class="row"><label data-i18n="l.class">Class</label>
@@ -311,8 +313,11 @@ const STRINGS = {
     'l.desc': 'Description',
     'l.desc.t': 'What this profile is, in plain language. It goes into /health and /profiles for agents to read.',
     'l.desc.ph': 'e.g. the FANUC simulator that mirrors the real machine',
-    'l.programs': 'Programs',
-    'l.programs.t': 'Windows open right now. Picking one fills in the two fields below.',
+    'l.program': 'Program',
+    'l.program.t': 'Which application this profile is one version of. Profiles that are alternatives - one open at a time, like the projects of NCGuide - share it, and a request can then say program= to get whichever is open. A dialog open beside the main window is not an alternative. Letters, digits, - and _; empty if this profile has no siblings.',
+    'l.program.ph': 'e.g. ncguide',
+    'l.openwin': 'Open windows',
+    'l.openwin.t': 'Windows open right now. Picking one fills in the two fields below.',
     'l.title': 'Title',
     'l.title.ph': 'substring match — a short fragment is fine',
     'l.title.t': 'This is a matching rule, not a fixed value. Many applications append the open file name, so keep only the part that never changes.',
@@ -341,6 +346,7 @@ const STRINGS = {
     'refmeta.same': ' (matches the window)',
     'refmeta.diff': ' · window is {0}',
     'profpick.default': ' (default)',
+    'profpick.noprog': '(no program)',
 
     'match.need': 'A title or a class is required.',
     'match.none': 'Nothing open right now matches.',
@@ -441,8 +447,11 @@ const STRINGS = {
     'l.desc': '설명',
     'l.desc.t': '이 프로파일이 무엇인지 사람 말로. /health 와 /profiles 에 그대로 실려 에이전트가 읽습니다.',
     'l.desc.ph': '예: 실장비와 같은 화면의 FANUC 시뮬레이터',
-    'l.programs': '프로그램 목록',
-    'l.programs.t': '지금 열려 있는 창들. 고르면 아래 두 칸이 채워집니다.',
+    'l.program': '프로그램',
+    'l.program.t': '이 프로파일이 어느 프로그램의 한 구성인지. 동시에 하나만 뜨는 대안들(NCGuide 의 프로젝트들)이 같은 이름을 쓰고, 그러면 요청에서 program= 으로 지금 열린 것을 받을 수 있습니다. 본창과 함께 뜨는 대화상자는 대안이 아닙니다. 영문·숫자·-·_ 만, 형제가 없으면 비워 두세요.',
+    'l.program.ph': '예: ncguide',
+    'l.openwin': '열린 창',
+    'l.openwin.t': '지금 열려 있는 창들. 고르면 아래 두 칸이 채워집니다.',
     'l.title': '제목',
     'l.title.ph': '부분 일치 — 짧게 줄여도 됩니다',
     'l.title.t': '고정값이 아니라 찾는 규칙입니다. 제목에 파일명이 붙는 앱이 많으니 변하지 않는 부분만 남기세요.',
@@ -470,6 +479,7 @@ const STRINGS = {
     'refmeta.same': ' (현재 창과 일치)',
     'refmeta.diff': ' · 현재 창은 {0}',
     'profpick.default': ' (기본)',
+    'profpick.noprog': '(프로그램 없음)',
 
     'match.need': '제목이나 클래스 중 하나는 있어야 합니다.',
     'match.none': '지금 열린 창 중 일치하는 것이 없습니다.',
@@ -616,6 +626,11 @@ let client = [0, 0];     // the target window's client size
 // particular window directly.
 let profile = new URLSearchParams(location.search).get('profile') || '';
 let profiles = [];
+// profile name -> its program ('' for none), to group the picker.
+let progOf = {};
+function programsOf(ps) {
+  return Object.fromEntries(Object.entries(ps).map(([n, p]) => [n, p.program || '']));
+}
 const pq = () => (profile ? '&profile=' + encodeURIComponent(profile) : '');
 let adminRequired = false; // whether the server demands an admin code (never its value)
 let windowList = [];      // GET /windows (the picker list, and counting matches)
@@ -696,6 +711,7 @@ async function loadAll() {
       all = await getJson('/profiles');
     }
     profiles = Object.keys(all.profiles);
+    progOf = programsOf(all.profiles);
     adminRequired = !!(all.policy && all.policy.admin_code_required);
     renderAdminHint();
     document.body.classList.toggle('noprof', profiles.length === 0);
@@ -712,12 +728,17 @@ async function loadAll() {
     if (!all.profiles[profile]) profile = profiles[0];
     // With ?profile= only that one comes back, so fetch the list once more to fill the picker.
     if (profiles.length === 1 && profiles[0] === profile) {
-      try { profiles = Object.keys((await getJson('/profiles')).profiles); } catch (_) {}
+      try {
+        const every = (await getJson('/profiles')).profiles;
+        profiles = Object.keys(every);
+        progOf = programsOf(every);
+      } catch (_) {}
     }
     renderProfiles(all.default_profile);
     renderTitle();
     doc = toDoc(all.profiles[profile]);
     $('#p_desc').value = doc.description || '';
+    $('#p_prog').value = doc.program || '';
     windowChanged = false;
     rebuildItems();
   } catch (e) {
@@ -1286,6 +1307,9 @@ function bindWindowFields() {
   const push = () => {
     if (!doc) return;
     doc.description = $('#p_desc').value;
+    // Saved as typed, trimmed. The server refuses a name that would not survive a URL, which
+    // is a clearer place to hear about it than a field that silently rewrote what you typed.
+    doc.program = $('#p_prog').value.trim();
     // Spread first: this page edits three fields of the window spec and must carry the rest.
     // Rebuilding the object from the form dropped window.has on the first keystroke, and with
     // it the only thing telling this profile's project apart from another under one title.
@@ -1299,7 +1323,7 @@ function bindWindowFields() {
     renderWindowMatch();
     scheduleWindowPreview();
   };
-  ['p_desc', 'w_title', 'w_class', 'w_exact'].forEach(id => {
+  ['p_desc', 'p_prog', 'w_title', 'w_class', 'w_exact'].forEach(id => {
     const el = $('#' + id);
     el.oninput = push;
     el.onchange = push;
@@ -1338,9 +1362,21 @@ function renderAdminHint() {
 
 function renderProfiles(def) {
   const sel = $('#profpick');
-  sel.innerHTML = profiles.map(n =>
-    `<option value="${n}"${n === profile ? ' selected' : ''}>${escapeHtml(n)}${n === def ? escapeHtml(t('profpick.default')) : ''}</option>`
-  ).join('');
+  const opt = n =>
+    `<option value="${escapeHtml(n)}"${n === profile ? ' selected' : ''}>${escapeHtml(n)}${n === def ? escapeHtml(t('profpick.default')) : ''}</option>`;
+  // Grouped by program, so the versions of one application sit together under its name. The
+  // ones with no program get a group of their own once any group exists - an option left
+  // after an optgroup reads as if it belonged to it.
+  const groups = {};
+  for (const n of profiles) (groups[progOf[n] || ''] ||= []).push(n);
+  const named = Object.keys(groups).filter(g => g).sort();
+  if (!named.length) {
+    sel.innerHTML = profiles.map(opt).join('');
+  } else {
+    const group = (label, names) => `<optgroup label="${escapeHtml(label)}">${names.map(opt).join('')}</optgroup>`;
+    sel.innerHTML = named.map(g => group(g, groups[g])).join('') +
+      (groups[''] ? group(t('profpick.noprog'), groups['']) : '');
+  }
   sel.style.display = '';
 }
 

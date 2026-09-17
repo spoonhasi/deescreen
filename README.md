@@ -54,6 +54,10 @@ first row does not. A **menu path** is the exception: the menu is read off the w
 than written in the profile, so it has no "the profile holds" column at all, and it has its own
 switch (`allow_menus`) for exactly that reason.
 
+And a request can name a **program** instead of a profile — a group of profiles that are versions
+of one application, of which the server uses whichever is open. That is a way of *choosing* the
+profile, not a fourth thing to press; see [Programs](#programs--several-versions-of-one-application).
+
 `click_button` is the one name in the API that is in no column, because it answers a different
 question — not *what* to press but *which mouse button presses it* (`left`, `right` or
 `middle`, one per click). It is not called `button` because then one word would mean two things
@@ -348,6 +352,60 @@ match, clicking is **refused**, so narrow it with `class` or `title_exact`. A ti
 also matches dialogs that repeat the name — `About FANUC NCGuide` contains `FANUC NCGuide` — so
 while one is open the profile refuses as ambiguous; where the title never changes,
 `title_exact` avoids that.
+
+### Programs — several versions of one application
+
+An application often exists in more than one version on the same PC: NC Trainer with different
+machine projects, NCGuide with a 0i lathe, a 0i mill and a 30i. Each version has its own layout,
+so each is its own profile. **`program` says which application a profile is a version of:**
+
+```json
+{ "description": "FANUC NCGuide with the 0i lathe project",
+  "program": "ncguide",
+  "window": { "title": "FANUC NCGuide", "title_exact": true,
+              "has": [ { "text": "MDI", "size": [667, 409] } ] },
+  "buttons": { "…": "…" } }
+```
+
+A program's profiles are **alternatives** — the same application with a different project
+loaded, one open at a time. So a request can name the program, and the server uses whichever of
+them is open:
+
+```bash
+curl -s -o shot.png ".../capture.png?program=ncguide"
+curl -s -X POST -H "Content-Type: application/json" \
+  -d '{"program": "ncguide", "button": "POS"}' .../click
+```
+
+It picks one **only when that profile proves the open window is its own**: its `window.has`
+marks are there, its anchors resolve, or its title is one no other profile of the program could
+also match. Anything else is refused, and the refusal says which case it is:
+
+| | |
+|---|---|
+| none open | each profile says why it did not take the window — including "a project no profile describes" |
+| two open | the same window accepted by both means their marks overlap; two different windows means two projects are running — name the one you mean with `profile=` |
+| one open, unproven | the only profile bound has nothing to show the window is its own. It is **not** picked on that alone: that is exactly how a 30i profile accepted a 0i lathe |
+
+The reply's `profile` says which one was used. Button names differ between versions, so read it
+before naming a button.
+
+- `GET /profiles` lists `programs`; `GET /profiles?program=NAME` returns every profile of that
+  program — a filter, not a pick.
+- `GET /health` says, per program, which profile is open right now, by the same rule a request
+  uses. It also names a program's profile that nothing could tell apart from a sibling — judged
+  from the documents alone, so with no window open.
+- Editing (`/admin/…`) never takes `program`. Which version happens to be open is not a way to
+  choose a file to rewrite; name the profile.
+- The editor has a **Program** field and groups its profile list by it. The list of open windows
+  that used to be labelled "Programs" is now "Open windows".
+
+**A dialog is not a version.** A window that opens *beside* the main one — NC Trainer's restart
+dialog — is open at the same time, so in the same program it makes the program ambiguous every
+time it shows. Give it no program.
+
+Where the versions differ in their titles (NC Trainer: `M830_L - …`, `M830V_M - …`), the title is
+all the proof needed. Where they share one (NCGuide), they need `window.has`:
 
 ### One program, several projects, one title — `window.has`
 
@@ -762,6 +820,10 @@ and a `/captures/<name>` URL instead.
 
 ## API
 
+Every endpoint that drives or reads a window takes **`profile`** — or **`program`**, to use
+whichever of that program's profiles is open ([Programs](#programs--several-versions-of-one-application)).
+The `/admin` endpoints take `profile` only.
+
 | method | path | class | |
 |---|---|---|---|
 | GET | `/` · `/help` | read | **the manual for agents**, one page (see below) |
@@ -769,7 +831,7 @@ and a `/captures/<name>` URL instead.
 | GET | `/health` | read | is it operable right now — checks every trap in **Known traps** below. `status` is `ok` or `degraded`, `problems` lists what is wrong in plain language, `policy` says which gated things are allowed |
 | GET | `/windows` | read | visible top-level windows — for finding a title |
 | GET | `/window` | read | the configured window's current state (client size, DPI, foreground) |
-| GET | `/profiles` | read | **every profile's full definition** — buttons, regions, keys, window. `?profile=` for one |
+| GET | `/profiles` | read | **every profile's full definition** — buttons, regions, keys, window. `?profile=` for one, `?program=` for one program's profiles; `programs` groups them |
 | GET | `/buttons` | read | one profile's button list (a subset of `/profiles`) |
 | GET | `/regions` | read | one profile's region list (coordinates absolute to the window) |
 | GET | `/controls` | read | enumerate child controls. **An empty list is an answer** (see below) |

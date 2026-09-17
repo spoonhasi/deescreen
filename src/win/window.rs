@@ -172,6 +172,36 @@ pub fn marks_missing_from(controls: &[ControlInfo], marks: &[ControlMark]) -> Ve
         .collect()
 }
 
+/// Whether some window could satisfy both specs' **title and class** — the part of a spec
+/// that can be judged without any window being open.
+///
+/// Used to decide whether a program's profiles can tell each other apart by title alone
+/// (NC Trainer: `M830_L - …` and `M830V_M - …`), or need something from inside the window
+/// (NCGuide: all `FANUC NCGuide`). `has` is deliberately ignored here: it is the thing that
+/// separates specs this says overlap.
+///
+/// Conservative in the direction that matters. Saying "could overlap" when they cannot costs a
+/// request for `has` that was not strictly needed; saying "cannot" when they can lets two
+/// profiles bind one window with nothing to choose between them.
+pub fn could_match_same(a: &WindowSpec, b: &WindowSpec) -> bool {
+    let (ac, bc) = (a.class.trim().to_lowercase(), b.class.trim().to_lowercase());
+    if !ac.is_empty() && !bc.is_empty() && ac != bc {
+        return false;
+    }
+    let (at, bt) = (a.title.trim().to_lowercase(), b.title.trim().to_lowercase());
+    if at.is_empty() || bt.is_empty() {
+        return true;
+    }
+    // A window titled with one of these would satisfy the other when...
+    match (a.title_exact, b.title_exact) {
+        (true, true) => at == bt,
+        (true, false) => at.contains(&bt),
+        (false, true) => bt.contains(&at),
+        // ...a title containing the longer needle contains the shorter one too.
+        (false, false) => at.contains(&bt) || bt.contains(&at),
+    }
+}
+
 /// Find the window the configured spec describes.
 pub fn find(spec: &WindowSpec) -> Result<WindowInfo, FindError> {
     let needle = spec.title.trim().to_lowercase();
@@ -586,6 +616,34 @@ mod tests {
         // Whitespace around a caption is not part of its name, as for anchors.
         let padded = [control("  Main Panel ", [0, 0, 705, 411])];
         assert!(marks_missing_from(&padded, &[ControlMark { text: "Main Panel".into(), size: [705, 411] }]).is_empty());
+    }
+
+    fn spec(title: &str, exact: bool, class: &str) -> WindowSpec {
+        WindowSpec { title: title.into(), title_exact: exact, class: class.into(), has: Vec::new() }
+    }
+
+    /// NC Trainer's projects differ in the title; NCGuide's do not. That difference is what
+    /// decides whether a program's profiles need anything more than their title.
+    #[test]
+    fn two_specs_overlap_only_where_one_window_could_satisfy_both() {
+        // NCGuide: one title for every project.
+        assert!(could_match_same(&spec("FANUC NCGuide", true, ""), &spec("FANUC NCGuide", true, "")));
+        // NC Trainer: the project is in the title.
+        assert!(!could_match_same(
+            &spec("M830_L - NC Trainer2", false, ""),
+            &spec("M830V_M - NC Trainer2", false, "")
+        ));
+        // A fragment inside another fragment: "M830_L - NC Trainer2" contains "NC Trainer2",
+        // so a window with the longer title satisfies both.
+        assert!(could_match_same(&spec("NC Trainer2", false, ""), &spec("M830_L - NC Trainer2", false, "")));
+        // An exact title is only reached by that title.
+        assert!(!could_match_same(&spec("NC Trainer2", true, ""), &spec("M830_L - NC Trainer2", true, "")));
+        assert!(could_match_same(&spec("M830_L - NC Trainer2", true, ""), &spec("NC Trainer2", false, "")));
+        // Different classes never meet; an unset class meets anything.
+        assert!(!could_match_same(&spec("X", false, "A"), &spec("X", false, "B")));
+        assert!(could_match_same(&spec("X", false, "A"), &spec("X", false, "")));
+        // An empty title matches every window.
+        assert!(could_match_same(&spec("", false, "A"), &spec("anything", true, "")));
     }
 
     /// A mark with only a text would match every project that has a panel of that name, and

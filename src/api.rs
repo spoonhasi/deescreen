@@ -51,6 +51,10 @@ pub struct CaptureReq {
     /// Which profile, and therefore which window. Omitted, the default profile.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Instead of `profile`: whichever of this program's profiles is open, when that can be
+    /// proven. With both, the profile is used and must belong to the program.
+    #[serde(default)]
+    pub program: Option<String>,
     /// A named region. Absent, the whole client area (`"client"`).
     #[serde(default)]
     pub region: Option<String>,
@@ -192,6 +196,10 @@ pub struct ClickReq {
     /// Which profile, and therefore which window. Omitted, the default profile.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Instead of `profile`: whichever of this program's profiles is open, when that can be
+    /// proven. With both, the profile is used and must belong to the program.
+    #[serde(default)]
+    pub program: Option<String>,
     /// Press several saved buttons in order, in one request.
     ///
     /// Entering data on an MDI keypad is one click per character, and a partial string left
@@ -290,6 +298,10 @@ pub struct KeyReq {
     /// Which profile, and therefore which window. Omitted, the default profile.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Instead of `profile`: whichever of this program's profiles is open, when that can be
+    /// proven. With both, the profile is used and must belong to the program.
+    #[serde(default)]
+    pub program: Option<String>,
     /// A name from the profile's `keys`.
     #[serde(default)]
     pub key: Option<String>,
@@ -385,6 +397,7 @@ impl CaptureReq {
         Ok(CaptureReq {
             params: Params::Query,
             profile: q_get(q, "profile"),
+            program: q_get(q, "program"),
             region: q_get(q, "region"),
             rect: q_rect(q)?,
             scale: q_num(q, "scale")?,
@@ -416,6 +429,7 @@ impl ClickReq {
         Ok(ClickReq {
             params: Params::Query,
             profile: q_get(q, "profile"),
+            program: q_get(q, "program"),
             buttons,
             gap_ms: q_num(q, "gap_ms")?,
             button: q_get(q, "button"),
@@ -440,6 +454,245 @@ impl ClickReq {
 }
 
 // ────────────────────────── shared work (blocking) ──────────────────────────
+
+/// What one profile of a program looked like when a request named the program.
+#[derive(Debug)]
+struct Seen {
+    profile: String,
+    state: SeenState,
+}
+
+#[derive(Debug)]
+enum SeenState {
+    /// Its window is open. `identifies` says whether it proved that window is its own.
+    Open { handle: isize, pid: u32, identifies: bool },
+    /// Not open, or open but not its own — the refusal that would have come back.
+    Absent(String),
+    /// Several windows satisfy it, so it cannot say which it would drive.
+    Unclear(String),
+}
+
+/// The decision, by position in the list it was made from.
+#[derive(Debug, PartialEq, Eq)]
+enum Chosen {
+    One(usize),
+    NoneOpen,
+    Several(Vec<usize>),
+    /// Exactly one is open, and it cannot show the window is its own.
+    Unproven(usize),
+    Unclear(Vec<usize>),
+}
+
+/// Which of a program's profiles to use, from what each one saw. No window is touched here.
+///
+/// Only a profile that **proved** the window is its own is picked. Being the only one bound is
+/// not proof: a profile with nothing to check binds any window with its title, including a
+/// project that no profile describes — which is how a 30i profile once accepted a 0i lathe.
+fn choose(seen: &[Seen]) -> Chosen {
+    let unclear: Vec<usize> =
+        (0..seen.len()).filter(|&i| matches!(seen[i].state, SeenState::Unclear(_))).collect();
+    if !unclear.is_empty() {
+        return Chosen::Unclear(unclear);
+    }
+    let open: Vec<usize> =
+        (0..seen.len()).filter(|&i| matches!(seen[i].state, SeenState::Open { .. })).collect();
+    match open.as_slice() {
+        [] => Chosen::NoneOpen,
+        [i] => match seen[*i].state {
+            SeenState::Open { identifies: true, .. } => Chosen::One(*i),
+            _ => Chosen::Unproven(*i),
+        },
+        _ => Chosen::Several(open),
+    }
+}
+
+/// The profiles that name `program`, in name order.
+fn program_members(state: &SharedState, program: &str) -> Vec<std::sync::Arc<crate::state::Profile>> {
+    state.profiles.load().values().filter(|p| p.targets().program == program).cloned().collect()
+}
+
+fn no_such_program(state: &SharedState, program: &str) -> ApiError {
+    ApiError::not_found(format!("no profile belongs to a program named '{program}'")).with_detail(json!({
+        "programs": near_names(program, program_names(state).into_iter(), "GET /profiles"),
+        "note": "a program is the \"program\" field of the profiles that belong to it. \
+                 GET /profiles lists every profile with its program.",
+    }))
+}
+
+/// `{program: [profile, ...]}` for every program in use.
+fn programs_map(state: &SharedState) -> Value {
+    let mut m: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for (name, p) in state.profiles.load().iter() {
+        let prog = p.targets().program.clone();
+        if !prog.is_empty() {
+            m.entry(prog).or_default().push(name.clone());
+        }
+    }
+    json!(m)
+}
+
+/// Profiles of one program that nothing could tell apart — not the title, not the class,
+/// and nothing inside the window. Judged from the documents alone, so it is reported whether
+/// or not any window is open.
+///
+/// Each entry is `(program, profile, window spec, has anchors)`.
+fn program_problems(members: &[(String, String, crate::win::window::WindowSpec, bool)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (prog, name, spec, anchored) in members {
+        if prog.is_empty() || !spec.has.is_empty() || *anchored {
+            continue;
+        }
+        let rivals: Vec<&str> = members
+            .iter()
+            .filter(|(p, other, s, _)| p == prog && other != name && window::could_match_same(spec, s))
+            .map(|(_, other, _, _)| other.as_str())
+            .collect();
+        if rivals.is_empty() {
+            continue;
+        }
+        out.push(format!(
+            "program '{prog}': profile '{name}' could take the same window as {} - title and class \
+             cannot separate them - and has no window.has and no anchors. program={prog} will \
+             refuse to pick it, and profile={name} will drive whichever of those projects is \
+             open. Add window.has; /help: WHEN ONE APPLICATION OPENS SEVERAL PROJECTS.",
+            rivals.join(", ")
+        ));
+    }
+    out
+}
+
+/// Every program name in use.
+fn program_names(state: &SharedState) -> Vec<String> {
+    let mut v: Vec<String> = state
+        .profiles
+        .load()
+        .values()
+        .map(|p| p.targets().program.clone())
+        .filter(|p| !p.is_empty())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Look at each of a program's profiles, then `choose`.
+fn resolve_program(state: &SharedState, program: &str) -> Result<std::sync::Arc<crate::state::Profile>, ApiError> {
+    let members = program_members(state, program);
+    if members.is_empty() {
+        return Err(no_such_program(state, program));
+    }
+    let specs: Vec<crate::win::window::WindowSpec> =
+        members.iter().map(|m| m.targets().window.clone()).collect();
+
+    let seen: Vec<Seen> = members
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let t = m.targets();
+            let seen_state = match window::find(&t.window) {
+                Ok(info) => {
+                    // Cheapest proof first; the anchors need every child window listed.
+                    let alone = specs
+                        .iter()
+                        .enumerate()
+                        .all(|(j, s)| j == i || !window::could_match_same(&t.window, s));
+                    let identifies = !t.window.has.is_empty()
+                        || alone
+                        || (!t.anchors.is_empty()
+                            && t.anchor_offsets(&window::enumerate_controls_all(info.handle).items).is_ok());
+                    SeenState::Open { handle: info.handle, pid: info.pid, identifies }
+                }
+                Err(FindError::Ambiguous(list)) => SeenState::Unclear(list.join("; ")),
+                Err(e) => SeenState::Absent(find_error(&t, e).message),
+            };
+            Seen { profile: m.name.clone(), state: seen_state }
+        })
+        .collect();
+
+    let report = |ix: &[usize]| -> Vec<Value> {
+        ix.iter()
+            .map(|&i| match &seen[i].state {
+                SeenState::Open { pid, identifies, .. } => {
+                    json!({"profile": seen[i].profile, "open": true, "pid": pid, "proves_it": identifies})
+                }
+                SeenState::Absent(why) => json!({"profile": seen[i].profile, "open": false, "why": why}),
+                SeenState::Unclear(why) => json!({"profile": seen[i].profile, "unclear": why}),
+            })
+            .collect()
+    };
+    let all: Vec<usize> = (0..seen.len()).collect();
+
+    match choose(&seen) {
+        Chosen::One(i) => Ok(members[i].clone()),
+        Chosen::NoneOpen => Err(ApiError::not_found(format!(
+            "none of program '{program}''s profiles has its window open"
+        ))
+        .with_detail(json!({
+            "profiles": report(&all),
+            "note": "each entry says why that profile did not take the window. If the \
+                     application is open with a project no profile describes, that is the \
+                     answer too - there is nothing here measured for it.",
+        }))),
+        Chosen::Several(ix) => {
+            let handles: std::collections::BTreeSet<isize> = ix
+                .iter()
+                .filter_map(|&i| match seen[i].state {
+                    SeenState::Open { handle, .. } => Some(handle),
+                    _ => None,
+                })
+                .collect();
+            let why = if handles.len() == 1 {
+                "they all accept the SAME window, so what tells them apart does not - fix \
+                 window.has so that each one's marks exist only in its own project"
+            } else {
+                "each has a window of its own open - two projects are running at once. Name the \
+                 one you mean with profile="
+            };
+            Err(ApiError::conflict(format!(
+                "{} of program '{program}''s profiles are open, so which one is meant cannot be \
+                 decided",
+                ix.len()
+            ))
+            .with_detail(json!({"profiles": report(&ix), "why": why})))
+        }
+        Chosen::Unproven(i) => Err(ApiError::conflict(format!(
+            "only '{}' of program '{program}' accepts the open window, but it cannot show the \
+             window is its own",
+            seen[i].profile
+        ))
+        .with_detail(json!({
+            "profiles": report(&all),
+            "why": "its title and class could also belong to another profile of this program, \
+                    and it has no window.has and no anchors that resolve. The open window may be \
+                    a project no profile describes, so it is not picked on the strength of being \
+                    the only one bound.",
+            "fix": "give it window.has - /help: WHEN ONE APPLICATION OPENS SEVERAL PROJECTS - or \
+                    name it with profile= if you know which project is open",
+        }))),
+        Chosen::Unclear(ix) => Err(ApiError::conflict(format!(
+            "program '{program}' cannot be resolved: some of its profiles match more than one \
+             window"
+        ))
+        .with_detail(json!({"profiles": report(&ix)}))),
+    }
+}
+
+/// Editing names the exact profile. `program` means "whichever is open", which is a way to
+/// drive a window and not a way to choose what to rewrite.
+fn no_program_here(q: &HashMap<String, String>) -> Result<(), ApiError> {
+    match q_get(q, "program") {
+        None => Ok(()),
+        Some(p) => Err(ApiError::bad_request(format!(
+            "program={p} is not accepted here - name the profile to change with profile="
+        ))
+        .with_detail(json!({
+            "why": "program picks whichever of its profiles is open at this moment. That is \
+                    how to drive a window, but writing to a profile chosen by what happens to \
+                    be open would edit a different file depending on the screen.",
+            "profiles": "GET /profiles?program=NAME lists them",
+        }))),
+    }
+}
 
 /// Where a request carried its parameters.
 ///
@@ -478,6 +731,33 @@ impl Params {
 fn pick(
     state: &SharedState,
     name: Option<&str>,
+    program: Option<&str>,
+    from: Params,
+) -> Result<std::sync::Arc<crate::state::Profile>, ApiError> {
+    let named = name.map(str::trim).filter(|n| !n.is_empty());
+    match (named, program.map(str::trim).filter(|p| !p.is_empty())) {
+        (None, Some(p)) => resolve_program(state, p),
+        (Some(_), Some(p)) => {
+            // Both given: the profile decides, and the program is a claim to check. A caller
+            // who believes ncguide-30i is an NCGuide profile and is wrong should hear it.
+            let prof = pick_named(state, named, from)?;
+            let actual = prof.targets().program.clone();
+            if actual != p {
+                return Err(ApiError::conflict(format!(
+                    "profile '{}' belongs to {}, not to program '{p}'",
+                    prof.name,
+                    if actual.is_empty() { "no program".to_string() } else { format!("program '{actual}'") }
+                )));
+            }
+            Ok(prof)
+        }
+        _ => pick_named(state, name, from),
+    }
+}
+
+fn pick_named(
+    state: &SharedState,
+    name: Option<&str>,
     from: Params,
 ) -> Result<std::sync::Arc<crate::state::Profile>, ApiError> {
     state.profile(name).map_err(|e| {
@@ -485,6 +765,7 @@ fn pick(
             "known_profiles": state.profile_names(),
             "default": state.effective_default(),
             "hint": from.profile_hint(),
+            "programs": program_names(state),
         }))
     })
 }
@@ -1170,6 +1451,10 @@ pub async fn ping() -> Response {
 /// One profile's hold on a window, as `/health` found it.
 struct Binding {
     profile: String,
+    /// Two profiles of one program sharing a window is what `program_problems` judges, from
+    /// the documents alone - so this warning leaves those pairs to it rather than saying the
+    /// same thing twice.
+    program: String,
     handle: isize,
     title: String,
     pid: u32,
@@ -1189,8 +1474,11 @@ struct Binding {
 fn shared_window_problems(bindings: &[Binding]) -> Vec<String> {
     let mut out = Vec::new();
     for b in bindings.iter().filter(|b| !b.identifies) {
-        let others: Vec<&Binding> =
-            bindings.iter().filter(|o| o.handle == b.handle && o.profile != b.profile).collect();
+        let others: Vec<&Binding> = bindings
+            .iter()
+            .filter(|o| o.handle == b.handle && o.profile != b.profile)
+            .filter(|o| b.program.is_empty() || o.program != b.program)
+            .collect();
         if others.is_empty() {
             continue;
         }
@@ -1266,6 +1554,7 @@ pub async fn health(State(state): State<SharedState>) -> Response {
             let t = prof.targets();
             let mut entry = json!({
                 "description": t.description,
+                "program": t.program,
                 // Give a count without saying where the names come from and the reader starts
                 // inventing them. What to call next goes right here.
                 "names": format!("/profiles?profile={name}"),
@@ -1336,6 +1625,7 @@ pub async fn health(State(state): State<SharedState>) -> Response {
                     }
                     bindings.push(Binding {
                         profile: name.clone(),
+                        program: t.program.clone(),
                         handle: info.handle,
                         title: info.title.clone(),
                         pid: info.pid,
@@ -1371,6 +1661,26 @@ pub async fn health(State(state): State<SharedState>) -> Response {
             per_profile.insert(name.clone(), entry);
         }
         problems.extend(shared_window_problems(&bindings));
+        let docs: Vec<(String, String, crate::win::window::WindowSpec, bool)> = snapshot
+            .iter()
+            .map(|(name, p)| {
+                let t = p.targets();
+                (t.program.clone(), name.clone(), t.window.clone(), !t.anchors.is_empty())
+            })
+            .collect();
+        problems.extend(program_problems(&docs));
+        // Per program, the profile a request naming it would get right now - by the same
+        // choice, so this and the request cannot disagree.
+        let mut programs = serde_json::Map::new();
+        if let Some(map) = programs_map(&st).as_object() {
+            for (prog, names) in map {
+                let (open, why) = match resolve_program(&st, prog) {
+                    Ok(p) => (json!(p.name), Value::Null),
+                    Err(e) => (Value::Null, json!(e.message)),
+                };
+                programs.insert(prog.clone(), json!({"profiles": names, "open": open, "why": why}));
+            }
+        }
 
         json!({
             "status": if problems.is_empty() { "ok" } else { "degraded" },
@@ -1384,6 +1694,7 @@ pub async fn health(State(state): State<SharedState>) -> Response {
             "our_elevation": our.as_str(),
             "default_profile": st.effective_default(),
             "profiles": per_profile,
+            "programs": programs,
             "policy": {
                 "allow_raw_clicks": st.config.allow_raw_clicks,
                 "allow_raw_keys": st.config.allow_raw_keys,
@@ -1430,7 +1741,7 @@ pub async fn window_info(
     State(state): State<SharedState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
-    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), q_get(&q, "program").as_deref(), Params::Query)?;
     let t = prof.targets();
     let (info, scale, warning) = tokio::task::spawn_blocking(move || bind_window_view(&t))
         .await
@@ -1505,6 +1816,7 @@ fn defs_view(t: &Targets) -> Value {
 
     json!({
         "description": t.description,
+        "program": t.program,
         "window": t.window,
         "reference_client": t.reference_client,
         "on_size_mismatch": t.on_size_mismatch,
@@ -1549,13 +1861,25 @@ pub async fn profiles(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
     let wanted = q_get(&q, "profile");
+    let program = q_get(&q, "program");
     let mut out = serde_json::Map::new();
-    match &wanted {
-        Some(name) => {
-            let prof = pick(&state, Some(name), Params::Query)?;
+    match (&wanted, &program) {
+        (Some(name), _) => {
+            let prof = pick(&state, Some(name), program.as_deref(), Params::Query)?;
             out.insert(prof.name.clone(), profile_view(&prof));
         }
-        None => {
+        // A filter here, not a pick. What was asked for is definitions, and they exist whether
+        // or not a window is open - so this is every profile of the program, not the open one.
+        (None, Some(p)) => {
+            let members = program_members(&state, p);
+            if members.is_empty() {
+                return Err(no_such_program(&state, p));
+            }
+            for m in members {
+                out.insert(m.name.clone(), profile_view(&m));
+            }
+        }
+        (None, None) => {
             for (name, prof) in state.profiles.load().iter() {
                 out.insert(name.clone(), profile_view(prof));
             }
@@ -1564,6 +1888,7 @@ pub async fn profiles(
     let mut body = json!({
         "default_profile": state.effective_default(),
         "profiles": out,
+        "programs": programs_map(&state),
         "policy": policy_json(&state),
     });
     if let Some(name) = wanted {
@@ -1578,7 +1903,7 @@ pub async fn list_buttons(
     State(state): State<SharedState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
-    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), q_get(&q, "program").as_deref(), Params::Query)?;
     let view = profile_view(&prof);
     Ok(json_ok(json!({
         "profile": prof.name,
@@ -1596,7 +1921,7 @@ pub async fn list_regions(
     State(state): State<SharedState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
-    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), q_get(&q, "program").as_deref(), Params::Query)?;
     let view = profile_view(&prof);
     Ok(json_ok(json!({
         "profile": prof.name,
@@ -1627,7 +1952,7 @@ pub async fn capture_png(
 }
 
 async fn do_capture(state: &SharedState, req: CaptureReq) -> Result<(Vec<u8>, Value, Value), ApiError> {
-    let prof = pick(state, req.profile.as_deref(), req.params)?;
+    let prof = pick(state, req.profile.as_deref(), req.program.as_deref(), req.params)?;
     let st = state.clone();
     tokio::task::spawn_blocking(move || {
         let t = prof.targets();
@@ -1776,7 +2101,7 @@ pub async fn preview_png(
         req.save = Some(false);
     }
 
-    let prof = pick(&state, req.profile.clone().as_deref(), Params::Query)?;
+    let prof = pick(&state, req.profile.clone().as_deref(), req.program.clone().as_deref(), Params::Query)?;
     let st = state.clone();
     let (png, meta, _win) = tokio::task::spawn_blocking(move || {
         let live = prof.targets();
@@ -1865,7 +2190,7 @@ pub async fn spell(
     State(state): State<SharedState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
-    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), q_get(&q, "program").as_deref(), Params::Query)?;
     let text = q_get(&q, "text").ok_or_else(|| {
         ApiError::bad_request("text is required — GET /spell?text=G91X0").with_detail(json!({
             "note": "this presses nothing; it answers which keys that string would press",
@@ -1945,7 +2270,7 @@ pub async fn sheet_png(
 }
 
 async fn do_sheet(state: &SharedState, q: HashMap<String, String>) -> Result<(Vec<u8>, Value), ApiError> {
-    let prof = pick(state, q_get(&q, "profile").as_deref(), Params::Query)?;
+    let prof = pick(state, q_get(&q, "profile").as_deref(), q_get(&q, "program").as_deref(), Params::Query)?;
     let order = SheetOrder::parse(q_get(&q, "order").as_deref())?;
     let wanted: Option<Vec<String>> = q_get(&q, "buttons").map(|v| {
         v.split(',').map(|b| b.trim().to_string()).filter(|b| !b.is_empty()).collect()
@@ -2135,7 +2460,7 @@ fn sheet_now(
 /// controls into windows, and the way forward is drawing them by hand in `/editor`. The
 /// response says exactly that.
 pub async fn controls(State(state): State<SharedState>, Query(q): Query<HashMap<String, String>>) -> Result<Response, ApiError> {
-    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), q_get(&q, "program").as_deref(), Params::Query)?;
     tokio::task::spawn_blocking(move || {
         let t = prof.targets();
         let info = find_window(&t)?;
@@ -2211,7 +2536,8 @@ pub async fn admin_get_profile(
     State(state): State<SharedState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
-    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
+    no_program_here(&q)?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), None, Params::Query)?;
     let doc = serde_json::to_value(&*prof.targets())
         .map_err(|e| ApiError::internal(format!("could not serialize the profile: {e}")))?;
     Ok(json_ok(doc))
@@ -2461,6 +2787,7 @@ pub async fn admin_patch_profile(
     Query(q): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    no_program_here(&q)?;
     editing_allowed(&state)?;
     let text = std::str::from_utf8(&body)
         .map_err(|_| ApiError::bad_request("body must be UTF-8 JSON"))?;
@@ -2478,7 +2805,7 @@ pub async fn admin_patch_profile(
         return Err(ApiError::bad_request("the patch is empty — nothing would change"));
     }
 
-    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), None, Params::Query)?;
     let before = prof.targets();
     let before_doc = serde_json::to_value(&*before)
         .map_err(|e| ApiError::internal(format!("could not serialize the profile: {e}")))?;
@@ -2581,6 +2908,7 @@ pub async fn admin_save_profile(
     Query(q): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    no_program_here(&q)?;
     editing_allowed(&state)?;
     // Parse and validate the body **first**. This used to create the profile file and then
     // look at the body, so a broken body left an unusable file behind (measured). Side effects
@@ -2622,7 +2950,7 @@ pub async fn admin_save_profile(
             });
             (p, true)
         }
-        other => (pick(&state, other.as_deref(), Params::Query)?, false),
+        other => (pick(&state, other.as_deref(), None, Params::Query)?, false),
     };
 
     // A whole-document POST is where a confirm flag goes missing by accident: 140 buttons
@@ -2739,9 +3067,31 @@ PROFILES
   GET /health lists them with a human-written description each, and GET /profiles
   gives their full definitions. If a person names an application rather than a
   profile, match what they said against those descriptions and window titles - do
-  not guess. Several profiles can share one title when one application opens several
-  projects; window.has is what tells them apart (WHEN ONE APPLICATION OPENS SEVERAL
-  PROJECTS UNDER ONE TITLE, below).
+  not guess.
+
+  PROGRAMS - several versions of one application. A profile can say which application it
+  is a version of: "program": "ncguide". A program's profiles are ALTERNATIVES - the same
+  application with a different project loaded, one open at a time (NCGuide's 0i lathe, 0i
+  mill and 30i). Then you can name the program instead of the profile, and the server uses
+  whichever of its profiles is open:
+    curl -s -o shot.png "{base}/capture.png?program=ncguide"
+    curl -s -X POST -H "Content-Type: application/json" \
+      -d '{{"program": "ncguide", "button": "NAME"}}' {base}/click
+  It picks one only when that profile PROVES the open window is its own - its window.has
+  marks are there, its anchors resolve, or its title is one no other profile of the program
+  could also match. Otherwise it refuses and says which case it is: none open, two open, or
+  one open that cannot show the window is its own. It never picks the only one bound on
+  that alone - the open project may be one no profile describes.
+  THE REPLY'S "profile" SAYS WHICH ONE WAS USED. Button names differ between the versions,
+  so read it before you name a button.
+  GET /profiles lists "programs", and GET /profiles?program=NAME returns every profile of
+  that program - a filter, not a pick. GET /health says per program which profile is open
+  right now, by the same rule a request uses. Editing (/admin/...) never takes program:
+  name the exact profile you mean to change.
+  A dialog that opens BESIDE the main window is not an alternative. In the same program it
+  would make the program ambiguous whenever it shows - give it no program. And where the
+  versions share a title, see WHEN ONE APPLICATION OPENS SEVERAL PROJECTS UNDER ONE TITLE
+  below for how they tell each other apart.
 
   Omitting profile works only when it is unambiguous: when the operator set a default,
   or when exactly one profile exists. With two or more and no default you get a 404
@@ -3135,11 +3485,14 @@ ENDPOINTS
                        another and has nothing to tell whether it is its own - no
                        window.has and no anchors. Each such profile looks fine alone -
                        see WHEN ONE APPLICATION OPENS SEVERAL PROJECTS below.
+                       "programs" says, per program, which of its profiles is open right
+                       now - the one program=NAME would use - or why none can be picked.
                        "status" is ok or degraded and "problems" lists what is wrong, in
                        plain language - a locked session, a profile that failed to parse,
                        a window that is not open. "policy" says which of the gated things
                        this server allows, including whether an admin code is required
-  GET  /profiles       every profile's full definition; one call tells you everything
+  GET  /profiles       every profile's full definition; one call tells you everything.
+                       ?program=NAME for that program's profiles; "programs" groups them
   GET  /buttons        just the button list of one profile (subset of /profiles)
   GET  /regions        just the region list of one profile (subset of /profiles)
   GET  /sheet.png      one cropped picture per button with its name under it. The way to
@@ -3239,8 +3592,11 @@ CREATE A PROFILE FROM SCRATCH
      it travels in URLs and capture file names.
        curl -s -X POST -H "Content-Type: application/json" \
          -d '{{"description": "the Mitsubishi CNC simulator the operator calls NC plus",
+              "program": "nctrainer",
               "window": {{"title": "NC Trainer2", "title_exact": false, "class": ""}}}}' \
-         "{base}/admin/profile?profile=nctrainer"
+         "{base}/admin/profile?profile=nctrainer-lathe"
+     "program" is the application; the profile name is this version of it. Leave it out
+     only when the application has, and will have, a single version.
      WRITE THE DESCRIPTION IN PLAIN LANGUAGE. It is the only thing connecting what a
      person says ("use the NC simulator") to a profile named nctrainer. Leaving it
      empty means the next agent has to guess.
@@ -3438,6 +3794,10 @@ EDITING A PROFILE FROM A PROGRAM
   Exactly one should come back with the window; the others should refuse. For NCGuide that
   was nine calls for three projects, and all nine came out as intended.
 
+  Give such profiles one "program" (PROGRAMS, above) and program=NAME uses whichever is open.
+  has is what lets the server prove which one that is; without it, profiles that share a
+  title cannot be picked by program at all.
+
   Anchors identify the project as well (see the next section), but only AFTER a window has
   been chosen - with two projects open they cannot pick between them. has is that identity
   check on its own, for a layout that never moves, without making every button name an
@@ -3556,6 +3916,14 @@ TRAPS - these fail quietly or confusingly. Read once, save yourself an hour.
                    belongs to: use that one, or ask the person to open the project this
                    profile was made for. If the right project IS open, the window is
                    likely at another size - see CHOOSING THE MARK above.
+  409 program      "N of program P's profiles are open", or "only X accepts the open
+                   window, but it cannot show the window is its own". The server would not
+                   pick a profile it could not prove. Two open: name the one you mean with
+                   profile=. One unproven: that profile needs window.has. Do not answer it by
+                   choosing the profile yourself on the same evidence - that is the guess the
+                   refusal declined to make.
+  400 program      "program=... is not accepted here" on an /admin call. Editing names the
+                   exact profile; which one is open is not a way to choose a file to rewrite.
   409 minimized    POST /window/focus.
   black capture    The console session is locked or RDP is disconnected. Nothing will
                    work until a human unlocks it. /health says so explicitly.
@@ -3953,7 +4321,7 @@ const DEFAULT_SEQUENCE_SETTLE_MS: u64 = 800;
 const MAX_SEQUENCE: usize = 200;
 
 async fn do_click(state: &SharedState, mut req: ClickReq) -> Result<(Option<Vec<u8>>, Value), ApiError> {
-    let prof = pick(state, req.profile.as_deref(), req.params)?;
+    let prof = pick(state, req.profile.as_deref(), req.program.as_deref(), req.params)?;
     // One input at a time, across every profile. There is one mouse and one foreground on a
     // PC, so driving two windows at once would have them stealing focus from each other.
     let _guard = state.input_lock.lock().await;
@@ -4427,7 +4795,7 @@ async fn do_click(state: &SharedState, mut req: ClickReq) -> Result<(Option<Vec<
 /// reliable than clicking.
 pub async fn key(State(state): State<SharedState>, body: Bytes) -> Result<Response, ApiError> {
     let req: KeyReq = parse_body(&body)?;
-    let prof = pick(&state, req.profile.as_deref(), Params::Body)?;
+    let prof = pick(&state, req.profile.as_deref(), req.program.as_deref(), Params::Body)?;
     let _guard = state.input_lock.lock().await;
     let st = state.clone();
     tokio::task::spawn_blocking(move || {
@@ -4577,7 +4945,7 @@ fn raw_keys_denied(t: &Targets) -> ApiError {
 /// Bring the window to the front. Done automatically before a click, but also useful when a
 /// person wants to look at the screen.
 pub async fn window_focus(State(state): State<SharedState>, Query(q): Query<HashMap<String, String>>) -> Result<Response, ApiError> {
-    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), q_get(&q, "program").as_deref(), Params::Query)?;
     let _guard = state.input_lock.lock().await;
     tokio::task::spawn_blocking(move || {
         let t = prof.targets();
@@ -4602,7 +4970,7 @@ pub async fn window_focus(State(state): State<SharedState>, Query(q): Query<Hash
 /// Restore the client area to `reference_client` — the one move that recovers from a window
 /// size drifting and taking every coordinate with it.
 pub async fn window_fit(State(state): State<SharedState>, Query(q): Query<HashMap<String, String>>) -> Result<Response, ApiError> {
-    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), q_get(&q, "program").as_deref(), Params::Query)?;
     let _guard = state.input_lock.lock().await;
     tokio::task::spawn_blocking(move || {
         let t = prof.targets();
@@ -4712,6 +5080,7 @@ pub async fn admin_delete_profile(
     State(state): State<SharedState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
+    no_program_here(&q)?;
     editing_allowed(&state)?;
     let Some(name) = q_get(&q, "profile") else {
         return Err(ApiError::bad_request("which profile? pass ?profile=NAME")
@@ -4727,7 +5096,7 @@ pub async fn admin_delete_profile(
                               on the target PC, so a person can put it back",
         })));
     }
-    let prof = pick(&state, Some(&name), Params::Query)?;
+    let prof = pick(&state, Some(&name), None, Params::Query)?;
     not_the_configured_default(&state, &prof.name)?;
 
     let path = prof.path.clone();
@@ -4806,7 +5175,7 @@ pub async fn menus(
     State(state): State<SharedState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
-    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), q_get(&q, "program").as_deref(), Params::Query)?;
     tokio::task::spawn_blocking(move || {
         let t = prof.targets();
         let info = find_window(&t)?;
@@ -4850,6 +5219,8 @@ pub async fn menus(
 pub struct MenuReq {
     #[serde(default)]
     pub profile: Option<String>,
+    #[serde(default)]
+    pub program: Option<String>,
     /// `"Tool/Set Machine Parameters"`, as `GET /menus` prints it.
     #[serde(default)]
     pub path: Option<String>,
@@ -4889,7 +5260,7 @@ pub async fn menu(State(state): State<SharedState>, body: Bytes) -> Result<Respo
     let path = req.path.clone().filter(|p| !p.trim().is_empty()).ok_or_else(|| {
         ApiError::bad_request("'path' is required — GET /menus lists them")
     })?;
-    let prof = pick(&state, req.profile.as_deref(), Params::Body)?;
+    let prof = pick(&state, req.profile.as_deref(), req.program.as_deref(), Params::Body)?;
 
     // One input at a time, like a click: a menu command that opens a dialog changes what the
     // next press would land on.
@@ -5133,11 +5504,12 @@ pub async fn admin_refit_profile(
     Query(q): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    no_program_here(&q)?;
     editing_allowed(&state)?;
     let req: RefitReq = parse_body(&body)?;
     let apply = req.apply.unwrap_or(false) || q_bool(&q, "apply")?.unwrap_or(false);
     let force = req.force.unwrap_or(false) || q_bool(&q, "force")?.unwrap_or(false);
-    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), None, Params::Query)?;
 
     tokio::task::spawn_blocking(move || refit_now(&prof, req, apply, force))
         .await
@@ -5396,6 +5768,7 @@ pub async fn admin_rename_profile(
     State(state): State<SharedState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
+    no_program_here(&q)?;
     editing_allowed(&state)?;
     let Some(to) = q_get(&q, "to") else {
         return Err(ApiError::bad_request("rename to what? pass &to=NEWNAME"));
@@ -5405,7 +5778,7 @@ pub async fn admin_rename_profile(
             "'{to}' is not a valid profile name — letters, digits, '-' and '_' only"
         )));
     }
-    let prof = pick(&state, q_get(&q, "profile").as_deref(), Params::Query)?;
+    let prof = pick(&state, q_get(&q, "profile").as_deref(), None, Params::Query)?;
     if prof.name == to {
         return Err(ApiError::bad_request(format!("'{to}' is already its name")));
     }
@@ -5457,6 +5830,7 @@ pub async fn admin_reload(
     State(state): State<SharedState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
+    no_program_here(&q)?;
     // With no `?profile=` this **rescans the disk** — drop in a new
     // profiles/deescreen.<name>.json, call this, and the profile exists without a restart.
     // Naming one re-reads only that one.
@@ -5492,7 +5866,7 @@ pub async fn admin_reload(
         })));
     };
 
-    let prof = pick(&state, Some(&name), Params::Query)?;
+    let prof = pick(&state, Some(&name), None, Params::Query)?;
     let path = prof.path.clone();
     let fresh = tokio::task::spawn_blocking(move || Targets::load(&path))
         .await
@@ -5576,6 +5950,7 @@ mod tests {
     fn overlay_probe(mode: &str) -> (image::RgbaImage, Value) {
         let mut t = crate::targets::Targets {
             description: String::new(),
+            program: String::new(),
             window: crate::win::window::WindowSpec {
                 title: "x".into(),
                 title_exact: false,
@@ -5659,6 +6034,7 @@ mod tests {
     fn raw_coordinates_do_not_slip_past_a_confirm_button() {
         let mut t = crate::targets::Targets {
             description: String::new(),
+            program: String::new(),
             window: crate::win::window::WindowSpec {
                 title: "x".into(),
                 title_exact: false,
@@ -5859,6 +6235,37 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "a lost line-continuation left indentation inside a message:\n{}", bad.join("\n"));
+    }
+
+    /// The manual is skipped above, because its own indentation is deliberate. But a curl
+    /// example there loses its backslash-newline the same way, and comes out as one line with
+    /// a run of spaces before the next flag - which still runs, so nothing else notices. This
+    /// happened three times before this test existed.
+    #[test]
+    fn no_manual_example_has_lost_its_line_break() {
+        let src = include_str!("api.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines.iter().position(|l| l.contains("r#\"deescreen v{version}")).expect("manual start");
+        let end = start
+            + lines[start..].iter().position(|l| l.trim_start().starts_with("\"#")).expect("manual end");
+        let mut bad = Vec::new();
+        for (i, l) in lines[start..end].iter().enumerate() {
+            let b = l.as_bytes();
+            // Something, three or more spaces, then a flag: `json"    -d '...`.
+            for w in 0..b.len().saturating_sub(5) {
+                if b[w] != b' '
+                    && b[w + 1..w + 4] == *b"   "
+                    && let Some(rest) = l.get(w + 4..)
+                {
+                    let rest = rest.trim_start();
+                    if rest.starts_with('-') && rest[1..].starts_with(|c: char| c.is_ascii_alphabetic() || c == '-') {
+                        bad.push(format!("api.rs:{}: {}", start + i + 1, l.trim()));
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "a manual example lost its line break:\n{}", bad.join("\n"));
     }
 
     /// The layout-drift check: same size elsewhere is drift, a different size says nothing.
@@ -6094,7 +6501,9 @@ mod tests {
         // absent from both sides and prove nothing.
         let doc = r#"{
             "description": "a simulator",
-            "window": {"title": "NC", "title_exact": false, "class": ""},
+            "program": "nc",
+            "window": {"title": "NC", "title_exact": false, "class": "",
+                       "has": [{"text": "MDI", "size": [1, 2]}]},
             "reference_client": [1280, 1000],
             "on_size_mismatch": "scale",
             "anchors": {"screen": {"text": "NC DISPLAY", "rect": [10, 10, 100, 100], "note": "n"}},
@@ -6173,6 +6582,7 @@ mod tests {
     fn a_profile_that_cannot_tell_is_named_when_it_shares_a_window() {
         let b = |p: &str, h: isize, identifies: bool, confirmed: bool| Binding {
             profile: p.to_string(),
+            program: String::new(),
             handle: h,
             title: "FANUC NCGuide".to_string(),
             pid: 6088,
@@ -6195,6 +6605,84 @@ mod tests {
         assert!(shared_window_problems(&[b("a", 1, true, true), b("b", 1, true, true)]).is_empty());
         // Two that cannot tell are both named.
         assert_eq!(shared_window_problems(&[b("a", 1, false, false), b("b", 1, false, false)]).len(), 2);
+    }
+
+    fn open(p: &str, handle: isize, identifies: bool) -> Seen {
+        Seen { profile: p.into(), state: SeenState::Open { handle, pid: 1, identifies } }
+    }
+    fn absent(p: &str) -> Seen {
+        Seen { profile: p.into(), state: SeenState::Absent("not this project".into()) }
+    }
+
+    /// The three NCGuide projects, as they were checked live: one open at a time, each with
+    /// window.has, and the other two refusing.
+    #[test]
+    fn a_program_picks_the_one_profile_that_proves_the_window_is_its_own() {
+        let seen = [absent("ncguide-0i-lathe"), open("ncguide-0i-mill", 7, true), absent("ncguide-30i")];
+        assert_eq!(choose(&seen), Chosen::One(1));
+
+        // Nothing open is its own answer, not a guess.
+        assert_eq!(choose(&[absent("a"), absent("b")]), Chosen::NoneOpen);
+    }
+
+    /// The case that started all this: a 30i profile with nothing to check accepted a 0i lathe.
+    /// Being the only one bound is not proof — the open window may be a project no profile
+    /// describes — so it is refused rather than picked.
+    #[test]
+    fn the_only_profile_bound_is_not_picked_unless_it_proves_it() {
+        let seen = [absent("ncguide-0i-lathe"), absent("ncguide-0i-mill"), open("ncguide-30i", 7, false)];
+        assert_eq!(choose(&seen), Chosen::Unproven(2));
+    }
+
+    /// Two open is never resolved by picking one. The reply tells the two situations apart —
+    /// one window accepted by both, or two projects running — from the handles.
+    #[test]
+    fn two_open_are_refused_whether_they_share_a_window_or_not() {
+        let same = [open("a", 7, true), open("b", 7, true)];
+        assert_eq!(choose(&same), Chosen::Several(vec![0, 1]));
+        let apart = [open("a", 7, true), absent("b"), open("c", 9, true)];
+        assert_eq!(choose(&apart), Chosen::Several(vec![0, 2]));
+    }
+
+    /// A profile that matches several windows cannot say which one it would drive, and a
+    /// choice made while that is true could be made on the wrong one.
+    #[test]
+    fn a_profile_that_matches_several_windows_stops_the_choice() {
+        let seen = [
+            open("a", 7, true),
+            Seen { profile: "b".into(), state: SeenState::Unclear("two windows".into()) },
+        ];
+        assert_eq!(choose(&seen), Chosen::Unclear(vec![1]));
+    }
+
+    /// Judged from the documents alone. NCGuide's profiles share a title, so each needs
+    /// something inside the window; NC Trainer's differ in the title and need nothing more.
+    #[test]
+    fn a_program_profile_that_nothing_could_tell_apart_is_named() {
+        let w = |t: &str, marked: bool| crate::win::window::WindowSpec {
+            title: t.into(),
+            title_exact: true,
+            class: String::new(),
+            has: if marked {
+                vec![crate::win::window::ControlMark { text: "MDI".into(), size: [1, 1] }]
+            } else {
+                Vec::new()
+            },
+        };
+        let m = |prog: &str, name: &str, spec, anchored| (prog.to_string(), name.to_string(), spec, anchored);
+        let got = program_problems(&[
+            m("ncguide", "ncguide-0i-lathe", w("FANUC NCGuide", true), true),
+            m("ncguide", "ncguide-0i-mill", w("FANUC NCGuide", false), true),
+            m("ncguide", "ncguide-30i", w("FANUC NCGuide", false), false),
+            m("nctrainer", "nctrainer-lathe", w("M830_L - NC Trainer2", false), false),
+            m("nctrainer", "nctrainer-mill", w("M830V_M - NC Trainer2", false), false),
+            // Same title as NCGuide, but in no program: not this check's business.
+            m("", "loose", w("FANUC NCGuide", false), false),
+        ]);
+        assert_eq!(got.len(), 1, "{got:#?}");
+        assert!(got[0].contains("profile 'ncguide-30i'"), "{}", got[0]);
+        assert!(got[0].contains("ncguide-0i-lathe, ncguide-0i-mill"), "{}", got[0]);
+        assert!(!got[0].contains("loose"), "another program's profile is not a rival: {}", got[0]);
     }
 
     /// The sentence a refusal carries has to name the place the caller is actually standing in.

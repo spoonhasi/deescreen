@@ -1,5 +1,6 @@
 {
   "description": "the Mitsubishi CNC simulator that mirrors the real machine's screen",
+  "program": "nctrainer",
   "window": {
     "title": "NC Trainer",
     "title_exact": false,
