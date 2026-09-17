@@ -394,6 +394,35 @@ impl Targets {
             for (name, r) in &self.regions {
                 known("region", name, &r.anchor)?;
             }
+        } else {
+            // No anchors declared, so an anchor NAME here refers to nothing, and offset_for
+            // treats a name it cannot find as no shift at all. The way this happens is a
+            // whole-document save that lost the anchors map while every element kept its
+            // anchor - and passing it would switch the correction off without anyone having
+            // decided to. `@fixed` is still fine: it says "no shift", which is what happens.
+            let dangling: Vec<String> = self
+                .buttons
+                .iter()
+                .filter(|(_, b)| !b.anchor.is_empty() && b.anchor != "@fixed")
+                .map(|(n, b)| format!("{n} -> {}", b.anchor))
+                .chain(
+                    self.regions
+                        .iter()
+                        .filter(|(_, r)| !r.anchor.is_empty() && r.anchor != "@fixed")
+                        .map(|(n, r)| format!("{n} -> {}", r.anchor)),
+                )
+                .collect();
+            if !dangling.is_empty() {
+                let shown: Vec<&str> = dangling.iter().take(5).map(String::as_str).collect();
+                return Err(format!(
+                    "{} buttons and regions name an anchor, but this profile declares none \
+                     (starting with: {}). Nothing would correct them. If the anchors were \
+                     removed on purpose, clear those names as well; if not, the anchors map \
+                     was lost on the way here - send it back with the rest of the document.",
+                    dangling.len(),
+                    shown.join(", ")
+                ));
+            }
         }
 
         for (name, r) in &self.regions {
@@ -1364,6 +1393,29 @@ mod tests {
         // An empty entry would otherwise match every path and guard the whole menu by accident.
         assert_eq!(menu_needs_confirm("File/Save", &["".to_string()]), None);
         assert_eq!(menu_needs_confirm("File/Save", &[]), None);
+    }
+
+    /// The editor used to rebuild a profile without its anchors map and save it. Every
+    /// button kept its anchor name, validation only looked at names when anchors existed, and
+    /// the correction for a moving layout switched itself off. A name that points at nothing
+    /// is refused now.
+    #[test]
+    fn an_anchor_name_with_no_anchors_behind_it_is_refused() {
+        let lost = r#"{"window":{"title":"x"},"buttons":{
+            "A":{"rect":[0,0,10,10],"anchor":"main"},
+            "B":{"rect":[20,0,10,10],"anchor":"@fixed"}}}"#;
+        let e = serde_json::from_str::<Targets>(lost)
+            .expect("parses")
+            .validate()
+            .expect_err("'main' refers to nothing");
+        assert!(e.contains("A -> main"), "{e}");
+        assert!(!e.contains("B ->"), "@fixed means no shift, which is what happens: {e}");
+
+        // Only @fixed and empty names, with no anchors: nothing to correct, nothing lost.
+        let fine = r#"{"window":{"title":"x"},"buttons":{
+            "A":{"rect":[0,0,10,10]},
+            "B":{"rect":[20,0,10,10],"anchor":"@fixed"}}}"#;
+        serde_json::from_str::<Targets>(fine).expect("parses").validate().expect("valid");
     }
 
     #[test]

@@ -2227,6 +2227,15 @@ fn confirm_flags_lost(before: &Targets, after: &Targets) -> Vec<String> {
         .filter(|(_, b)| b.confirm)
         .filter(|(name, _)| after.buttons.get(*name).is_none_or(|now| !now.confirm))
         .map(|(name, _)| name.clone())
+        // A menu path under confirm_menus is the same judgement about the same machine, made
+        // for a thing that has no rectangle. Losing it is losing a confirm flag.
+        .chain(
+            before
+                .confirm_menus
+                .iter()
+                .filter(|m| !after.confirm_menus.contains(m))
+                .map(|m| format!("menu:{m}")),
+        )
         .collect()
 }
 
@@ -2389,7 +2398,7 @@ fn allow_losing_confirm(
         "buttons": lost,
  "why": "a person marked those as needing a human before they are pressed. Removing the flag is the same decision as pressing one, so it asks the same way.",
  "hint": "resend with &confirm=true if removing it is part of the work you were asked to do. If you are here because a press was refused, this is not the way around that — the press itself takes \"confirm\": true, and leaves the flag where it is for whoever comes next.",
- "note": "dropping a button that had the flag counts too — a raw coordinate inside it stops being protected the moment the button is gone",
+ "note": "dropping a button that had the flag counts too — a raw coordinate inside it stops being protected the moment the button is gone. Entries starting with menu: are paths removed from confirm_menus, which is the same protection for the menu bar.",
     })))
 }
 
@@ -6123,6 +6132,22 @@ mod tests {
         assert_eq!(a["name"], json!("screen"));
         assert_eq!(a["text"], json!("NC DISPLAY"));
         assert_eq!(a["rect"], json!([10, 10, 100, 100]));
+
+        // The editor copies this form back as a document, converting only the four keyed
+        // collections. So the reading form must also carry NOTHING the document lacks — an
+        // extra key here is one the save then sends, and the document refuses unknown fields.
+        // Checked per entry as well, because that is where the editor strips only `name`.
+        let extra: Vec<&String> = view.keys().filter(|k| !saved.contains_key(*k)).collect();
+        assert!(extra.is_empty(), "GET /profiles adds keys a save would send back: {extra:?}");
+        for coll in ["anchors", "buttons", "regions"] {
+            let entry = view[coll][0].as_object().expect("an entry");
+            let doc_entry = saved[coll].as_object().expect("a map").values().next().expect("one");
+            let doc_keys: std::collections::BTreeSet<&String> =
+                doc_entry.as_object().expect("an object").keys().collect();
+            let view_keys: std::collections::BTreeSet<&String> =
+                entry.keys().filter(|k| *k != "name").collect();
+            assert_eq!(view_keys, doc_keys, "a {coll} entry differs between the two forms");
+        }
     }
 
     /// The numbers from the live NCGuide 0i window. A softkey painted onto the CNC screen
@@ -6248,6 +6273,19 @@ mod tests {
         )
         .expect("parses");
         assert!(confirm_flags_lost(&before, &harmless).is_empty(), "no flag was lost");
+
+        // A guarded menu path is the same protection. The editor once rebuilt documents
+        // without it, which is how a whole-document save loses it without anyone deciding to.
+        let menus: Targets = serde_json::from_str(
+            r#"{"window":{"title":"x"},"confirm_menus":["File","Tool/Set"],"buttons":{}}"#,
+        )
+        .expect("parses");
+        let one_left: Targets = serde_json::from_str(
+            r#"{"window":{"title":"x"},"confirm_menus":["Tool/Set"],"buttons":{}}"#,
+        )
+        .expect("parses");
+        assert_eq!(confirm_flags_lost(&menus, &one_left), vec!["menu:File".to_string()]);
+        assert!(confirm_flags_lost(&one_left, &menus).is_empty(), "adding one is free");
     }
 
     /// Merge patch, the three rules that matter: a null removes, an object merges into what is

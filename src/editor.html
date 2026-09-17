@@ -823,39 +823,31 @@ async function restoreWindow() {
 }
 
 // Turn one profile view from `/profiles` (arrays) back into the saved document shape.
+// The reading form (GET /profiles) lists these as arrays of {name, ...}; the saved form keys
+// them by name. They are the only things converted. Everything else is copied as it arrives.
+const KEYED = ['anchors', 'regions', 'buttons', 'keys'];
+
+// GET /profiles -> the document POST takes.
+//
+// Copy everything, convert only the collections. Listing the fields one by one is how the
+// anchors map, shift and confirm_menus were each dropped on save - POST replaces the whole
+// document, so a field this page did not carry was deleted, and for anchors nothing
+// complained. The server keeps the reading form complete (a test compares it against the
+// document's own fields), so copying every key is what makes this page complete too. A value
+// the server does not accept is refused loudly, which beats being dropped quietly.
 function toDoc(t) {
-  const d = {
-    description: t.description || '',
-    window: t.window,
-    reference_client: t.reference_client,
-    on_size_mismatch: t.on_size_mismatch,
-    regions: {}, buttons: {}, keys: {}
-  };
-  // A region is an object now, not a bare rectangle. Keep the fields this editor has no
-  // control for — dropping an anchor somebody set is not an edit anyone asked for.
-  for (const r of t.regions) {
-    const o = { rect: r.rect };
-    if (r.anchor) o.anchor = r.anchor;
-    if (r.note) o.note = r.note;
-    d.regions[r.name] = o;
+  const d = {};
+  for (const [k, v] of Object.entries(t)) {
+    if (!KEYED.includes(k)) d[k] = structuredClone(v);
   }
-  for (const g of t.buttons) {
-    const o = { rect: g.rect };
-    if (g.point) o.point = g.point;
-    if (g.click_button && g.click_button !== 'left') o.click_button = g.click_button;
-    if (g.double) o.double = true;
-    if (g.confirm) o.confirm = true;
-    if (g.settle_ms != null) o.settle_ms = g.settle_ms;
-    if (g.hold_ms != null) o.hold_ms = g.hold_ms;
-    // The keypad legends. This page cannot edit them, which is exactly why it has to carry
-    // them: a save that silently dropped them would take the whole spelling map with it.
-    if (g.types) o.types = g.types;
-    if (g.shift_types) o.shift_types = g.shift_types;
-    if (g.anchor) o.anchor = g.anchor;
-    if (g.note) o.note = g.note;
-    d.buttons[g.name] = o;
+  for (const k of KEYED) {
+    d[k] = {};
+    for (const entry of t[k] || []) {
+      const { name, ...rest } = entry;
+      // A key is the one collection whose value is not an object.
+      d[k][name] = k === 'keys' ? rest.keys : structuredClone(rest);
+    }
   }
-  for (const k of t.keys) d.keys[k.name] = k.keys;
   return d;
 }
 
@@ -872,25 +864,18 @@ function toDocFromItems() {
   const d = structuredClone(doc);
   d.regions = {}; d.buttons = {};
   for (const it of items) {
-    if (it.kind === 'region') {
-      const r = { rect: it.rect };
-      if (it.anchor) r.anchor = it.anchor;
-      if (it.note) r.note = it.note;
-      d.regions[it.name] = r;
+    // `kind` and `name` are this page's bookkeeping; everything else is the document's, and
+    // goes back as it came - for the same reason as toDoc.
+    const { kind, name, ...rest } = it;
+    if (kind === 'region') {
+      d.regions[name] = rest;
       continue;
     }
-    const o = { rect: it.rect };
-    if (it.point) o.point = it.point;
-    if (it.click_button && it.click_button !== 'left') o.click_button = it.click_button;
-    if (it.double) o.double = true;
-    if (it.confirm) o.confirm = true;
-    if (it.settle_ms != null && it.settle_ms !== '') o.settle_ms = Number(it.settle_ms);
-    if (it.hold_ms != null && it.hold_ms !== '') o.hold_ms = Number(it.hold_ms);
-    if (it.types) o.types = it.types;
-    if (it.shift_types) o.shift_types = it.shift_types;
-    if (it.anchor) o.anchor = it.anchor;
-    if (it.note) o.note = it.note;
-    d.buttons[it.name] = o;
+    // The two numbers edited as text come back as strings, or as '' for "the default".
+    for (const k of ['settle_ms', 'hold_ms']) {
+      rest[k] = rest[k] === '' || rest[k] == null ? null : Number(rest[k]);
+    }
+    d.buttons[name] = rest;
   }
   return d;
 }
