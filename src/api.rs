@@ -4258,6 +4258,9 @@ THE WINDOW'S MENU BAR - the one thing not written in the profile
   is what an application receives AFTER it has decided an item is enabled - so posting a
   greyed-out item's command may be acted on anyway. POST /menu reads the state the same way
   GET /menus does, asking first, so the check is against what the application would show.
+  An item INSIDE a disabled submenu is refused too, however its own state reads: that
+  submenu does not open, so no person could reach it. GET /menus marks such an item with
+  "blocked_by" - the disabled submenu - and leaves it out of "invocable".
 
   THE COMMAND IS POSTED, NOT SENT. A menu item that opens a modal dialog would otherwise
   hold the request open for as long as the dialog is on screen. So the reply means the
@@ -5334,6 +5337,9 @@ fn menu_item_json(m: &crate::win::menu::MenuItem, guarded: &[String]) -> Value {
     if m.empty {
         v["empty"] = json!(true);
     }
+    if let Some(b) = &m.blocked_by {
+        v["blocked_by"] = json!(b);
+    }
     if let Some(g) = crate::targets::menu_needs_confirm(&m.path, guarded) {
         v["confirm"] = json!(true);
         v["confirm_by"] = json!(g);
@@ -5365,6 +5371,48 @@ const EMPTY_SUBMENU: &str = "these submenus came back with nothing in them. That
                              invoked by path. Reach them by clicking: open the menu with a \
                              click, capture, and click the item.";
 
+/// Why a menu item cannot be invoked by its path, or `None` if it can.
+///
+/// Both refusals are for the same reason. `WM_COMMAND` is past the point where the application
+/// decides, so posting the command anyway might well be acted on - and that is the problem.
+/// Refusing is the only answer that cannot act on something the application had said no to,
+/// whether it said so on the item or on the submenu that holds it.
+fn menu_unusable(item: &crate::win::menu::MenuItem, refreshed: bool) -> Option<ApiError> {
+    if item.submenu {
+        return Some(ApiError::bad_request(format!("'{}' is a submenu, not a command", item.path)));
+    }
+    if !item.enabled {
+        return Some(ApiError::conflict(format!("the menu item '{}' is disabled", item.path)).with_detail(json!({
+            "path": item.path,
+            "state_refreshed": refreshed,
+            "note": if refreshed {
+                "the application, asked for the current state as it is when a person opens the \
+                 menu, reports it greyed out. Posting the command anyway may still be acted on, \
+                 which is exactly why this is refused rather than attempted. Put the \
+                 application into the mode where the item is available and ask again."
+            } else {
+                STALE_BUSY
+            },
+        })));
+    }
+    if let Some(b) = &item.blocked_by {
+        return Some(ApiError::conflict(format!(
+            "the menu item '{}' is inside '{b}', which is disabled",
+            item.path
+        ))
+        .with_detail(json!({
+            "path": item.path,
+            "blocked_by": b,
+            "state_refreshed": refreshed,
+            "note": "the item itself reads enabled, but a disabled submenu does not open, so no \
+                     person could reach it - the application has said no one level up. Its \
+                     command id would still be delivered, which is why this is refused. Put the \
+                     application into the mode where that submenu is available and ask again.",
+        })));
+    }
+    None
+}
+
 /// **The window's menu bar** — paths, command IDs and state. Presses nothing.
 ///
 /// An empty list is an answer. Not every application has a menu Windows can see, and the reply
@@ -5380,7 +5428,7 @@ pub async fn menus(
         let info = find_window(&t)?;
         let menu = crate::win::menu::read(info.handle, refresh);
         let items = menu.items;
-        let invocable = items.iter().filter(|m| !m.submenu && m.enabled).count();
+        let invocable = items.iter().filter(|m| menu_unusable(m, true).is_none()).count();
         let mut out = json!({
             "profile": prof.name,
             "window": window_json(&info),
@@ -5531,23 +5579,8 @@ fn menu_now(
                 "note": "a submenu is a place. Name one of the items inside it.",
             })));
     }
-    if !item.enabled {
-        // Posting the command anyway might work, and that is the problem: WM_COMMAND is past
-        // the point where the application decides. Refusing is the only answer that cannot act
-        // on something the application had said no to.
-        return Err(ApiError::conflict(format!("the menu item '{path}' is disabled"))
-            .with_detail(json!({
-                "path": item.path,
-                "state_refreshed": menu.refreshed,
-                "note": if menu.refreshed {
-                    "the application, asked for the current state as it is when a person opens \
-                     the menu, reports it greyed out. Posting the command anyway may still be \
-                     acted on, which is exactly why this is refused rather than attempted. Put \
-                     the application into the mode where the item is available and ask again."
-                } else {
-                    STALE_BUSY
-                },
-            })));
+    if let Some(e) = menu_unusable(item, menu.refreshed) {
+        return Err(e);
     }
     let Some(id) = item.id else {
         return Err(ApiError::conflict(format!("the menu item '{path}' carries no command id")));
@@ -7343,6 +7376,42 @@ mod tests {
         assert_eq!(text_stem("Axis 1"), "axis");
         assert_eq!(text_stem("12:30"), "");
         assert_eq!(text_stem("OPERATION PANEL"), "operation panel");
+    }
+
+    /// NCGuide greys "Cycle Time Estimate Function" and leaves "Start Estimation" inside it
+    /// enabled. No person can open that submenu, so its command is refused like a disabled one,
+    /// and neither counts as invocable.
+    #[test]
+    fn an_item_inside_a_disabled_submenu_is_refused_like_a_disabled_one() {
+        let item = |path: &str, enabled: bool, blocked_by: Option<&str>| crate::win::menu::MenuItem {
+            path: path.into(),
+            label: path.into(),
+            id: Some(1),
+            depth: 2,
+            enabled,
+            checked: false,
+            blocked_by: blocked_by.map(str::to_string),
+            submenu: false,
+            empty: false,
+        };
+        let parent = "File/Cycle Time Estimate Function";
+        let inside = item("File/Cycle Time Estimate Function/Start Estimation", true, Some(parent));
+        let e = menu_unusable(&inside, true).expect("refused");
+        assert_eq!(e.status, StatusCode::CONFLICT);
+        assert!(e.message.contains("inside 'File/Cycle Time Estimate Function'"), "{}", e.message);
+        assert_eq!(menu_item_json(&inside, &[])["blocked_by"], json!(parent));
+
+        let greyed = item("File/Other", false, None);
+        assert!(menu_unusable(&greyed, true).expect("refused").message.contains("is disabled"));
+        // The item's own state is the first thing said, when both apply.
+        let both = item("File/Cycle Time Estimate Function/Stop", false, Some(parent));
+        assert!(menu_unusable(&both, true).expect("refused").message.contains("is disabled"));
+
+        let fine = item("File/Exit", true, None);
+        assert!(menu_unusable(&fine, true).is_none());
+        assert!(menu_item_json(&fine, &[]).get("blocked_by").is_none(), "only said when it applies");
+        let place = crate::win::menu::MenuItem { submenu: true, id: None, ..item(parent, true, None) };
+        assert!(menu_unusable(&place, true).is_some(), "a submenu is not a command");
     }
 
     /// A sequence and a single press are mutually exclusive, and the body shape parses.

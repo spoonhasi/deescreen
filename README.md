@@ -1499,6 +1499,10 @@ Matched on **whole path segments** — `"File"` covers the whole File menu and d
 is what an application receives *after* it has decided an item is enabled — so posting a
 greyed-out item's command may well be acted on. `POST /menu` reads the state the same way
 `GET /menus` does, asking first, so the check is against what the application would show.
+An item **inside a disabled submenu** is refused too, however its own state reads: NCGuide greys
+*Cycle Time Estimate Function* and leaves *Start Estimation* inside it enabled, but a disabled
+submenu does not open, so no person could reach it. `GET /menus` marks such an item with
+`blocked_by` — the disabled submenu — and leaves it out of `invocable`.
 
 **The command is posted, not sent.** A menu item that opens a modal dialog would otherwise hold
 the request open for as long as the dialog is on screen. So the reply means the application

@@ -24,7 +24,8 @@
 //! the read: `Menu::refreshed` then says the states are as the menu held them.
 //!
 //! A disabled item's ID posted anyway may still be acted on, so invoking one is refused
-//! rather than attempted.
+//! rather than attempted - and so is one inside a disabled submenu, which no person could
+//! open to reach it (`MenuItem::blocked_by`).
 //!
 //! Posted, never sent: a menu item that opens a modal dialog does not return until the dialog
 //! is closed, and `SendMessage` would hold this thread — and with it the input lock — for as
@@ -53,14 +54,22 @@ pub struct MenuItem {
     pub depth: u32,
     pub enabled: bool,
     pub checked: bool,
+    /// The outermost submenu above this one that is disabled, if any.
+    ///
+    /// A disabled submenu does not open, so nothing under it can be reached by a person
+    /// however its own state reads - NCGuide greys "Cycle Time Estimate Function" and leaves
+    /// "Start Estimation" inside it enabled. The command id is still there to post, which is
+    /// why this is recorded rather than inferred from `enabled`.
+    pub blocked_by: Option<String>,
     /// A submenu. Not invocable; its children are.
     pub submenu: bool,
     /// A submenu that came back with nothing in it.
     ///
-    /// Usually a menu the application fills at the moment it is opened — a recent-files list,
-    /// or a whole File menu built on demand. Reading never opens a menu, so those items do not
-    /// exist yet from here, and cannot be invoked by path. Flagged so that asking for one gets
-    /// that explanation instead of a list of names that look similar.
+    /// A menu the application fills at the moment it is opened — a recent-files list, or a
+    /// whole File menu built on demand — and did not fill when asked (see the module notes):
+    /// one that waits until it is really on screen. Its items do not exist from here and cannot
+    /// be invoked by path. Flagged so that asking for one gets that explanation instead of a
+    /// list of names that look similar.
     pub empty: bool,
 }
 
@@ -165,11 +174,18 @@ pub fn read(window: isize, refresh: bool) -> Menu {
     ask.send(WM_INITMENU, bar as usize, 0);
     let mut items = Vec::new();
     // Bounded so a corrupt or hostile menu cannot walk forever. Real menu bars are three deep.
-    walk(bar, "", 0, &mut items, &mut ask);
+    walk(bar, "", 0, None, &mut items, &mut ask);
     Menu { items, refreshed: ask.on }
 }
 
-fn walk(menu: *mut core::ffi::c_void, prefix: &str, depth: u32, out: &mut Vec<MenuItem>, ask: &mut Asker) {
+fn walk(
+    menu: *mut core::ffi::c_void,
+    prefix: &str,
+    depth: u32,
+    blocked_by: Option<&str>,
+    out: &mut Vec<MenuItem>,
+    ask: &mut Asker,
+) {
     if depth > 8 {
         return;
     }
@@ -206,23 +222,27 @@ fn walk(menu: *mut core::ffi::c_void, prefix: &str, depth: u32, out: &mut Vec<Me
         let path = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
 
         let submenu = !info.hSubMenu.is_null();
+        // MFS_DISABLED and MFS_GRAYED are the same bit; both are checked so the intent survives
+        // a rename in the windows crate.
+        let enabled = info.fState & (MFS_DISABLED | MFS_GRAYED) == 0;
         let at = out.len();
         out.push(MenuItem {
             path: path.clone(),
             label,
             id: if submenu { None } else { Some(info.wID) },
             depth,
-            // MFS_DISABLED and MFS_GRAYED are the same bit; both are checked so the intent
-            // survives a rename in the windows crate.
-            enabled: info.fState & (MFS_DISABLED | MFS_GRAYED) == 0,
+            enabled,
             checked: info.fState & MFS_CHECKED != 0,
+            blocked_by: blocked_by.map(str::to_string),
             submenu,
             empty: false,
         });
         if submenu {
+            // The outermost one is named: it is the one a person would have to get past first.
+            let below = blocked_by.or((!enabled).then_some(path.as_str()));
             // lParam: the position in the parent, and FALSE for "not the window menu".
             ask.send(WM_INITMENUPOPUP, info.hSubMenu as usize, (i as u16) as isize);
-            walk(info.hSubMenu, &path, depth + 1, out, ask);
+            walk(info.hSubMenu, &path, depth + 1, below, out, ask);
             ask.send(WM_UNINITMENUPOPUP, info.hSubMenu as usize, 0);
             // Nothing was added under it — see `MenuItem::empty`.
             out[at].empty = out.len() == at + 1;
