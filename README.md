@@ -352,38 +352,89 @@ while one is open the profile refuses as ambiguous; where the title never change
 ### One program, several projects, one title — `window.has`
 
 Some applications open different configurations under a title and class that never change.
-NCGuide shows `FANUC NCGuide` whether a 0i lathe, a 0i mill or a 30i is loaded, so a profile
-measured on one binds whichever is running and presses its coordinates onto it. Checked live:
-the 30i profile accepted the 0i lathe window with no warning.
+NCGuide shows `FANUC NCGuide` whether a 0i lathe, a 0i mill or a 30i is loaded, and starts a
+new process for each — so neither the title nor the pid tells them apart. A profile measured on
+one binds whichever is running and presses its coordinates onto it. Checked live: the 30i
+profile accepted the 0i lathe window, and `/health` called it healthy.
 
-What differs is inside the window, so say what has to be there:
+What differs is inside the window: the panels are different sizes. So say what has to be there:
 
 ```json
 "window": {
   "title": "FANUC NCGuide", "title_exact": true,
   "class": "WindowsForms10.Window.8.app.0.378734a",
-  "has": [ { "text": "Main Panel", "size": [705, 411] } ]
+  "has": [ { "text": "MDI", "size": [826, 454] } ]
 }
 ```
 
-Copy the text and the size — the last two numbers of `rect` — from `GET /controls` **while that
-project is open**. The size is required: the text is usually shared (the 0i lathe and the 0i
-mill both have a `Main Panel`, at 705×411 and 666×439), and a mark that only names it would
-match both while looking like it worked. Pick a container whose size differs
-between the projects, and check it against each.
+It is checked **while the window is being chosen**, and touches no coordinate. With two
+projects open at once, each profile therefore finds its own window — where title and class
+alone would refuse both as ambiguous.
 
-A window lacking any mark is not this profile's. The refusal says exactly that — which windows
-were open and what each one lacked — rather than claiming no window exists, because the fix is
-the opposite one: the window is right there, and it is either a different project or the right
-one at a different size.
+To add it to a profile that already works, patch just that. An object merges, so the title and
+class stay; `has` is a list, and a list is replaced whole, so a second mark means sending both:
 
-Anchors read the same controls, so a profile with anchors already refuses the wrong project.
-`has` is the identity half on its own, for a layout that never moves and where declaring an
-anchor would mean 140 buttons answering which one they belong to.
+```bash
+curl -s -X PATCH -H "Content-Type: application/json" \
+  -d '{"window": {"has": [{"text": "MDI", "size": [826, 454]}]}}' \
+  ".../admin/profile?profile=ncguide-30i"
+```
 
-`GET /health` names any profile that binds the same window as another and has nothing to tell
-whether the window is its own — no `has`, no anchors. Each such profile looks healthy alone, so
-this is the only place the problem can show.
+#### Choosing the mark
+
+It takes every project that shares the title, and an agent cannot switch projects itself — a
+person opens each one. With each open, `GET /controls` and note the sizes of the few large
+captioned containers. A sibling profile's anchors already record its containers' sizes. Then
+pick a control that:
+
+- **has the same caption in every project**, so every sibling profile can use it;
+- **is clearly a different size in each.** Measured on NCGuide:
+
+  | control | 0i lathe | 0i mill | 30i |
+  |---|---|---|---|
+  | `MDI` | 667×409 | 791×440 | 826×454 |
+  | `Main Panel` | 705×411 | 666×439 | 664×461 |
+  | `Sub Panel` | 706×261 | 692×281 | 822×283 |
+  | `CNC` | 666×529 | 667×528 | 670×532 |
+
+  Matching is exact, so even `CNC` would separate them, but a pixel or two apart is not a
+  difference to build on. `MDI` differs in both directions for every pair;
+- **keeps its size when the window is resized.** A panel that stretches with the window refuses
+  the moment the window changes size — and `POST /window/fit`, the call that would put the size
+  back, has to find the window first, so it refuses too.
+
+The size is required. A caption is usually shared, and a mark naming only the caption would
+match every project while looking as if it worked.
+
+Then **check it across every project**: with each open in turn, ask every sibling profile for
+its window with `GET /window?profile=NAME`. Exactly one should come back with it; the others
+should refuse. For NCGuide that was nine calls, and all nine came out as intended.
+
+#### When it refuses
+
+```
+a window matching "FANUC NCGuide" is open, but it is not the one this profile was measured on
+```
+
+The title matched and `has` did not: a different project is open. `detail.windows` says what
+each open window lacked. **This is the check doing its job — do not edit `has` until it passes,
+and do not remove it.** That turns the refusal back into the wrong press it exists to stop.
+`GET /health` shows which profile the open window belongs to: use that one, or ask the person to
+open this profile's project. If the right project *is* open, the window is probably at another
+size.
+
+It is a "not found" rather than an "ambiguous", and says so in words rather than claiming no
+window exists, because the fix is the opposite of both: the window is right there.
+
+#### Against anchors
+
+Anchors read the same controls, so a profile with anchors also refuses the wrong project — but
+only **after** a window has been chosen, so with two projects open they cannot pick between
+them. `has` is the identity check on its own, for a layout that never moves, where declaring an
+anchor would mean 140 buttons each answering which one they belong to.
+
+`GET /health` names any profile that shares a window with another and has neither `has` nor
+anchors. Each such profile looks healthy alone, so this is the only place the problem can show.
 
 From there, three routes. **With a person present, the browser is much faster.**
 

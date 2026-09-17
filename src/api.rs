@@ -682,11 +682,14 @@ fn find_error(t: &Targets, e: FindError) -> ApiError {
         .with_detail(json!({
             "windows": list,
             "has": t.window.has,
-            "hint": "window.has names controls only this profile's project contains. Either the \
-                     application has a different project open - GET /controls shows what this \
-                     window does contain, and GET /health which profile it belongs to - or it \
-                     is the right project at a different window size, which changes the \
-                     controls' sizes too.",
+            "hint": "window.has names controls only this profile's project contains, so this is \
+                     the check doing its job. Either the application has a different project \
+                     open - GET /health shows which profile this window belongs to; use that \
+                     one, or ask the person to open this profile's project - or it is the \
+                     right project at a different window size, which changes the controls' \
+                     sizes too.",
+            "do_not": "edit or remove window.has to make this pass. That turns the refusal \
+                       into the wrong press it exists to stop.",
         })),
     }
 }
@@ -1213,7 +1216,9 @@ fn shared_window_problems(bindings: &[Binding]) -> Vec<String> {
         }
         msg.push_str(&format!(
             " Add window.has to '{}' with a control only its own project contains - read the \
-             text and size from GET /controls while that project is open.",
+             text and size from GET /controls while that project is open, and check it \
+             against every project that shares the title. /help: WHEN ONE APPLICATION OPENS \
+             SEVERAL PROJECTS.",
             b.profile
         ));
         out.push(msg);
@@ -2725,7 +2730,9 @@ PROFILES
   GET /health lists them with a human-written description each, and GET /profiles
   gives their full definitions. If a person names an application rather than a
   profile, match what they said against those descriptions and window titles - do
-  not guess.
+  not guess. Several profiles can share one title when one application opens several
+  projects; window.has is what tells them apart (WHEN ONE APPLICATION OPENS SEVERAL
+  PROJECTS UNDER ONE TITLE, below).
 
   Omitting profile works only when it is unambiguous: when the operator set a default,
   or when exactly one profile exists. With two or more and no default you get a 404
@@ -3117,7 +3124,8 @@ ENDPOINTS
                        yours: the DEESCREEN_HOME environment variable, then a restart.
                        "problems" also names a profile that binds the same window as
                        another and has nothing to tell whether it is its own - no
-                       window.has and no anchors. Each such profile looks fine alone.
+                       window.has and no anchors. Each such profile looks fine alone -
+                       see WHEN ONE APPLICATION OPENS SEVERAL PROJECTS below.
                        "status" is ok or degraded and "problems" lists what is wrong, in
                        plain language - a locked session, a profile that failed to parse,
                        a window that is not open. "policy" says which of the gated things
@@ -3214,21 +3222,9 @@ CREATE A PROFILE FROM SCRATCH
      "FANUC NCGuide" - and while one is open the profile refuses as ambiguous. Where the
      title is always the same, title_exact avoids that.
 
-     ONE PROGRAM, SEVERAL PROJECTS, ONE TITLE. Some applications open different
-     configurations under a title and class that never change: NCGuide shows "FANUC
-     NCGuide" whether a 0i lathe, a 0i mill or a 30i is loaded. A profile measured on one
-     of them binds whichever is running and presses its coordinates onto it. What differs
-     is inside the window, so say what must be there:
-       "window": {{"title": "FANUC NCGuide", "title_exact": true,
-                  "has": [{{"text": "Main Panel", "size": [705, 411]}}]}}
-     Copy the text and the size (the last two numbers of "rect") from GET /controls while
-     THAT project is open. The size is required: the text is usually shared - the 0i lathe
-     and the 0i mill both have a "Main Panel" - and a mark that only names it matches both. A
-     window lacking any mark is not this profile's; the refusal says so, and names what was
-     missing, rather than claiming no window exists. Pick a container whose size differs
-     between the projects, and check it against each of them.
-     Anchors read the same controls, so a profile with anchors already refuses the wrong
-     project. has is for when the layout never moves and anchors would be all cost.
+     DOES THE APPLICATION OPEN SEVERAL PROJECTS UNDER THAT SAME TITLE? Then the title
+     cannot tell them apart, and this profile needs window.has - see WHEN ONE APPLICATION
+     OPENS SEVERAL PROJECTS UNDER ONE TITLE below. Ask the person if you are not sure.
 
   2. Create it. The name is yours to choose: letters, digits, '-' and '_' only, because
      it travels in URLs and capture file names.
@@ -3392,6 +3388,53 @@ EDITING A PROFILE FROM A PROGRAM
   stop with no confirmation required and answer "saved". Same for the config file, which
   refuses to start rather than run with a setting it did not understand.
 
+  WHEN ONE APPLICATION OPENS SEVERAL PROJECTS UNDER ONE TITLE - window.has
+  Some programs load different configurations without changing their title or class.
+  NCGuide says "FANUC NCGuide" whether a 0i lathe, a 0i mill or a 30i is loaded, and starts
+  a new process for each, so neither the title nor the pid tells them apart. A profile
+  measured on one of them binds whichever is running and presses its coordinates onto it -
+  with no error, because the title matched.
+
+  What differs is inside the window: the panels are different sizes. window.has names
+  controls that must be there, caption AND size, and a window without them is not this
+  profile's:
+    "window": {{"title": "FANUC NCGuide", "title_exact": true,
+               "has": [{{"text": "MDI", "size": [826, 454]}}]}}
+  It is checked while the window is being chosen and touches no coordinate. So with two
+  projects open at once each profile finds its own window, where title and class alone
+  would refuse both as ambiguous.
+
+  ADDING IT TO A PROFILE THAT ALREADY WORKS. An object merges, so the title and class stay:
+    curl -s -X PATCH -H "Content-Type: application/json" \
+      -d '{{"window": {{"has": [{{"text": "MDI", "size": [826, 454]}}]}}}}' \
+      "{base}/admin/profile?profile=NAME"
+  has is a list, and a list is replaced whole - to add a second mark, send both.
+
+  CHOOSING THE MARK takes every project that shares the title, and you cannot switch
+  projects yourself: a person has to open each one. With each open, GET /controls and note
+  the sizes of the few large captioned containers (depth 2). A sibling profile's anchors
+  already record its containers' sizes, which can save a round. Then pick a control that
+    - has the same caption in every project, so every sibling profile can use it,
+    - is clearly a different size in each. NCGuide's "CNC" screen was 666x529, 667x528 and
+      670x532 - too close to trust. Its "MDI" panel was 667x409, 791x440 and 826x454,
+    - keeps its size when the window is resized. A panel that stretches with the window
+      refuses the moment the window changes size, and POST /window/fit - the call that
+      would put the size back - has to find the window first, so it refuses too.
+  The size is required. A caption is usually shared, and a mark that names only the caption
+  would match every project while looking as if it worked.
+
+  CHECK IT ACROSS EVERY PROJECT. With each project open in turn, ask every sibling profile
+  for the window:
+    curl -s "{base}/window?profile=NAME"
+  Exactly one should come back with the window; the others should refuse. For NCGuide that
+  was nine calls for three projects, and all nine came out as intended.
+
+  Anchors identify the project as well (see the next section), but only AFTER a window has
+  been chosen - with two projects open they cannot pick between them. has is that identity
+  check on its own, for a layout that never moves, without making every button name an
+  anchor. GET /health names any profile that shares a window with another and has neither:
+  each such profile looks fine on its own, so nothing else can say it.
+
   WHEN AN APPLICATION MOVES ITS OWN LAYOUT - ANCHORS
   Some programs put their panel in a slightly different place each time they start. The
   window is the same size, every control is the same size, and only the origin differs, so
@@ -3495,6 +3538,15 @@ TRAPS - these fail quietly or confusingly. Read once, save yourself an hour.
                    that field instead. A panel that genuinely stretches with its window
                    can set "on_size_mismatch": "scale", or "ignore" where the panel stays
                    pinned to the top-left; the default, "reject", is this 409.
+  404 wrong window "a window matching ... is open, but it is not the one this profile was
+                   measured on". The title matched and window.has did not: a different
+                   project is open in that application, and detail.windows says what each
+                   open window lacked. This is the check doing its job. DO NOT edit has
+                   until it passes, and do not remove it - that is exactly the wrong press
+                   it exists to stop. GET /health shows which profile the open window
+                   belongs to: use that one, or ask the person to open the project this
+                   profile was made for. If the right project IS open, the window is
+                   likely at another size - see CHOOSING THE MARK above.
   409 minimized    POST /window/focus.
   black capture    The console session is locked or RDP is disconnected. Nothing will
                    work until a human unlocks it. /health says so explicitly.
