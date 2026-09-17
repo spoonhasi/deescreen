@@ -345,6 +345,8 @@ const STRINGS = {
     'match.need': 'A title or a class is required.',
     'match.none': 'Nothing open right now matches.',
     'match.one': '1 match: {0}',
+    'match.has': ' — by title and class. The server also requires {0} controls inside the window (window.has), which this page cannot check.',
+    'match.has.one': ' — by title and class. The server also requires {0} control inside the window (window.has), which this page cannot check.',
     'match.many': '{0} windows match — narrow it with a class or an exact title. With several, the server refuses to act.',
     'match.unsaved': '  (not saved yet — save to keep it)',
 
@@ -472,6 +474,7 @@ const STRINGS = {
     'match.need': '제목이나 클래스 중 하나는 있어야 합니다.',
     'match.none': '지금 열린 창 중 일치하는 것이 없습니다.',
     'match.one': '1개 일치: {0}',
+    'match.has': ' — 제목·클래스 기준입니다. 서버는 창 안의 컨트롤 {0}개(window.has)도 요구하는데, 이 페이지에서는 확인할 수 없습니다.',
     'match.many': '{0}개가 걸립니다 — 클래스를 넣거나 완전 일치로 좁히세요. 여럿이면 서버가 조작을 거부합니다.',
     'match.unsaved': '  (아직 저장 전 — 저장해야 남습니다)',
 
@@ -1281,6 +1284,14 @@ function renderWindowMatch() {
     el.textContent = t('match.many', hits.length);
     el.style.color = '#ff8200';
   }
+  // The count above is title and class only. window.has is checked by the server against the
+  // controls inside each window, which this page never lists — so with it set, "3 match" can
+  // be one on the server, and "1 match" can be none.
+  const marks = (spec.has || []).length;
+  if (marks && (spec.title || spec.class)) {
+    el.textContent += tn('match.has', marks);
+    if (hits.length > 1) el.style.color = '';
+  }
   if (windowChanged) {
     el.textContent += t('match.unsaved');
   }
@@ -1290,7 +1301,11 @@ function bindWindowFields() {
   const push = () => {
     if (!doc) return;
     doc.description = $('#p_desc').value;
+    // Spread first: this page edits three fields of the window spec and must carry the rest.
+    // Rebuilding the object from the form dropped window.has on the first keystroke, and with
+    // it the only thing telling this profile's project apart from another under one title.
     doc.window = {
+      ...doc.window,
       title: $('#w_title').value,
       title_exact: $('#w_exact').checked,
       class: $('#w_class').value,
@@ -1311,7 +1326,7 @@ function bindWindowFields() {
     // Leave the title as a substring match and fill in the class alongside it — plenty of
     // applications append the open file name, so an exact match stops finding the window
     // the moment a document is opened.
-    doc.window = { title: w.title, title_exact: false, class: w.class };
+    doc.window = { ...doc.window, title: w.title, title_exact: false, class: w.class };
     windowChanged = true;
     renderWindowMatch();
     clearTimeout(winPreviewTimer);

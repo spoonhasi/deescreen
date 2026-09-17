@@ -981,7 +981,12 @@ mod tests {
     fn sample() -> Targets {
         let mut t = Targets {
             description: String::new(),
-            window: WindowSpec { title: "Sample".into(), title_exact: false, class: String::new() },
+            window: WindowSpec {
+                title: "Sample".into(),
+                title_exact: false,
+                class: String::new(),
+                has: Vec::new(),
+            },
             reference_client: Some([1280, 1000]),
             on_size_mismatch: SizeMismatch::Reject,
             anchors: BTreeMap::new(),

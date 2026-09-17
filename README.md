@@ -344,7 +344,46 @@ curl -s http://192.0.2.73:8090/windows
 ```
 
 Pick a `title` and `class` and write them into the profile's `window`. If several windows
-match, clicking is **refused**, so narrow it with `class` or `title_exact`.
+match, clicking is **refused**, so narrow it with `class` or `title_exact`. A title *fragment*
+also matches dialogs that repeat the name — `About FANUC NCGuide` contains `FANUC NCGuide` — so
+while one is open the profile refuses as ambiguous; where the title never changes,
+`title_exact` avoids that.
+
+### One program, several projects, one title — `window.has`
+
+Some applications open different configurations under a title and class that never change.
+NCGuide shows `FANUC NCGuide` whether a 0i lathe, a 0i mill or a 30i is loaded, so a profile
+measured on one binds whichever is running and presses its coordinates onto it. Checked live:
+the 30i profile accepted the 0i lathe window with no warning.
+
+What differs is inside the window, so say what has to be there:
+
+```json
+"window": {
+  "title": "FANUC NCGuide", "title_exact": true,
+  "class": "WindowsForms10.Window.8.app.0.378734a",
+  "has": [ { "text": "Main Panel", "size": [705, 411] } ]
+}
+```
+
+Copy the text and the size — the last two numbers of `rect` — from `GET /controls` **while that
+project is open**. The size is required: the text is usually shared (the 0i lathe and the 0i
+mill both have a `Main Panel`, at 705×411 and 666×439), and a mark that only names it would
+match both while looking like it worked. Pick a container whose size differs
+between the projects, and check it against each.
+
+A window lacking any mark is not this profile's. The refusal says exactly that — which windows
+were open and what each one lacked — rather than claiming no window exists, because the fix is
+the opposite one: the window is right there, and it is either a different project or the right
+one at a different size.
+
+Anchors read the same controls, so a profile with anchors already refuses the wrong project.
+`has` is the identity half on its own, for a layout that never moves and where declaring an
+anchor would mean 140 buttons answering which one they belong to.
+
+`GET /health` names any profile that binds the same window as another and has nothing to tell
+whether the window is its own — no `has`, no anchors. Each such profile looks healthy alone, so
+this is the only place the problem can show.
 
 From there, three routes. **With a person present, the browser is much faster.**
 

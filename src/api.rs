@@ -649,8 +649,11 @@ fn hit_json(h: &crate::win::window::ControlHit) -> Value {
 
 /// Find the one configured window. Nothing found, or several, fails with **what to do next**
 /// attached.
-fn find_window(t: &Targets) -> Result<WindowInfo, ApiError> {
-    let info = window::find(&t.window).map_err(|e| match e {
+/// A failed window lookup, in words. Shared by every caller of `window::find`, because the
+/// three failures need three different fixes and a caller that flattened them into "not
+/// found" would send someone to check a title that was right all along.
+fn find_error(t: &Targets, e: FindError) -> ApiError {
+    match e {
         FindError::NotFound => ApiError::not_found(format!(
             "no visible window matches {:?}",
             t.window.title
@@ -666,9 +669,30 @@ fn find_window(t: &Targets) -> Result<WindowInfo, ApiError> {
         ))
         .with_detail(json!({
             "matches": list,
-            "hint": "narrow it with window.title_exact or window.class in the profile",
+            "hint": "narrow it with window.title_exact or window.class in the profile, or \
+                     window.has where the windows differ only in what is inside them",
         })),
-    })?;
+        // Not "no window": the window is right there. Saying "not found" would send the
+        // caller to check the title, which is the one part that is correct.
+        FindError::Unmarked(list) => ApiError::not_found(format!(
+            "a window matching {:?} is open, but it is not the one this profile was measured \
+             on — it lacks the control(s) window.has requires",
+            t.window.title
+        ))
+        .with_detail(json!({
+            "windows": list,
+            "has": t.window.has,
+            "hint": "window.has names controls only this profile's project contains. Either the \
+                     application has a different project open - GET /controls shows what this \
+                     window does contain, and GET /health which profile it belongs to - or it \
+                     is the right project at a different window size, which changes the \
+                     controls' sizes too.",
+        })),
+    }
+}
+
+fn find_window(t: &Targets) -> Result<WindowInfo, ApiError> {
+    let info = window::find(&t.window).map_err(|e| find_error(t, e))?;
 
     if info.minimized {
         return Err(ApiError::conflict("the target window is minimized").with_detail(json!({
@@ -1140,6 +1164,63 @@ pub async fn ping() -> Response {
 /// The failure modes that matter here — DPI scaling, UIPI, a locked session — all **work
 /// wrongly without raising an error**. So rather than noticing after the
 /// fact, this asks in advance.
+/// One profile's hold on a window, as `/health` found it.
+struct Binding {
+    profile: String,
+    handle: isize,
+    title: String,
+    pid: u32,
+    /// `window.has` or anchors — anything that could tell this window apart from another
+    /// project in the same application.
+    identifies: bool,
+    /// …and it did: `has` passed (the profile is bound, so it must have), or the anchors
+    /// resolved.
+    confirmed: bool,
+}
+
+/// Profiles that share a window with another and have nothing to tell whether it is theirs.
+///
+/// Written as its own function because the case it catches is one no single profile can see:
+/// each looks fine alone. Measured on NCGuide — `ncguide-30i` reported healthy against the 0i
+/// lathe, and would have pressed 30i coordinates onto it.
+fn shared_window_problems(bindings: &[Binding]) -> Vec<String> {
+    let mut out = Vec::new();
+    for b in bindings.iter().filter(|b| !b.identifies) {
+        let others: Vec<&Binding> =
+            bindings.iter().filter(|o| o.handle == b.handle && o.profile != b.profile).collect();
+        if others.is_empty() {
+            continue;
+        }
+        let names: Vec<&str> = others.iter().map(|o| o.profile.as_str()).collect();
+        let confirmed: Vec<&str> =
+            others.iter().filter(|o| o.confirmed).map(|o| o.profile.as_str()).collect();
+        let mut msg = format!(
+            "profile '{}' binds the same window as {} ({:?}, pid {}) and has nothing to tell them \
+             apart - no window.has and no anchors - so a request naming it acts on that window \
+             whichever project is open in it.",
+            b.profile,
+            names.join(", "),
+            b.title,
+            b.pid
+        );
+        if !confirmed.is_empty() {
+            msg.push_str(&format!(
+                " {} positively identifies this window as its own, so it is probably not the one \
+                 '{}' was measured on.",
+                confirmed.join(" and "),
+                b.profile
+            ));
+        }
+        msg.push_str(&format!(
+            " Add window.has to '{}' with a control only its own project contains - read the \
+             text and size from GET /controls while that project is open.",
+            b.profile
+        ));
+        out.push(msg);
+    }
+    out
+}
+
 pub async fn health(State(state): State<SharedState>) -> Response {
     let st = state.clone();
     let body = tokio::task::spawn_blocking(move || {
@@ -1175,6 +1256,7 @@ pub async fn health(State(state): State<SharedState>) -> Response {
                     .into(),
             );
         }
+        let mut bindings: Vec<Binding> = Vec::new();
         for (name, prof) in snapshot.iter() {
             let t = prof.targets();
             let mut entry = json!({
@@ -1215,10 +1297,12 @@ pub async fn health(State(state): State<SharedState>) -> Response {
                         ));
                     }
                     entry["window"] = window_json(&info);
+                    let mut anchors_ok = false;
                     if !t.anchors.is_empty() {
-                        let found = crate::win::window::enumerate_controls(info.handle);
+                        let found = crate::win::window::enumerate_controls_all(info.handle);
                         entry["anchors"] = match t.anchor_offsets(&found.items) {
                             Ok(offs) => {
+                                anchors_ok = true;
                                 let moved: Vec<String> = offs
                                     .iter()
                                     .filter(|(_, (dx, dy))| *dx != 0 || *dy != 0)
@@ -1245,6 +1329,14 @@ pub async fn health(State(state): State<SharedState>) -> Response {
                             }
                         };
                     }
+                    bindings.push(Binding {
+                        profile: name.clone(),
+                        handle: info.handle,
+                        title: info.title.clone(),
+                        pid: info.pid,
+                        identifies: !t.window.has.is_empty() || !t.anchors.is_empty(),
+                        confirmed: !t.window.has.is_empty() || anchors_ok,
+                    });
                     entry["input"] = json!({
                         "our_elevation": our.as_str(),
                         "target_elevation": theirs.as_str(),
@@ -1273,6 +1365,7 @@ pub async fn health(State(state): State<SharedState>) -> Response {
             }
             per_profile.insert(name.clone(), entry);
         }
+        problems.extend(shared_window_problems(&bindings));
 
         json!({
             "status": if problems.is_empty() { "ok" } else { "degraded" },
@@ -2140,7 +2233,7 @@ fn anchor_offsets(t: &Targets, info: &crate::win::window::WindowInfo) -> Result<
     if t.anchors.is_empty() {
         return Ok(AnchorOffsets::new());
     }
-    let found = crate::win::window::enumerate_controls(info.handle);
+    let found = crate::win::window::enumerate_controls_all(info.handle);
     t.anchor_offsets(&found.items).map_err(|e| {
         ApiError::new(StatusCode::CONFLICT, e).with_detail(json!({
             "why": "this profile's coordinates are recorded relative to a control, and that \
@@ -3022,6 +3115,9 @@ ENDPOINTS
                        that PC, and why that directory was chosen - the answer when a person
                        asks where their settings are. Moving them is theirs to do, not
                        yours: the DEESCREEN_HOME environment variable, then a restart.
+                       "problems" also names a profile that binds the same window as
+                       another and has nothing to tell whether it is its own - no
+                       window.has and no anchors. Each such profile looks fine alone.
                        "status" is ok or degraded and "problems" lists what is wrong, in
                        plain language - a locked session, a profile that failed to parse,
                        a window that is not open. "policy" says which of the gated things
@@ -3114,6 +3210,25 @@ CREATE A PROFILE FROM SCRATCH
      the SHORTEST title fragment that still picks exactly one - titles often carry the
      open file name, so an exact match on today's title stops matching tomorrow.
      Check your fragment: how many windows contain it? If more than one, add "class".
+     A fragment also matches dialogs that repeat the name - "About FANUC NCGuide" contains
+     "FANUC NCGuide" - and while one is open the profile refuses as ambiguous. Where the
+     title is always the same, title_exact avoids that.
+
+     ONE PROGRAM, SEVERAL PROJECTS, ONE TITLE. Some applications open different
+     configurations under a title and class that never change: NCGuide shows "FANUC
+     NCGuide" whether a 0i lathe, a 0i mill or a 30i is loaded. A profile measured on one
+     of them binds whichever is running and presses its coordinates onto it. What differs
+     is inside the window, so say what must be there:
+       "window": {{"title": "FANUC NCGuide", "title_exact": true,
+                  "has": [{{"text": "Main Panel", "size": [705, 411]}}]}}
+     Copy the text and the size (the last two numbers of "rect") from GET /controls while
+     THAT project is open. The size is required: the text is usually shared - the 0i lathe
+     and the 0i mill both have a "Main Panel" - and a mark that only names it matches both. A
+     window lacking any mark is not this profile's; the refusal says so, and names what was
+     missing, rather than claiming no window exists. Pick a container whose size differs
+     between the projects, and check it against each of them.
+     Anchors read the same controls, so a profile with anchors already refuses the wrong
+     project. has is for when the layout never moves and anchors would be all cost.
 
   2. Create it. The name is yours to choose: letters, digits, '-' and '_' only, because
      it travels in URLs and capture file names.
@@ -4408,10 +4523,7 @@ pub async fn window_focus(State(state): State<SharedState>, Query(q): Query<Hash
         // Not `find_window` — that one refuses a minimised window, and undoing minimisation is
         // precisely this endpoint's job. (`/window/fit` bypasses the size check for the same
         // reason.) A recovery must not be blocked by the state it recovers from.
-        let before = window::find(&t.window).map_err(|_| {
-            ApiError::not_found("target window not found")
-                .with_detail(json!({"hint": "GET /windows lists visible window titles"}))
-        })?;
+        let before = window::find(&t.window).map_err(|e| find_error(&t, e))?;
         let minimized_before = before.minimized;
         window::focus(before.handle).map_err(ApiError::conflict)?;
         let info = window::describe(before.handle)
@@ -4440,8 +4552,7 @@ pub async fn window_fit(State(state): State<SharedState>, Query(q): Query<HashMa
         };
         // A size mismatch is the reason this endpoint gets called, so it bypasses
         // bind_window's check.
-        let info = window::find(&t.window)
-            .map_err(|_| ApiError::not_found("target window not found"))?;
+        let info = window::find(&t.window).map_err(|e| find_error(&t, e))?;
         let before = info.client_size;
         let after = window::fit_client(info.handle, rw, rh).map_err(ApiError::internal)?;
         let info = window::describe(info.handle)
@@ -5004,7 +5115,7 @@ fn refit_now(
     }
 
     let (info, coord_scale, size_warning) = bind_window_view(&t)?;
-    let list = window::enumerate_controls(info.handle);
+    let list = window::enumerate_controls_all(info.handle);
     if list.items.is_empty() {
         return Err(ApiError::conflict(
             "this application has no child windows, so its containers cannot be found",
@@ -5408,6 +5519,7 @@ mod tests {
                 title: "x".into(),
                 title_exact: false,
                 class: String::new(),
+                has: Vec::new(),
             },
             reference_client: None,
             on_size_mismatch: crate::targets::SizeMismatch::Ignore,
@@ -5490,6 +5602,7 @@ mod tests {
                 title: "x".into(),
                 title_exact: false,
                 class: String::new(),
+                has: Vec::new(),
             },
             reference_client: None,
             on_size_mismatch: crate::targets::SizeMismatch::Ignore,
@@ -5974,6 +6087,37 @@ mod tests {
         // And the other direction: a hand-drawn rectangle far larger than the control it
         // covers is not that control either.
         assert!(!same_thing([0, 0, 400, 400], [0, 0, 40, 40]));
+    }
+
+    /// The live case: three NCGuide profiles, one window. The one with nothing to check is
+    /// named; the two that check are not; and the one whose check passed is offered as the
+    /// likely owner.
+    #[test]
+    fn a_profile_that_cannot_tell_is_named_when_it_shares_a_window() {
+        let b = |p: &str, h: isize, identifies: bool, confirmed: bool| Binding {
+            profile: p.to_string(),
+            handle: h,
+            title: "FANUC NCGuide".to_string(),
+            pid: 6088,
+            identifies,
+            confirmed,
+        };
+        let got = shared_window_problems(&[
+            b("ncguide-0i-lathe", 1, true, true),
+            b("ncguide-0i-mill", 1, true, false),
+            b("ncguide-30i", 1, false, false),
+            // Alone on its own window: nothing to confuse it with, so nothing to say.
+            b("nctrainer-mill", 2, false, false),
+        ]);
+        assert_eq!(got.len(), 1, "{got:#?}");
+        assert!(got[0].starts_with("profile 'ncguide-30i'"), "{}", got[0]);
+        assert!(got[0].contains("ncguide-0i-lathe positively identifies"), "{}", got[0]);
+        assert!(!got[0].contains("ncguide-0i-mill positively"), "a failed check confirms nothing");
+
+        // Two that both check and still share are left alone — intended, or already refusing.
+        assert!(shared_window_problems(&[b("a", 1, true, true), b("b", 1, true, true)]).is_empty());
+        // Two that cannot tell are both named.
+        assert_eq!(shared_window_problems(&[b("a", 1, false, false), b("b", 1, false, false)]).len(), 2);
     }
 
     /// The sentence a refusal carries has to name the place the caller is actually standing in.

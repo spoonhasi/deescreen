@@ -54,6 +54,34 @@ pub struct WindowSpec {
     /// The window class name (optional). For narrowing down when several share a title.
     #[serde(default)]
     pub class: String,
+    /// **Controls the window must contain** — for telling apart windows that title and class
+    /// cannot.
+    ///
+    /// One program that opens different projects shows the same title and class for all of
+    /// them: NCGuide's 0i lathe, 0i mill and 30i are all `FANUC NCGuide`. What differs is the
+    /// panel layout inside. Without this, a profile measured on one project binds whichever is
+    /// running and presses its coordinates onto it — checked live, with no warning.
+    ///
+    /// Anchors read the same thing, but declaring one makes every button say which anchor it
+    /// belongs to. This is only the identity half: checked while the window is being chosen,
+    /// and nothing else. A window lacking any of these is not this profile's window.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub has: Vec<ControlMark>,
+}
+
+/// One control a window has to contain — see [`WindowSpec::has`].
+///
+/// Text **and** size, like an anchor, and for the same reason: the text is usually shared.
+/// Every NCGuide project has a control called `Main Panel`; they differ in how big it is. A
+/// mark with only a text would match every one of them and look like it was doing its job.
+/// So the size is required, and copied from `GET /controls` like the text.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlMark {
+    /// The control's window text, as `GET /controls` reports it.
+    pub text: String,
+    /// Its `[w, h]` — the last two numbers of that control's `rect`.
+    pub size: [i32; 2],
 }
 
 #[derive(Debug)]
@@ -63,6 +91,10 @@ pub enum FindError {
     /// Several matched — **nothing is picked.** Clicking while it is unclear which window is
     /// being driven is exactly the accident that naming buttons exists to prevent.
     Ambiguous(Vec<String>),
+    /// Windows with that title and class are open, and none contains the controls `has`
+    /// names. Kept apart from `NotFound` because the fix is the opposite one: the window is
+    /// right there, it is a different project — or the same one at a different size.
+    Unmarked(Vec<String>),
 }
 
 /// Enumerate every visible top-level window. The source of the `/windows` endpoint — this is
@@ -126,6 +158,20 @@ pub fn describe(handle: isize) -> Option<WindowInfo> {
     }
 }
 
+/// Which of `marks` are absent from `controls`. Text trimmed and compared exactly, size
+/// compared exactly — the same rule an anchor uses to find its control.
+pub fn marks_missing_from(controls: &[ControlInfo], marks: &[ControlMark]) -> Vec<ControlMark> {
+    marks
+        .iter()
+        .filter(|m| {
+            !controls
+                .iter()
+                .any(|c| c.text.trim() == m.text.trim() && [c.rect[2], c.rect[3]] == m.size)
+        })
+        .cloned()
+        .collect()
+}
+
 /// Find the window the configured spec describes.
 pub fn find(spec: &WindowSpec) -> Result<WindowInfo, FindError> {
     let needle = spec.title.trim().to_lowercase();
@@ -146,6 +192,22 @@ pub fn find(spec: &WindowSpec) -> Result<WindowInfo, FindError> {
             title_ok && class_ok
         })
         .collect();
+
+    if !spec.has.is_empty() && !hits.is_empty() {
+        let mut others: Vec<String> = Vec::new();
+        hits.retain(|w| {
+            let missing = marks_missing_from(&enumerate_controls_all(w.handle).items, &spec.has);
+            if !missing.is_empty() {
+                let what: Vec<String> =
+                    missing.iter().map(|m| format!("{:?} {}x{}", m.text, m.size[0], m.size[1])).collect();
+                others.push(format!("{} [{}] pid={} lacks {}", w.title, w.class, w.pid, what.join(", ")));
+            }
+            missing.is_empty()
+        });
+        if hits.is_empty() {
+            return Err(FindError::Unmarked(others));
+        }
+    }
 
     match hits.len() {
         0 => Err(FindError::NotFound),
@@ -197,6 +259,21 @@ pub struct ControlList {
 }
 
 pub fn enumerate_controls(root: isize) -> ControlList {
+    enumerate_up_to(root, CONTROL_LIMIT)
+}
+
+/// Every control, with no ceiling — for **identifying** a window rather than describing it.
+///
+/// The ceiling exists to bound a response. Deciding whether a control is present against a
+/// list that was cut off reports it missing when it is merely late in the enumeration, and a
+/// container is visited only after every descendant of the containers before it — so on an
+/// application with thousands of child windows, exactly the controls an anchor or a `has`
+/// mark names are the ones most likely to fall past the cut.
+pub fn enumerate_controls_all(root: isize) -> ControlList {
+    enumerate_up_to(root, usize::MAX)
+}
+
+fn enumerate_up_to(root: isize, limit: usize) -> ControlList {
     let Some(info) = describe(root) else {
         return ControlList { items: Vec::new(), total: 0 };
     };
@@ -210,7 +287,7 @@ pub fn enumerate_controls(root: isize) -> ControlList {
     let total = handles.len();
     let items = handles
         .into_iter()
-        .take(CONTROL_LIMIT)
+        .take(limit)
         .filter_map(|h| {
             let hw = hwnd(h);
             unsafe {
@@ -477,6 +554,57 @@ pub struct ControlHit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn control(text: &str, rect: [i32; 4]) -> ControlInfo {
+        ControlInfo { class: String::new(), text: text.into(), id: 0, rect, depth: 2, visible: true }
+    }
+
+    /// The live case. The running NCGuide had its `Main Panel` at 705x411, which is the 0i
+    /// lathe; the 0i mill's is 666x439. Same text, so only the size can tell them apart —
+    /// which is why a mark carries both.
+    #[test]
+    fn a_mark_is_matched_on_text_and_size_together() {
+        let running = [
+            control("Main Panel", [670, 530, 705, 411]),
+            control("MDI", [2, 531, 667, 409]),
+            control("CNC", [2, 2, 666, 529]),
+        ];
+        let lathe = ControlMark { text: "Main Panel".into(), size: [705, 411] };
+        let mill = ControlMark { text: "Main Panel".into(), size: [666, 439] };
+
+        assert!(marks_missing_from(&running, std::slice::from_ref(&lathe)).is_empty());
+        assert_eq!(marks_missing_from(&running, std::slice::from_ref(&mill)), std::slice::from_ref(&mill));
+
+        // Every mark has to be there, and each missing one is reported rather than the first.
+        let screen = ControlMark { text: "CNC".into(), size: [666, 529] };
+        let gone = ControlMark { text: "Sub Panel".into(), size: [1, 1] };
+        assert_eq!(
+            marks_missing_from(&running, &[lathe, screen, mill.clone(), gone.clone()]),
+            [mill, gone]
+        );
+
+        // Whitespace around a caption is not part of its name, as for anchors.
+        let padded = [control("  Main Panel ", [0, 0, 705, 411])];
+        assert!(marks_missing_from(&padded, &[ControlMark { text: "Main Panel".into(), size: [705, 411] }]).is_empty());
+    }
+
+    /// A mark with only a text would match every project that has a panel of that name, and
+    /// look as if it were working. So the size is not optional.
+    #[test]
+    fn a_mark_without_a_size_does_not_load() {
+        let no_size = r#"{"title": "FANUC NCGuide", "has": [{"text": "Main Panel"}]}"#;
+        assert!(serde_json::from_str::<WindowSpec>(no_size).is_err());
+
+        let ok = r#"{"title": "FANUC NCGuide", "has": [{"text": "Main Panel", "size": [705, 411]}]}"#;
+        let spec: WindowSpec = serde_json::from_str(ok).expect("parses");
+        assert_eq!(spec.has.len(), 1);
+
+        // Absent is the ordinary case, and it stays absent when written back.
+        let plain: WindowSpec = serde_json::from_str(r#"{"title": "x"}"#).expect("parses");
+        assert!(plain.has.is_empty());
+        let out = serde_json::to_value(&plain).expect("serializes");
+        assert!(out.get("has").is_none(), "{out}");
+    }
 
     /// Check that `control_at` really picks the control at a point, against **windows that
     /// are already open**.
