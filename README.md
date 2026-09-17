@@ -1421,13 +1421,17 @@ as a backup either way, and `reference_client` is set to the window as it is now
 refit is for when the size changed — so where two controls carry the same text and neither is
 still the saved size, nothing is left to tell them apart. Picking the nearest would use the
 rectangle that may be stale to decide which control proves it stale. The reply lists the
-candidates; name the one you mean:
+candidates; name the one you mean. The key is the **anchor's name** in the profile, not the
+control's caption; the value is that control's rectangle from `GET /controls`:
 
 ```bash
 curl -s -X POST -H "Content-Type: application/json" -H "X-Admin-Code: THECODE" \
-  -d '{"anchors": {"OPERATION PANEL": [1142,384,746,251]}, "apply": true}' \
+  -d '{"anchors": {"panel": [1142,384,746,251]}}' \
   ".../admin/profile/refit?profile=NAME"
 ```
+
+That is still only the proposal. Read it — `matched_by`, `text_now`, `verify` — then send the
+same body with `"apply": true`.
 
 **A named rectangle has to be a control's own**, exactly as `GET /controls` prints it, and the
 anchor takes that control's **text** along with its place. Taken on trust, a rectangle was saved
@@ -1494,6 +1498,15 @@ button:
 
 Matched on **whole path segments** — `"File"` covers the whole File menu and does *not* cover
 `"Filename Options"`. Those paths refuse unless the request carries `"confirm": true`.
+
+**That asking is not invisible.** The application reacts as it would to a menu opening, and some
+do more than update states — an MFC program closes a drop-down list that is open. Read the menu
+before starting something that depends on such a list, or after it, not in the middle.
+
+**A caption can contain `/` itself.** NCGuide has `PMC/I/O Operation Panel`: an item called
+*I/O Operation Panel* under *PMC*. So a path is not split to find its parent — `depth` and the
+order of the list give the tree (an entry's parent is the nearest one above it with a smaller
+depth). A path is sent whole, as printed, and matched as one string.
 
 **A disabled item is refused, not attempted.** The command is delivered as `WM_COMMAND`, which
 is what an application receives *after* it has decided an item is enabled — so posting a

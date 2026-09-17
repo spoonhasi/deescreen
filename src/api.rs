@@ -3261,13 +3261,16 @@ PRESS A SAVED BUTTON - click, wait for it to settle, re-capture, one round trip
     -d '{{"button":"NAME","capture":"REGION","settle_ms":500}}' {base}/click
 
   In every reply "button" is a NAME - the one you sent, as in a sequence's records and in
-  GET /buttons. Which mouse button did the pressing is "click_button".
+  GET /buttons; for a rect or point press, a label such as "(point 850,660)". Which mouse
+  button did the pressing is "click_button".
 
   NO REGION FOR WHAT YOU WANT TO SEE? "capture_rect": [x,y,w,h] instead of "capture" -
   live client coordinates, the same ones GET /capture.png?rect= takes, so a rectangle read
   off one picture goes straight into the next press. pad applies to it; it is not moved by
   an anchor or scaled, because it came off the window as it is. Send one of the two, not
-  both. POST /key and POST /menu take it too; in a query string, capture_rect=x,y,w,h.
+  both. measure and per_press watch that rectangle too; with neither given, they watch the
+  whole client area. POST /key and POST /menu take it too; in a query string,
+  capture_rect=x,y,w,h.
 
   settle_ms is how long to wait after the press before re-capturing. Left out it uses
   the server's default (500ms); ask for more than the server's ceiling and it is CLAMPED,
@@ -3641,8 +3644,10 @@ ENDPOINTS
                        For a profile with anchors, "anchors" says whether they resolve on
                        the window as it is now and how far each has moved - the answer to
                        "are the coordinates in this profile usable right now", before
-                       anything is pressed. An anchor that cannot be found is listed in
-                       "problems" as well.
+                       anything is pressed. Anchors that cannot be found are listed in
+                       "problems" as well - all of them in one line, each with the size or
+                       caption that is there instead, which is what tells a resized
+                       application (refit, below) from a different build.
                        "home" is where config.json, profiles/, captures/ and logs/ live on
                        that PC, and why that directory was chosen - the answer when a person
                        asks where their settings are. Moving them is theirs to do, not
@@ -3680,7 +3685,8 @@ ENDPOINTS
                        buttons had no picture to show
   GET  /menus          the window's own menu bar - paths, command ids, enabled/checked,
                        brought up to date first (refresh=false to skip that).
-                       Presses nothing. An empty list is an answer
+                       Presses nothing, but the application is told its menus are
+                       opening - see THE WINDOW'S MENU BAR. An empty list is an answer
   POST /menu           {{path}} - pick one item from it. The ONLY name here that does not
                        come from the profile, so it needs allow_menus as well. Takes
                        {{capture | capture_rect, pad, ignore, settle_ms}} like a click
@@ -3700,9 +3706,8 @@ ENDPOINTS
                        Use it when you want the picture kept and referred to rather than
                        read right now. Parameters go in the body
   POST /click          {{button | buttons[] | spell | rect | point, confirm, click_button,
-                       double, hold_ms, measure, quiet_ms, per_press,
-                       settle_ms, gap_ms, capture | capture_rect, pad, ignore}} - the
-                       reply carries "hit"
+                       double, hold_ms, measure, quiet_ms, per_press, settle_ms, gap_ms,
+                       capture | capture_rect, pad, ignore}} - the reply carries "hit"
                        (what was under the point) and "change" (pixels + bbox). With
                        "buttons" it presses them in order and stops at the first failure
   POST /click.png      same, returns PNG bytes; parameters go in the query string
@@ -3712,11 +3717,10 @@ ENDPOINTS
                        both need allow_raw_keys.
                        Takes {{capture | capture_rect, pad, ignore, settle_ms, measure,
                        quiet_ms, scale, max_width}} too, so one call presses and shows you
-                       the result -
-                       and "measure": true times this key's settle exactly as it does for
-                       a click. There is no "hit" here -
-                       a key has no coordinate, so "did it arrive" has no cheap answer;
-                       check /health input.uipi_risk instead.
+                       the result - and "measure": true times this key's settle exactly as
+                       it does for a click. There is no "hit" here - a key has no
+                       coordinate, so "did it arrive" has no cheap answer; check /health
+                       input.uipi_risk instead.
   POST /window/focus   raise it / un-minimize it
   POST /window/fit     restore the client area to the size the buttons were measured at
   POST /preview.png    draw a candidate profile document over the live screen, saving nothing
@@ -4198,8 +4202,13 @@ TRAPS - these fail quietly or confusingly. Read once, save yourself an hour.
   AN AMBIGUOUS ANCHOR IS REFUSED, NOT GUESSED. Anchors are found by text AND size, and a
   refit is for when the size changed - so where two controls carry the same text and neither
   is still the saved size, there is nothing left to tell them apart. The reply lists the
-  candidates; name the right one:
-    -d '{{"anchors": {{"OPERATION PANEL": [1142,384,746,251]}}, "apply": true}}'
+  candidates; name the right one. The key is the ANCHOR's name in the profile, not the
+  control's caption; the value is that control's rectangle, from GET /controls:
+    curl -s -X POST -H "X-Admin-Code: THECODE" -H "Content-Type: application/json" \
+      -d '{{"anchors": {{"panel": [1142,384,746,251]}}}}' \
+      "{base}/admin/profile/refit?profile=NAME"
+  That is still only the proposal. Read it - "matched_by", "text_now", "verify" - then send
+  the same body with "apply": true.
 
   A NAMED RECTANGLE HAS TO BE A CONTROL'S OWN - exactly as GET /controls prints it - and the
   anchor takes that control's text along with its place. A rectangle that is no control's
@@ -4244,6 +4253,17 @@ THE WINDOW'S MENU BAR - the one thing not written in the profile
   what the menu held; "state_note" says so. refresh=false skips the asking, for an
   application that misbehaves when asked.
 
+  THAT ASKING IS NOT INVISIBLE. The application reacts as it would to a menu opening, and
+  some do more than update states - an MFC program closes a drop-down list that is open.
+  Read the menu before starting something that depends on such a list, or after it, not in
+  the middle.
+
+  A CAPTION CAN CONTAIN '/' ITSELF. NCGuide has "PMC/I/O Operation Panel": an item called
+  "I/O Operation Panel" under PMC, not O Operation Panel under I. So do not split a path to
+  find its parent - "depth" and the order of the list give the tree: an entry's parent is
+  the nearest one above it with a smaller depth. Send a path whole, as printed; it is
+  matched as one string.
+
   THIS IS THE ONE PLACE WHERE A NAME IS NOT FROM THE PROFILE. Everything else here can only
   press what a person wrote in the profile file. A menu is read off the window, so this
   endpoint reaches whatever the application's menu reaches - which is why it needs
@@ -4261,6 +4281,8 @@ THE WINDOW'S MENU BAR - the one thing not written in the profile
   An item INSIDE a disabled submenu is refused too, however its own state reads: that
   submenu does not open, so no person could reach it. GET /menus marks such an item with
   "blocked_by" - the disabled submenu - and leaves it out of "invocable".
+  "invocable" counts exactly what POST /menu would accept on state: commands, enabled, not
+  under a disabled submenu. allow_menus and confirm_menus apply on top of that.
 
   THE COMMAND IS POSTED, NOT SENT. A menu item that opens a modal dialog would otherwise
   hold the request open for as long as the dialog is on screen. So the reply means the
