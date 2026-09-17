@@ -1549,6 +1549,9 @@ pub async fn health(State(state): State<SharedState>) -> Response {
                     .into(),
             );
         }
+        // Files that did not load are not in the snapshot, so nothing below would mention
+        // them. Said first, because a missing profile explains every later "unknown profile".
+        problems.extend(st.load_notes.load().iter().cloned());
         let mut bindings: Vec<Binding> = Vec::new();
         for (name, prof) in snapshot.iter() {
             let t = prof.targets();
@@ -1567,6 +1570,9 @@ pub async fn health(State(state): State<SharedState>) -> Response {
                 "window_spec": t.window,
                 "anchors": t.anchors.len(),
             });
+            for w in t.lint() {
+                problems.push(format!("profile '{name}': {w}"));
+            }
             if size_check_is_inert(&t) {
                 problems.push(format!(
                     "profile '{name}': on_size_mismatch is \"reject\" but reference_client is not set, so nothing is checking the window size and every coordinate is used at whatever size the window happens to be. Open the window, read client_size from GET /window?profile={name}, and save it back as reference_client."
@@ -2092,7 +2098,7 @@ pub async fn preview_png(
     .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid profile document: {e}")))?;
     // Validation happens here too, so an agent filters itself out before involving a person.
     candidate
-        .validate()
+        .validate_for_save()
         .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
 
     let mut req = CaptureReq::from_query(&q)?;
@@ -2755,6 +2761,32 @@ fn merge_patch(target: &mut Value, patch: &Value) {
     }
 }
 
+/// What a patch changed: per name in the keyed collections, and every other top-level field
+/// that differs.
+///
+/// The fields are read off the two documents rather than listed. A hand-written list of four
+/// answered "fields": [] to a patch that set `program`, which reads as "nothing changed" - the
+/// one answer this reply exists to keep apart from "it worked".
+fn patch_changes(before: &Value, after: &Value) -> Value {
+    const KEYED: [&str; 4] = ["buttons", "regions", "keys", "anchors"];
+    let mut fields: Vec<String> = before
+        .as_object()
+        .into_iter()
+        .flat_map(|o| o.keys())
+        .chain(after.as_object().into_iter().flat_map(|o| o.keys()))
+        .filter(|k| !KEYED.contains(&k.as_str()))
+        .filter(|k| before.get(k.as_str()) != after.get(k.as_str()))
+        .cloned()
+        .collect();
+    fields.sort();
+    fields.dedup();
+    let mut out = json!({"fields": fields});
+    for k in KEYED {
+        out[k] = map_diff(before.get(k), after.get(k));
+    }
+    out
+}
+
 /// Which names in one of the by-name maps came, went, or changed. A patch that turns out to
 /// match what was already there has to be reported as the nothing it was, rather than as a
 /// save — otherwise "it worked" and "it was already like that" look identical from here.
@@ -2819,7 +2851,7 @@ pub async fn admin_patch_profile(
         ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, format!("the patched profile is not valid: {e}"))
             .with_detail(json!({"note": "nothing was written — the profile on disk is unchanged"}))
     })?;
-    fresh.validate().map_err(|e| {
+    fresh.validate_for_save().map_err(|e| {
         ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e)
             .with_detail(json!({"note": "nothing was written — the profile on disk is unchanged"}))
     })?;
@@ -2839,17 +2871,7 @@ pub async fn admin_patch_profile(
     }
 
     let lost_confirm = allow_losing_confirm(&q, &before, &fresh)?;
-    let scalars: Vec<String> = ["description", "window", "reference_client", "on_size_mismatch"]
-        .iter()
-        .filter(|f| before_doc.get(**f) != after_doc.get(**f))
-        .map(|f| (*f).to_string())
-        .collect();
-    let changed = json!({
-        "buttons": map_diff(before_doc.get("buttons"), after_doc.get("buttons")),
-        "regions": map_diff(before_doc.get("regions"), after_doc.get("regions")),
-        "keys": map_diff(before_doc.get("keys"), after_doc.get("keys")),
-        "fields": scalars,
-    });
+    let changed = patch_changes(&before_doc, &after_doc);
 
     let path = prof.path.clone();
     let saved = tokio::task::spawn_blocking(move || fresh.save(&path).map(|()| fresh))
@@ -2920,7 +2942,7 @@ pub async fn admin_save_profile(
         ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid profile document: {e}"))
     })?;
     fresh
-        .validate()
+        .validate_for_save()
         .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
 
     // Saving under an unknown name **creates a profile** — requiring a config edit and a
@@ -3487,6 +3509,10 @@ ENDPOINTS
                        see WHEN ONE APPLICATION OPENS SEVERAL PROJECTS below.
                        "programs" says, per program, which of its profiles is open right
                        now - the one program=NAME would use - or why none can be picked.
+                       A profile FILE that failed to load is listed first: it is missing
+                       from "profiles" altogether, and that is the only place to learn why.
+                       A profile that loads but could not be saved as it is (a leftover the
+                       current rules refuse) is listed too; the next save has to fix it.
                        "status" is ok or degraded and "problems" lists what is wrong, in
                        plain language - a locked session, a profile that failed to parse,
                        a window that is not open. "policy" says which of the gated things
@@ -5743,7 +5769,7 @@ fn refit_now(
         })));
     }
 
-    fresh.validate().map_err(|e| {
+    fresh.validate_for_save().map_err(|e| {
         ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, format!("the refitted profile is invalid: {e}"))
     })?;
     fresh.save(&prof.path).map_err(ApiError::internal)?;
@@ -5857,6 +5883,7 @@ pub async fn admin_reload(
         }
         let names: Vec<String> = fresh.keys().cloned().collect();
         state.profiles.store(std::sync::Arc::new(fresh));
+        state.load_notes.store(std::sync::Arc::new(notes.clone()));
         log::info!("profiles rescanned: {}", names.join(", "));
         return Ok(json_ok(json!({
             "rescanned": true,
@@ -6683,6 +6710,28 @@ mod tests {
         assert!(got[0].contains("profile 'ncguide-30i'"), "{}", got[0]);
         assert!(got[0].contains("ncguide-0i-lathe, ncguide-0i-mill"), "{}", got[0]);
         assert!(!got[0].contains("loose"), "another program's profile is not a rival: {}", got[0]);
+    }
+
+    /// A patch that set `program` was answered with "fields": [] - the list of fields it
+    /// compared was written by hand. Anything at the top level counts now, whether or not it
+    /// existed when this was written.
+    #[test]
+    fn a_patch_reports_every_top_level_field_it_changed() {
+        let before = json!({"description": "d", "window": {"title": "x"},
+                            "buttons": {"A": {"rect": [0, 0, 1, 1]}}});
+        let after = json!({"description": "d", "window": {"title": "x"}, "program": "nc",
+                           "confirm_menus": ["File"],
+                           "anchors": {"m": {"text": "M", "rect": [0, 0, 5, 5]}},
+                           "buttons": {"A": {"rect": [0, 0, 1, 1]}}});
+        let c = patch_changes(&before, &after);
+        assert_eq!(c["fields"], json!(["confirm_menus", "program"]));
+        assert_eq!(c["anchors"]["added"], json!(["m"]));
+        assert_eq!(c["buttons"]["modified"], json!([]));
+
+        // And a field taken away counts as much as one put in.
+        let c = patch_changes(&after, &before);
+        assert_eq!(c["fields"], json!(["confirm_menus", "program"]));
+        assert_eq!(c["anchors"]["removed"], json!(["m"]));
     }
 
     /// The sentence a refusal carries has to name the place the caller is actually standing in.

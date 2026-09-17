@@ -48,6 +48,12 @@ pub struct AppState {
     pub input_lock: Arc<tokio::sync::Mutex<()>>,
     /// Whether `SetProcessDpiAwarenessContext` succeeded — the DPI diagnostic.
     pub dpi_aware: bool,
+    /// What the last startup or rescan could not load, in words.
+    ///
+    /// Written to the log as well, but an agent cannot read the log. Without this, a file
+    /// that failed to load simply was not in /health - one profile fewer, no problem listed,
+    /// which is the quietest failure there is.
+    pub load_notes: arc_swap::ArcSwap<Vec<String>>,
 }
 
 /// `AppState` is cloned per handler, so it is wrapped in an `Arc` (`ArcSwap` is not Clone).

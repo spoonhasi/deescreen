@@ -310,8 +310,62 @@ impl Targets {
         Ok(t)
     }
 
-    /// Whether a parsed definition is actually usable. **Loading and saving run the same
-    /// function** — a looser check on the editor's path would make that path the way around it.
+    /// Problems a profile can be **loaded** with but not **saved** with.
+    ///
+    /// Rules added after profiles already exist in the wild go here rather than in `validate`.
+    /// Put in `validate`, such a rule makes a file that worked yesterday fail to load after an
+    /// upgrade - which is what happened to a real profile the first time. Here, a loaded
+    /// profile reports it in /health, and the next save has to fix it.
+    ///
+    /// The looser side is loading, never saving. A save path that checked less than loading
+    /// would be a way around the checks; loading checking less than saving only means an old
+    /// file keeps working until someone writes it.
+    pub(crate) fn lint(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.anchors.is_empty() {
+            // No anchors declared, so an anchor NAME here refers to nothing, and offset_for
+            // treats a name it cannot find as no shift at all. The way this happens is a
+            // whole-document save that lost the anchors map while every element kept its
+            // anchor - and accepting that save would switch the correction off without anyone
+            // having decided to. `@fixed` is fine: it says "no shift", which is what happens.
+            let dangling: Vec<String> = self
+                .buttons
+                .iter()
+                .filter(|(_, b)| !b.anchor.is_empty() && b.anchor != "@fixed")
+                .map(|(n, b)| format!("{n} -> {}", b.anchor))
+                .chain(
+                    self.regions
+                        .iter()
+                        .filter(|(_, r)| !r.anchor.is_empty() && r.anchor != "@fixed")
+                        .map(|(n, r)| format!("{n} -> {}", r.anchor)),
+                )
+                .collect();
+            if !dangling.is_empty() {
+                let shown: Vec<&str> = dangling.iter().take(5).map(String::as_str).collect();
+                out.push(format!(
+                    "{} buttons and regions name an anchor, but this profile declares none \
+                     (starting with: {}). Nothing corrects them; the names are ignored. \
+                     Either declare those anchors, or clear the names - if the anchors map was \
+                     lost from a document on its way here, send it back instead.",
+                    dangling.len(),
+                    shown.join(", ")
+                ));
+            }
+        }
+        out
+    }
+
+    /// `validate`, plus everything `lint` would only warn about. What a save must pass.
+    pub(crate) fn validate_for_save(&self) -> Result<(), String> {
+        self.validate()?;
+        match self.lint().into_iter().next() {
+            Some(first) => Err(first),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether a parsed definition is actually usable. Loading and saving both run it; see
+    /// `lint` for the rules only a save enforces.
     pub(crate) fn validate(&self) -> Result<(), String> {
         for (kind, names) in [
             ("button", self.buttons.keys().collect::<Vec<_>>()),
@@ -415,35 +469,6 @@ impl Targets {
             for (name, r) in &self.regions {
                 known("region", name, &r.anchor)?;
             }
-        } else {
-            // No anchors declared, so an anchor NAME here refers to nothing, and offset_for
-            // treats a name it cannot find as no shift at all. The way this happens is a
-            // whole-document save that lost the anchors map while every element kept its
-            // anchor - and passing it would switch the correction off without anyone having
-            // decided to. `@fixed` is still fine: it says "no shift", which is what happens.
-            let dangling: Vec<String> = self
-                .buttons
-                .iter()
-                .filter(|(_, b)| !b.anchor.is_empty() && b.anchor != "@fixed")
-                .map(|(n, b)| format!("{n} -> {}", b.anchor))
-                .chain(
-                    self.regions
-                        .iter()
-                        .filter(|(_, r)| !r.anchor.is_empty() && r.anchor != "@fixed")
-                        .map(|(n, r)| format!("{n} -> {}", r.anchor)),
-                )
-                .collect();
-            if !dangling.is_empty() {
-                let shown: Vec<&str> = dangling.iter().take(5).map(String::as_str).collect();
-                return Err(format!(
-                    "{} buttons and regions name an anchor, but this profile declares none \
-                     (starting with: {}). Nothing would correct them. If the anchors were \
-                     removed on purpose, clear those names as well; if not, the anchors map \
-                     was lost on the way here - send it back with the rest of the document.",
-                    dangling.len(),
-                    shown.join(", ")
-                ));
-            }
         }
 
         for (name, r) in &self.regions {
@@ -474,7 +499,7 @@ impl Targets {
     /// and leaving half-written JSON would block the next startup entirely. There is always one
     /// copy to go back to.
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        self.validate()?;
+        self.validate_for_save()?;
         // On a new profile, profiles/ may not exist yet.
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -1420,16 +1445,20 @@ mod tests {
     /// The editor used to rebuild a profile without its anchors map and save it. Every
     /// button kept its anchor name, validation only looked at names when anchors existed, and
     /// the correction for a moving layout switched itself off. A name that points at nothing
-    /// is refused now.
+    /// is refused when SAVING.
+    ///
+    /// Only when saving. The first version refused it when loading too, and a live profile
+    /// with leftover names from a copied file stopped loading on upgrade - silently, since a
+    /// load failure only reached the log. A file that worked must keep loading.
     #[test]
-    fn an_anchor_name_with_no_anchors_behind_it_is_refused() {
+    fn an_anchor_name_with_no_anchors_behind_it_is_refused_on_save_only() {
         let lost = r#"{"window":{"title":"x"},"buttons":{
             "A":{"rect":[0,0,10,10],"anchor":"main"},
             "B":{"rect":[20,0,10,10],"anchor":"@fixed"}}}"#;
-        let e = serde_json::from_str::<Targets>(lost)
-            .expect("parses")
-            .validate()
-            .expect_err("'main' refers to nothing");
+        let t = serde_json::from_str::<Targets>(lost).expect("parses");
+        t.validate().expect("it still loads");
+        assert_eq!(t.lint().len(), 1, "and says what is wrong");
+        let e = t.validate_for_save().expect_err("'main' refers to nothing");
         assert!(e.contains("A -> main"), "{e}");
         assert!(!e.contains("B ->"), "@fixed means no shift, which is what happens: {e}");
 
@@ -1437,7 +1466,9 @@ mod tests {
         let fine = r#"{"window":{"title":"x"},"buttons":{
             "A":{"rect":[0,0,10,10]},
             "B":{"rect":[20,0,10,10],"anchor":"@fixed"}}}"#;
-        serde_json::from_str::<Targets>(fine).expect("parses").validate().expect("valid");
+        let t = serde_json::from_str::<Targets>(fine).expect("parses");
+        t.validate_for_save().expect("valid");
+        assert!(t.lint().is_empty());
     }
 
     #[test]

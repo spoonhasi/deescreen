@@ -173,6 +173,7 @@ async fn main() {
         captures_dir: captures_dir.clone(),
         input_lock: Arc::new(tokio::sync::Mutex::new(())),
         dpi_aware,
+        load_notes: ArcSwap::from(Arc::new(notes.clone())),
     });
 
     // ── startup diagnostics ──
