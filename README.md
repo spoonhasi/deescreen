@@ -29,6 +29,114 @@ control authority.** Manage file permissions and the IP whitelist on that basis.
 
 ---
 
+## Why this exists — and why not just hand over the desktop
+
+Literally, it lets an agent on one PC see and press a GUI window on another, for applications
+that offer nothing but a screen. But remote control alone already exists: a remote desktop, or
+a computer-use agent reading full screenshots and clicking pixels. What this adds comes in two
+parts.
+
+### It does not fail quietly
+
+A click on a screen **succeeds even when it is wrong.** Pressing the wrong key, pressing a key
+that does nothing, photographing the screen before it caught up — none of them raises an error.
+Most of this tool is the answer to that, one case at a time, each of them met on a real machine:
+
+| what went wrong without an error | what catches it now |
+|---|---|
+| a profile measured on one project pressed onto another that had the same title | [`window.has`](#one-program-several-projects-one-title--windowhas), [programs](#programs--several-versions-of-one-application) |
+| the application moved its whole layout 16px, so narrow keys hit their neighbours | [anchors](#when-the-application-moves-its-own-layout--anchors), `aim` |
+| a key in the middle of a sequence was dropped and the end screen looked fine | `per_press` |
+| the capture was taken before the screen had caught up | `settle_ms`, `measure` |
+| the click arrived, but nothing was listening at that point | `hit` |
+| a save lost part of a profile and validation let it through | whole-document saves carry every field; `lint` |
+
+Three ideas carry it:
+
+- **Names, not pixels.** An agent says `CYCLE_START`; the coordinates live only in the profile.
+  So **whoever can edit the profile holds the control authority** — what can be pressed, what
+  needs `confirm`, and which of the gated doors (`allow_*`) are open at all.
+- **Refuse what cannot be shown.** Is this the right window, is the layout where the profile
+  says, did the press reach a real control, did anything change? Where the answer cannot be
+  established, the reply says why and stops, rather than guessing.
+- **Three roles.** A person draws the boundary, the agent operates inside it, and the server
+  sits between them asking for evidence.
+
+In effect it puts **a narrow, named, auditable API on an application that never had one.** The
+profile is that API's definition.
+
+For CNC simulators that means an agent can work through operating procedures — enter a program
+on the MDI keypad, run a cycle, read the alarms — without a real machine in the loop: for
+training, for checking part programs, for test automation. The warning above stands because
+none of these safeguards can stop the kind of mistake that stops a machine.
+
+Its limits are as plain. It sees pixels and Win32 controls, and nothing else; an application
+that draws its own controls has to be measured by hand. A changed screen says *something*
+happened, not that the *intended* thing did. So where an application has an API of its own,
+read the result from there and use the screen to act ([§3 below](#3-the-screen-is-a-last-resort)).
+
+### It costs far fewer tokens
+
+Reducing what a reader has to look at was a design goal from the first commit — `captures.rs`
+opens by saying that a full-screen PNG is expensive on every call, in transfer and in tokens.
+
+On Claude, [an image costs](https://platform.claude.com/docs/en/build-with-claude/vision#resolution-and-token-cost)
+`⌈width / 28⌉ × ⌈height / 28⌉` visual tokens. Claude 4.7 and later take images up to 2576 px on
+the long edge (4784 tokens); earlier models downscale to about 1568 tokens. Other vision models
+count differently, but cost scales with pixel area everywhere.
+
+| what the agent looks at | size | tokens (Claude 4.7+) |
+|---|---|---|
+| the whole desktop, every step | 1920×1080 | **2,691** |
+| the simulator's client area | 1920×997 | 2,484 |
+| the same, `scale=0.5` | 960×499 | 630 |
+| a status bar | 1280×60 | **138** |
+| one key, to read its legend | 300×80 | 33 |
+| no `capture` at all | — | **0** — JSON only |
+
+Where the saving comes from:
+
+1. **Small images, or none.** Remote control has to look at the whole screen after every action.
+   Here a request names the region it needs, and a press that only has to be confirmed by
+   `changed` needs no picture.
+2. **Fewer round trips.** Press, wait and capture are one request; a run of keys is one
+   `buttons: [...]` or `spell`.
+3. **No re-finding buttons.** Locating a key in a screenshot is visual reasoning, every session,
+   every step — and the likeliest place to be wrong. The profile holds the answer once.
+4. **Checks come back as numbers.** `changed`, `pixels`, `hit`, `aim`, `sequence.unchanged` and
+   `suggest_settle_ms` replace looking at a before and an after.
+5. **Less flailing.** A silent failure costs a remote-control agent screenshot after screenshot
+   while it works out what happened. A refusal with its reason ends that at the first step.
+6. **A smaller history.** An agent loop resends the whole conversation on every request, so every
+   screenshot it has taken is paid for again on every later turn. Fewer, smaller images keep that
+   down — and keep the context clear enough for a long task to stay on track, which matters
+   as much as the bill.
+
+A rough comparison — entering `G91X0;` on the MDI keypad, pressing INSERT and reading the status
+bar:
+
+| | whole desktop | deescreen |
+|---|---|---|
+| how | one screenshot per key and one to check | one `POST /click` with `buttons` and `capture: status_bar` |
+| images | 8–10 × 2,691 ≈ **22,000–27,000** tokens, each resent on later turns | one 138-token strip |
+| total | tens of thousands of tokens | a few hundred |
+
+An estimate, not a benchmark. For repeated operation the gap is one to two orders of magnitude.
+
+The cost moves to the front instead:
+
+| up front | size | how often |
+|---|---|---|
+| `GET /help` | about 70 KB of text, on the order of 17,000 tokens | once per session |
+| `GET /profiles` for a 140-button profile | tens of kilobytes | when needed — `GET /buttons` and `PATCH` keep it smaller |
+| `GET /sheet.png` of 142 buttons | 1507×1878, 3,672 tokens | only when checking names |
+| measuring a profile | — | once, usually by a person in `/editor` |
+
+A fixed cost, and then very little per operation — it pays for itself within a handful of
+actions.
+
+---
+
 ## Vocabulary
 
 **The thing you press is a "button"** — on screen, in the file, and in the API.
