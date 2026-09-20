@@ -2,6 +2,17 @@
 
 Capture and click **one Windows GUI window** on a remote PC, over HTTP. One exe, no installer.
 
+**In one minute.** Hand an agent a remote desktop and it photographs the whole screen after every
+action and clicks pixels — and a click on a screen *succeeds even when it is wrong*. The wrong
+key, a key that does nothing, a screen photographed before it had caught up: none of them raises
+an error. Here a person saves the window and its buttons once, and the agent presses
+`CYCLE_START` by name. The coordinates live only in the profile file, so **whoever can edit that
+file holds the control authority**. Every reply says what changed, what the press landed on and
+whether the layout still matches — and where that cannot be established the request is refused
+rather than guessed. It also looks at the strip it asked for instead of the whole screen, which
+is why it costs a fraction of the tokens:
+[why this exists](#why-this-exists--and-why-not-just-hand-over-the-desktop).
+
 Built so an AI agent could work the operator panel of a CNC simulator — Mitsubishi NC Trainer2
 plus, FANUC NCGuide, and the like — but nothing about any of those applications lives in the
 code. It all lives in a **profile file**: write down a window title and some rectangles, and
